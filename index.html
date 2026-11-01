@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="vi" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/jpeg" href="./avatar.jpg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Cytools — Tiện Ích Trình Duyệt Đa Năng</title>
+    <meta name="description" content="Nền tảng tiện ích đa năng trực tiếp trong trình duyệt: Tải video TikTok không logo, YouTube, Instagram, Pinterest chuẩn HD, xóa phông AI studio và convert media mượt mà." />
+    
+    <!-- Chrome Extension Popup Immediate Dimension Lock -->
+    <script>
+      if (
+        window.location.protocol === 'chrome-extension:' ||
+        new URLSearchParams(window.location.search).get('popup') === 'true'
+      ) {
+        document.documentElement.classList.add('is-extension-popup');
+      }
+    </script>
+    <style>
+      /* Enforce solid popup dimensions when running as Chrome Extension */
+      html.is-extension-popup,
+      html.is-extension-popup body {
+        width: 540px !important;
+        height: 580px !important;
+        min-width: 540px !important;
+        min-height: 580px !important;
+        max-width: 540px !important;
+        max-height: 580px !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        overflow: hidden !important;
+      }
+      html.is-extension-popup #root {
+        width: 540px !important;
+        height: 580px !important;
+      }
+    </style>
+  </head>
+  <body class="min-h-screen">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

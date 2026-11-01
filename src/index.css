@@ -1,0 +1,163 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    color-scheme: light;
+    --app-bg: #f8fafc;
+    --app-text: #0f172a;
+    --app-border: #e2e8f0;
+  }
+
+  :root.dark, html.dark {
+    color-scheme: dark;
+    --app-bg: #09090b;
+    --app-text: #f4f4f5;
+    --app-border: rgba(255, 255, 255, 0.08);
+  }
+
+  * {
+    border-color: var(--app-border);
+  }
+
+  body {
+    background-color: var(--app-bg);
+    color: var(--app-text);
+    min-height: 100vh;
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    overflow-x: hidden;
+    transition: background-color 0.2s cubic-bezier(0.16, 1, 0.3, 1), color 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+}
+
+/* Custom subtle scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 9999px;
+}
+
+html.dark ::-webkit-scrollbar-thumb {
+  background: #27272a;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+html.dark ::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+/* Checkerboard pattern for transparent canvas preview */
+.bg-checkerboard {
+  background-color: #f1f5f9;
+  background-image: linear-gradient(45deg, #e2e8f0 25%, transparent 25%),
+                    linear-gradient(-45deg, #e2e8f0 25%, transparent 25%),
+                    linear-gradient(45deg, transparent 75%, #e2e8f0 75%),
+                    linear-gradient(-45deg, transparent 75%, #e2e8f0 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0px;
+}
+
+html.dark .bg-checkerboard {
+  background-color: #18181b;
+  background-image: linear-gradient(45deg, #27272a 25%, transparent 25%),
+                    linear-gradient(-45deg, #27272a 25%, transparent 25%),
+                    linear-gradient(45deg, transparent 75%, #27272a 75%),
+                    linear-gradient(-45deg, transparent 75%, #27272a 75%);
+}
+
+/* Typewriter Blinking Caret */
+.caret {
+  display: inline-block;
+  width: 2px;
+  height: 1.1em;
+  background: #FF8A00;
+  vertical-align: -0.15em;
+  margin-left: 2px;
+  animation: blink 1s steps(1) infinite;
+}
+
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* Interactive Copy Button & Tooltip */
+.copy,
+.copy-btn-interactive {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.5rem;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.copy .tooltip,
+.copy-btn-interactive .tooltip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%) translateY(4px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  white-space: nowrap;
+  z-index: 40;
+}
+
+/* Tooltip arrow caret */
+.copy .tooltip::after,
+.copy-btn-interactive .tooltip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  border-width: 4px;
+  border-style: solid;
+  border-color: #0f172a transparent transparent transparent;
+}
+
+html.dark .copy .tooltip::after,
+html.dark .copy-btn-interactive .tooltip::after {
+  border-color: #27272a transparent transparent transparent;
+}
+
+.copy:hover .tooltip,
+.copy.is-copied .tooltip,
+.copy-btn-interactive:hover .tooltip,
+.copy-btn-interactive.is-copied .tooltip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+/* Chrome Extension Popup Root Sizing */
+html.is-extension-popup,
+html.is-extension-popup body,
+html.is-extension-popup #root {
+  width: 540px;
+  height: 580px;
+  min-width: 540px;
+  min-height: 580px;
+  max-width: 540px;
+  max-height: 580px;
+  overflow: hidden;
+}
+
+

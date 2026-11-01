@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Cytools - Tiện Ích Đa Năng",
+  "version": "1.0.0",
+  "description": "Bộ tiện ích tải video đa nền tảng, xóa nền AI và chuyển đổi media bảo mật 100% trong trình duyệt.",
+  "action": {
+    "default_popup": "index.html",
+    "default_title": "Mở Cytools",
+    "default_icon": {
+      "16": "icon-37.png",
+      "48": "icon-52.png",
+      "128": "icon-125.png"
+    }
+  },
+  "permissions": [
+    "activeTab",
+    "tabs",
+    "downloads"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "icons": {
+    "16": "icon-37.png",
+    "48": "icon-52.png",
+    "128": "icon-125.png"
+  }
+}
