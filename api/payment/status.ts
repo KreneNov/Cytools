@@ -13,6 +13,9 @@ interface ExtendedResponse extends ServerResponse {
 function sendJson(res: ExtendedResponse, statusCode: number, data: any) {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   res.statusCode = statusCode;
   res.end(JSON.stringify(data));
 }

@@ -50,15 +50,13 @@ export const HallOfFame: React.FC<HallOfFameProps> = ({
     let isMounted = true;
     const fetchLiveHallOfFame = async () => {
       try {
-        const url = resolveApiUrl('/api/hall-of-fame');
-        const res = await fetch(url);
+        const url = resolveApiUrl(`/api/hall-of-fame?t=${Date.now()}`);
+        const res = await fetch(url, { cache: 'no-store' });
         if (!res.ok) return;
         const data = await res.json();
-        if (isMounted && data.success && Array.isArray(data.donors) && data.donors.length > 0) {
+        if (isMounted && data.success && Array.isArray(data.donors)) {
           setDonorsList(data.donors);
-          if (typeof data.totalAmount === 'number') {
-            setServerTotalAmount(data.totalAmount);
-          }
+          setServerTotalAmount(typeof data.totalAmount === 'number' ? data.totalAmount : 0);
         }
       } catch (err) {
         console.warn('Lỗi khi nạp Bảng Vinh Danh trực tuyến, sử dụng dữ liệu tĩnh:', err);
@@ -147,39 +145,47 @@ export const HallOfFame: React.FC<HallOfFameProps> = ({
           animate="visible"
           className="max-h-[380px] overflow-y-auto pr-1 divide-y divide-slate-100 dark:divide-zinc-800 rounded-xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-zinc-900/60 custom-scrollbar"
         >
-          {donorsList.map((donor) => (
-            <motion.div
-              key={donor.id}
-              variants={itemVariants}
-              className="p-3 flex items-center justify-between gap-3 hover:bg-slate-50 dark:hover:bg-zinc-800/40 transition-colors"
-            >
-              <div className="flex items-center gap-2.5 min-w-0">
-                <span className="text-sm font-bold text-slate-900 dark:text-slate-100 truncate">
-                  {donor.name}
-                </span>
-                <span className="text-sm font-mono text-slate-500 dark:text-slate-400 shrink-0">
-                  {donor.date}
-                </span>
-              </div>
+          {donorsList.length === 0 ? (
+            <div className="p-8 text-center text-slate-500 dark:text-slate-400 text-sm">
+              <Sparkles className="w-8 h-8 text-pink-500/50 mx-auto mb-2" />
+              <p className="font-semibold text-slate-700 dark:text-slate-300">Chưa có người ủng hộ nào</p>
+              <p className="text-xs mt-1 text-slate-500">Hãy là người đầu tiên tiếp sức cho Cytools!</p>
+            </div>
+          ) : (
+            donorsList.map((donor) => (
+              <motion.div
+                key={donor.id}
+                variants={itemVariants}
+                className="p-3 flex items-center justify-between gap-3 hover:bg-slate-50 dark:hover:bg-zinc-800/40 transition-colors"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <span className="text-sm font-bold text-slate-900 dark:text-slate-100 truncate">
+                    {donor.name}
+                  </span>
+                  <span className="text-sm font-mono text-slate-500 dark:text-slate-400 shrink-0">
+                    {donor.date}
+                  </span>
+                </div>
 
-              <div className="flex items-center gap-2.5 shrink-0">
-                <span className="text-sm font-mono font-bold text-slate-800 dark:text-slate-200">
-                  {donor.amount}
-                </span>
-                {donor.role === 'PRO Member' || donor.badgeType === 'pro' ? (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-pink-500/10 border border-pink-500/20 text-pink-600 dark:text-pink-400 text-xs font-bold font-mono">
-                    <Sparkles className="w-3 h-3" />
-                    <span>PRO</span>
+                <div className="flex items-center gap-2.5 shrink-0">
+                  <span className="text-sm font-mono font-bold text-slate-800 dark:text-slate-200">
+                    {donor.amount}
                   </span>
-                ) : (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-xs font-bold font-mono">
-                    <Coffee className="w-3 h-3" />
-                    <span>DONOR</span>
-                  </span>
-                )}
-              </div>
-            </motion.div>
-          ))}
+                  {donor.role === 'PRO Member' || donor.badgeType === 'pro' ? (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-pink-500/10 border border-pink-500/20 text-pink-600 dark:text-pink-400 text-xs font-bold font-mono">
+                      <Sparkles className="w-3 h-3" />
+                      <span>PRO</span>
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-xs font-bold font-mono">
+                      <Coffee className="w-3 h-3" />
+                      <span>DONOR</span>
+                    </span>
+                  )}
+                </div>
+              </motion.div>
+            ))
+          )}
         </motion.div>
       </div>
     );
@@ -198,7 +204,7 @@ export const HallOfFame: React.FC<HallOfFameProps> = ({
             </div>
             <div>
               <div className="text-xl font-black text-slate-800 dark:text-slate-100 font-mono">
-                {donorsList.length}+
+                {donorsList.length}
               </div>
               <div className="text-sm text-slate-600 dark:text-slate-300 font-medium">
                 Người bạn đồng hành
@@ -288,41 +294,53 @@ export const HallOfFame: React.FC<HallOfFameProps> = ({
             animate="visible"
             className="rounded-2xl border border-slate-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 divide-y divide-slate-100 dark:divide-zinc-800 overflow-hidden shadow-xs"
           >
-            {filteredDonors.map((donor: DonorEntry) => (
-              <motion.div
-                key={donor.id}
-                variants={itemVariants}
-                className="px-5 py-3.5 flex items-center justify-between gap-4 hover:bg-slate-50 dark:hover:bg-zinc-800/40 transition-colors"
-              >
-                {/* Left: Name & Date */}
-                <div className="flex items-center gap-3 min-w-0">
-                  <span className="font-bold text-sm text-slate-900 dark:text-slate-100 truncate">
-                    {donor.name}
-                  </span>
-                  <span className="text-sm text-slate-500 dark:text-slate-400 font-mono">
-                    {donor.date}
-                  </span>
-                </div>
+            {filteredDonors.length === 0 ? (
+              <div className="p-12 text-center text-slate-500 dark:text-slate-400">
+                <Sparkles className="w-10 h-10 text-pink-500/50 mx-auto mb-3" />
+                <p className="font-bold text-base text-slate-800 dark:text-slate-200">
+                  Chưa có người ủng hộ nào trong danh mục này
+                </p>
+                <p className="text-sm mt-1.5 text-slate-500 max-w-md mx-auto">
+                  Hãy là người tiên phong tiếp sức cho Cytools phát triển các công cụ miễn phí cho cộng đồng!
+                </p>
+              </div>
+            ) : (
+              filteredDonors.map((donor: DonorEntry) => (
+                <motion.div
+                  key={donor.id}
+                  variants={itemVariants}
+                  className="px-5 py-3.5 flex items-center justify-between gap-4 hover:bg-slate-50 dark:hover:bg-zinc-800/40 transition-colors"
+                >
+                  {/* Left: Name & Date */}
+                  <div className="flex items-center gap-3 min-w-0">
+                    <span className="font-bold text-sm text-slate-900 dark:text-slate-100 truncate">
+                      {donor.name}
+                    </span>
+                    <span className="text-sm text-slate-500 dark:text-slate-400 font-mono">
+                      {donor.date}
+                    </span>
+                  </div>
 
-                {/* Right: Amount & Specific Badge */}
-                <div className="flex items-center gap-3.5 shrink-0">
-                  <span className="text-sm font-mono font-bold text-slate-900 dark:text-slate-100">
-                    {donor.amount}
-                  </span>
-                  {donor.role === 'PRO Member' || donor.badgeType === 'pro' ? (
-                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-pink-500/10 border border-pink-500/20 text-pink-600 dark:text-pink-400 text-xs font-bold font-mono">
-                      <Sparkles className="w-3 h-3" />
-                      <span>PRO</span>
+                  {/* Right: Amount & Specific Badge */}
+                  <div className="flex items-center gap-3.5 shrink-0">
+                    <span className="text-sm font-mono font-bold text-slate-900 dark:text-slate-100">
+                      {donor.amount}
                     </span>
-                  ) : (
-                    <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-xs font-bold font-mono">
-                      <Coffee className="w-3 h-3" />
-                      <span>DONOR</span>
-                    </span>
-                  )}
-                </div>
-              </motion.div>
-            ))}
+                    {donor.role === 'PRO Member' || donor.badgeType === 'pro' ? (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-pink-500/10 border border-pink-500/20 text-pink-600 dark:text-pink-400 text-xs font-bold font-mono">
+                        <Sparkles className="w-3 h-3" />
+                        <span>PRO</span>
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-xs font-bold font-mono">
+                        <Coffee className="w-3 h-3" />
+                        <span>DONOR</span>
+                      </span>
+                    )}
+                  </div>
+                </motion.div>
+              ))
+            )}
           </motion.div>
         </AnimatePresence>
 

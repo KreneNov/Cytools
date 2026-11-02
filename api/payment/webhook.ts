@@ -14,23 +14,26 @@ interface ExtendedResponse extends ServerResponse {
 function sendJson(res: ExtendedResponse, statusCode: number, data: any) {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   res.statusCode = statusCode;
   res.end(JSON.stringify(data));
 }
 
 /**
- * Verifies webhook secret against process.env.WEBHOOK_SECRET.
+ * Verifies webhook secret against process.env.SEPAY_API_KEY or process.env.WEBHOOK_SECRET.
  * Supports:
- * - Header 'Authorization': 'Apikey <SECRET>' or 'Bearer <SECRET>'
+ * - Header 'Authorization': 'Apikey <KEY>' or 'Bearer <KEY>'
  * - Header 'X-Secret-Key', 'x-sepay-token', 'x-api-key'
- * - Query param '?secret=...' or '?token=...'
- * - Body field 'body.secret' or 'body.token'
+ * - Query param '?secret=...', '?token=...', or '?apiKey=...'
+ * - Body field 'body.secret', 'body.token', or 'body.apiKey'
  */
 export function isWebhookAuthorized(req: ExtendedRequest): boolean {
-  const configuredSecret = process.env.WEBHOOK_SECRET;
-  // If WEBHOOK_SECRET is not configured in environment, allow for initial development and log warning
+  const configuredSecret = process.env.SEPAY_API_KEY || process.env.WEBHOOK_SECRET;
+  // If neither SEPAY_API_KEY nor WEBHOOK_SECRET is configured, allow in development mode with warning
   if (!configuredSecret || !configuredSecret.trim()) {
-    console.warn('[Webhook Security] WEBHOOK_SECRET is not configured in environment. Allowing request in unconfigured mode.');
+    console.warn('[Webhook Security] Neither SEPAY_API_KEY nor WEBHOOK_SECRET is configured in environment. Allowing request in unconfigured mode.');
     return true;
   }
 
@@ -46,8 +49,8 @@ export function isWebhookAuthorized(req: ExtendedRequest): boolean {
     ''
   ).trim();
 
-  const queryToken = String(req.query?.secret || req.query?.token || '').trim();
-  const bodyToken = String(req.body?.secret || req.body?.token || '').trim();
+  const queryToken = String(req.query?.secret || req.query?.token || req.query?.apiKey || '').trim();
+  const bodyToken = String(req.body?.secret || req.body?.token || req.body?.apiKey || '').trim();
 
   return (
     tokenFromAuth === secret ||
@@ -101,6 +104,16 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
       body.data?.[0]?.amount ||
       0
     );
+
+    const transferType = String(body.transferType || body.type || '').trim().toLowerCase();
+    if (transferType && transferType !== 'in') {
+      console.log(`[Webhook Notice] Bỏ qua giao dịch không phải chuyển tiền vào (transferType: "${transferType}")`);
+      return sendJson(res, 200, {
+        success: true,
+        ignored: true,
+        message: 'Bỏ qua giao dịch do không phải chuyển khoản vào (transferType !== in)',
+      });
+    }
 
     console.log(`[Webhook Received] Description: "${description}", Amount: ${amount}`);
 

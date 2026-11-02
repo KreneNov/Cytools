@@ -120,6 +120,7 @@ export const UpgradeModal: React.FC = () => {
         const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
           body: JSON.stringify({
             type: activeTab === 'donate' ? 'DONOR' : 'PRO',
             donorName: donorNameInputRef.current.trim() || undefined,
@@ -152,8 +153,8 @@ export const UpgradeModal: React.FC = () => {
 
     const interval = setInterval(async () => {
       try {
-        const url = resolveApiUrl(`/api/payment/status/${sessionCode}`);
-        const res = await fetch(url);
+        const url = resolveApiUrl(`/api/payment/status/${sessionCode}?t=${Date.now()}`);
+        const res = await fetch(url, { cache: 'no-store' });
         const data = await res.json();
         if (data.success && data.status === 'PAID') {
           setSessionStatus('PAID');
@@ -176,6 +177,7 @@ export const UpgradeModal: React.FC = () => {
       await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        cache: 'no-store',
         body: JSON.stringify({
           code: sessionCode,
           donorName: donorNameInput.trim(),
@@ -199,8 +201,8 @@ export const UpgradeModal: React.FC = () => {
     let paidData: { licenseKey?: string; donorName?: string } = {};
 
     try {
-      const url = resolveApiUrl(`/api/payment/status/${sessionCode}`);
-      const res = await fetch(url);
+      const url = resolveApiUrl(`/api/payment/status/${sessionCode}?t=${Date.now()}`);
+      const res = await fetch(url, { cache: 'no-store' });
       const data = await res.json();
       if (data.success && data.status === 'PAID') {
         isPaid = true;

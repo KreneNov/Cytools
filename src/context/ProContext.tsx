@@ -224,6 +224,7 @@ export const ProProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          cache: 'no-store',
           body: JSON.stringify({ key: keyToVerify.trim() }),
         });
 
