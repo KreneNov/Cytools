@@ -50,6 +50,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
     setIsExtracting(true);
     setExtractError(null);
     setResult(null);
+    setDownloadProgress(INITIAL_PROGRESS);
 
     try {
       const response = await apiFetch(`/api/social/extract?url=${encodeURIComponent(url.trim())}`);

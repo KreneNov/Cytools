@@ -169,6 +169,7 @@ export const SocialDownloaderPage: React.FC<SocialDownloaderPageProps> = ({ isCo
     if (e) e.preventDefault();
     if (!inputUrl.trim()) return;
 
+    clearDownloadError();
     const res = await extractMedia(inputUrl.trim());
     if (res?.slideshowImages) {
       // Select all images by default
@@ -255,6 +256,7 @@ export const SocialDownloaderPage: React.FC<SocialDownloaderPageProps> = ({ isCo
     try {
       const text = await navigator.clipboard.readText();
       if (text) {
+        clearDownloadError();
         setInputUrl(text);
       }
     } catch (err) {
@@ -514,7 +516,10 @@ export const SocialDownloaderPage: React.FC<SocialDownloaderPageProps> = ({ isCo
                   id="social-url-input"
                   type="text"
                   value={inputUrl}
-                  onChange={(e) => setInputUrl(e.target.value)}
+                  onChange={(e) => {
+                    setInputUrl(e.target.value);
+                    clearDownloadError();
+                  }}
                   placeholder="Dán liên kết video TikTok, YouTube, Reels, Pinterest..."
                   className="w-full pl-10 pr-32 sm:pr-52 py-3.5 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-sm text-slate-900 dark:text-slate-100 placeholder-slate-400 dark:placeholder-slate-500 focus:outline-none focus:border-pink-500 focus:ring-1 focus:ring-pink-500/30 transition-all font-sans"
                 />
@@ -837,7 +842,10 @@ export const SocialDownloaderPage: React.FC<SocialDownloaderPageProps> = ({ isCo
             </div>
 
             <button
-              onClick={reset}
+              onClick={() => {
+                reset();
+                setInputUrl('');
+              }}
               className="text-xs text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white px-3 py-1.5 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors self-start sm:self-auto cursor-pointer"
             >
               Làm mới / Nhập link khác
