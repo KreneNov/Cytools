@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'http';
-import { markOrderPaid, getOrder } from '../../src/api/db';
+import { markOrderPaid } from '../../src/api/db';
 
 interface ExtendedRequest extends IncomingMessage {
   query?: Record<string, string>;
@@ -12,13 +12,85 @@ interface ExtendedResponse extends ServerResponse {
 }
 
 function sendJson(res: ExtendedResponse, statusCode: number, data: any) {
-  res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
+  if (typeof res.setHeader === 'function') {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
   res.statusCode = statusCode;
   res.end(JSON.stringify(data));
+}
+
+/**
+ * Safely parses request body regardless of whether Vercel serverless runtime
+ * provided a pre-parsed object, Buffer, raw JSON string, or readable stream.
+ */
+export async function parseRequestBody(req: ExtendedRequest): Promise<Record<string, any>> {
+  try {
+    if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+      return req.body;
+    }
+
+    if (Buffer.isBuffer(req.body)) {
+      const text = req.body.toString('utf-8');
+      return text ? JSON.parse(text) : {};
+    }
+
+    if (typeof req.body === 'string') {
+      return req.body ? JSON.parse(req.body) : {};
+    }
+
+    if (typeof (req as any).on === 'function') {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req as any) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      if (chunks.length > 0) {
+        const raw = Buffer.concat(chunks).toString('utf-8');
+        return raw ? JSON.parse(raw) : {};
+      }
+    }
+  } catch (err) {
+    console.warn('[Webhook Parser] Không thể parse JSON request body:', err);
+  }
+  return {};
+}
+
+/**
+ * Safely extracts payment code from messy banking SMS / transaction descriptions.
+ * Matches:
+ * 1. SEVQR[A-Z0-9]{5} (e.g. "CT DEN:470T26B02L3YPKWW SEVQRN27T5 (0862151811)" -> "SEVQRN27T5")
+ * 2. CYPRO[0-9]+ (e.g. "CYPRO01")
+ * 3. CY[A-Z0-9]{5} (excluding "CYTOOLS")
+ */
+export function extractPaymentCode(description: unknown): string | null {
+  if (!description || typeof description !== 'string') return null;
+  const text = description.trim();
+
+  // 1. Primary: Match SEVQR + 5 alphanumeric characters (VietinBank / SePay standard)
+  const sevqrMatch = text.match(/(?:^|[^A-Z0-9])(SEVQR[A-Z0-9]{5})(?:[^A-Z0-9]|$)/i);
+  if (sevqrMatch && sevqrMatch[1]) {
+    return sevqrMatch[1].toUpperCase();
+  }
+
+  // 2. Secondary: Match CYPRO followed by numbers (legacy pro codes e.g. CYPRO01)
+  const cyproMatch = text.match(/(?:^|[^A-Z0-9])(CYPRO[0-9]+)(?:[^A-Z0-9]|$)/i);
+  if (cyproMatch && cyproMatch[1]) {
+    return cyproMatch[1].toUpperCase();
+  }
+
+  // 3. Tertiary: Match CY + 5 alphanumeric characters (legacy format e.g. CYP45J5)
+  const cyMatch = text.match(/(?:^|[^A-Z0-9])(CY[A-Z0-9]{5})(?:[^A-Z0-9]|$)/i);
+  if (cyMatch && cyMatch[1]) {
+    const candidate = cyMatch[1].toUpperCase();
+    if (candidate !== 'CYTOOLS') {
+      return candidate;
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -29,7 +101,7 @@ function sendJson(res: ExtendedResponse, statusCode: number, data: any) {
  * - Query param '?secret=...', '?token=...', or '?apiKey=...'
  * - Body field 'body.secret', 'body.token', or 'body.apiKey'
  */
-export function isWebhookAuthorized(req: ExtendedRequest): boolean {
+export function isWebhookAuthorized(req: ExtendedRequest, body?: Record<string, any>): boolean {
   const configuredSecret = process.env.SEPAY_API_KEY || process.env.WEBHOOK_SECRET;
   // If neither SEPAY_API_KEY nor WEBHOOK_SECRET is configured, allow in development mode with warning
   if (!configuredSecret || !configuredSecret.trim()) {
@@ -50,7 +122,7 @@ export function isWebhookAuthorized(req: ExtendedRequest): boolean {
   ).trim();
 
   const queryToken = String(req.query?.secret || req.query?.token || req.query?.apiKey || '').trim();
-  const bodyToken = String(req.body?.secret || req.body?.token || req.body?.apiKey || '').trim();
+  const bodyToken = String(body?.secret || body?.token || body?.apiKey || req.body?.secret || req.body?.token || req.body?.apiKey || '').trim();
 
   return (
     tokenFromAuth === secret ||
@@ -62,31 +134,34 @@ export function isWebhookAuthorized(req: ExtendedRequest): boolean {
 }
 
 export default async function handler(req: ExtendedRequest, res: ExtendedResponse) {
-  // CORS Preflight
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Secret-Key, x-sepay-token, x-api-key');
-
-  if (req.method === 'OPTIONS') {
-    res.statusCode = 200;
-    return res.end();
-  }
-
-  if (req.method !== 'POST') {
-    return sendJson(res, 405, { success: false, error: 'Method Not Allowed' });
-  }
-
-  // 1. Security check: Validate Webhook Secret
-  if (!isWebhookAuthorized(req)) {
-    console.warn('[Webhook Security] Từ chối Webhook: Sai hoặc thiếu WEBHOOK_SECRET.');
-    return sendJson(res, 401, {
-      success: false,
-      error: 'Unauthorized: Invalid or missing Webhook Secret',
-    });
-  }
-
   try {
-    const body = req.body || {};
+    // CORS Preflight
+    if (typeof res.setHeader === 'function') {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Secret-Key, x-sepay-token, x-api-key');
+    }
+
+    if (req.method === 'OPTIONS') {
+      res.statusCode = 200;
+      return res.end();
+    }
+
+    if (req.method !== 'POST') {
+      return sendJson(res, 405, { success: false, error: 'Method Not Allowed' });
+    }
+
+    // Parse body first before authorization check (allows body.secret)
+    const body = await parseRequestBody(req);
+
+    // 1. Security check: Validate Webhook Secret
+    if (!isWebhookAuthorized(req, body)) {
+      console.warn('[Webhook Security] Từ chối Webhook: Sai hoặc thiếu WEBHOOK_SECRET.');
+      return sendJson(res, 401, {
+        success: false,
+        error: 'Unauthorized: Invalid or missing Webhook Secret',
+      });
+    }
 
     const description =
       body.content ||
@@ -117,31 +192,16 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
 
     console.log(`[Webhook Received] Description: "${description}", Amount: ${amount}`);
 
-    // Match code pattern: SEVQR + 5 alphanumeric chars (and retain CY... for backwards compatibility)
-    const matches = [
-      ...String(description).matchAll(/SEVQR[A-Z0-9]{5}/gi),
-      ...String(description).matchAll(/CY[A-Z0-9]{5}/gi),
-    ].map((m) => m[0].toUpperCase());
+    // Robust extraction of payment code
+    const code = extractPaymentCode(description);
 
-    if (matches.length === 0) {
-      console.warn('[Webhook Notice] Không tìm thấy mã SEVQR hoặc CY trong nội dung chuyển khoản.');
+    if (!code) {
+      console.warn(`[Webhook Notice] Không tìm thấy mã SEVQR hoặc CY trong nội dung chuyển khoản: "${description}"`);
       return sendJson(res, 200, {
         success: true,
         matched: false,
         message: 'Bỏ qua giao dịch do không chứa mã định danh (SEVQR hoặc CY)',
       });
-    }
-
-    // Resolve matching code
-    let code = matches[0];
-    for (const candidate of matches) {
-      if (candidate !== 'CYTOOLS') {
-        const order = await getOrder(candidate);
-        if (order) {
-          code = candidate;
-          break;
-        }
-      }
     }
 
     console.log(`[Webhook Matched Code] Tìm thấy mã đơn hàng: ${code}`);
@@ -169,10 +229,17 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
       message: 'Giao dịch đã được xác nhận và đồng bộ lên Vercel KV thành công!',
     });
   } catch (error) {
-    console.error('Lỗi khi xử lý Webhook SePay:', error);
-    return sendJson(res, 500, {
-      success: false,
-      error: 'Lỗi máy chủ khi xử lý Webhook',
-    });
+    console.error('[Webhook Fatal Error] Lỗi khi xử lý Webhook SePay:', error);
+    try {
+      return sendJson(res, 500, {
+        success: false,
+        error: 'Lỗi máy chủ khi xử lý Webhook',
+      });
+    } catch {
+      if (!res.headersSent) {
+        res.statusCode = 500;
+      }
+      return res.end();
+    }
   }
 }

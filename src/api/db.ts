@@ -207,6 +207,8 @@ export async function updateOrderName(code: string, donorName: string): Promise<
 
 /**
  * Marks an order as PAID, registers license key, and inserts donor into Hall of Fame.
+ * If the order was not pre-registered in DB (e.g. direct VietQR transfer or KV reset),
+ * automatically provisions the order record so valid customer transactions are NEVER lost.
  */
 export async function markOrderPaid(
   code: string,
@@ -220,33 +222,50 @@ export async function markOrderPaid(
 }> {
   if (!code) return { success: false, error: 'Mã đơn hàng không hợp lệ' };
   const db = await getDb();
+  if (!Array.isArray(db.orders)) db.orders = [];
+  if (!Array.isArray(db.licenses)) db.licenses = [];
+  if (!Array.isArray(db.donors)) db.donors = [];
+
   const upper = code.trim().toUpperCase();
-  const order = db.orders.find((o) => o.code.toUpperCase() === upper);
-
-  if (!order) {
-    return { success: false, error: 'Không tìm thấy đơn hàng' };
-  }
-
-  if (order.status === 'PAID') {
-    return { success: true, order, alreadyPaid: true };
-  }
-
-  if (order.type === 'PRO' && actualAmount < 5000) {
-    return { success: false, error: 'Số tiền thanh toán chưa đủ 5.000đ cho gói PRO' };
-  }
+  let order = db.orders.find((o) => o && o.code && o.code.toUpperCase() === upper);
 
   const now = new Date();
   const paidIso = now.toISOString();
-  order.status = 'PAID';
-  order.actualAmount = actualAmount;
-  order.paidAt = paidIso;
+
+  if (!order) {
+    // Auto-provision order on-the-fly for confirmed payments
+    const isPro = actualAmount >= 5000;
+    order = {
+      code: upper,
+      type: isPro ? 'PRO' : 'DONOR',
+      donorName: 'Người bạn ẩn danh',
+      expectedAmount: actualAmount,
+      actualAmount: actualAmount,
+      status: 'PAID',
+      createdAt: paidIso,
+      paidAt: paidIso,
+    };
+    db.orders.push(order);
+  } else {
+    if (order.status === 'PAID') {
+      return { success: true, order, alreadyPaid: true };
+    }
+
+    if (order.type === 'PRO' && actualAmount < 5000) {
+      return { success: false, error: 'Số tiền thanh toán chưa đủ 5.000đ cho gói PRO' };
+    }
+
+    order.status = 'PAID';
+    order.actualAmount = actualAmount;
+    order.paidAt = paidIso;
+  }
 
   const finalName = order.donorName?.trim() || 'Người bạn ẩn danh';
 
   // 1. Register license key (order code acts as the license key)
-  if (!db.licenses.some((l) => l.key.toUpperCase() === order.code.toUpperCase())) {
+  if (!db.licenses.some((l) => l && l.key && l.key.toUpperCase() === upper)) {
     db.licenses.push({
-      key: order.code,
+      key: upper,
       donorName: finalName,
       createdAt: paidIso,
     });
