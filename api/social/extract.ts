@@ -108,6 +108,15 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
     }
 
     const result = await extractSocialMedia(cleanUrl);
+
+    // Anti-Bot Safety Guard: Ensure no HTML / CAPTCHA string is returned as a stream URL
+    if (result.videoHd && (result.videoHd.includes('<!DOCTYPE') || result.videoHd.startsWith('data:text/html'))) {
+      return sendJson(res, 502, {
+        success: false,
+        error: 'Bị chặn bởi nền tảng. Vui lòng thử tải lại hoặc dùng tiện ích mở rộng Cytools.',
+      });
+    }
+
     return sendJson(res, 200, result);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Lỗi không xác định khi bóc tách media.';

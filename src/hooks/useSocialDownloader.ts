@@ -125,20 +125,18 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       scheduleStageProgression();
 
       try {
-        const rawDownloadUrl = mediaUrl.startsWith('/api/')
-          ? `${mediaUrl}${mediaUrl.includes('?') ? '&' : '?'}filename=${encodeURIComponent(targetFileName)}`
-          : `/api/download?url=${encodeURIComponent(mediaUrl)}&filename=${encodeURIComponent(targetFileName)}`;
-        const downloadUrl = getApiUrl(rawDownloadUrl);
+        const directUrl = mediaUrl;
 
         // 1. Chrome Extension Native Streaming Optimization:
-        // When running in Extension with downloads API, stream directly to disk with 0 MB JS heap allocation!
+        // Use user's local residential IP directly via chrome.downloads API.
+        // Completely bypasses Vercel 10s timeouts, datacenter IP bans, and uses 0 MB heap!
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const chromeObj = (window as any).chrome;
+        const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
         if (chromeObj?.downloads?.download) {
           await new Promise<void>((resolve, reject) => {
             chromeObj.downloads.download(
               {
-                url: downloadUrl,
+                url: directUrl,
                 filename: targetFileName,
                 saveAs: false,
               },
@@ -168,117 +166,95 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
           setTimeout(() => {
             setDownloadProgress(INITIAL_PROGRESS);
-          }, 4000);
+          }, 3500);
           return;
         }
 
-        // 2. Standard Web Browser Fetch Streaming:
-        const response = await fetch(downloadUrl);
+        // 2. Standard Web Browser Client-Side Direct Download (Bypasses Vercel Proxy Timeouts)
+        const triggerNativeBrowserSave = (url: string, filename: string) => {
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          a.target = '_blank';
+          a.rel = 'noopener noreferrer';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        };
 
-        // Explicit Check: HTTP 204 No Content
-        if (response.status === 204) {
-          throw new Error('Máy chủ phản hồi rỗng (204 No Content). Không thể tải luồng phương tiện. Vui lòng thử lại sau.');
-        }
+        let downloadedViaBlob = false;
 
-        // If response is not OK (4xx, 5xx), parse error message from server
-        if (!response.ok) {
-          let errorDetail = `Lỗi máy chủ (${response.status}): Không thể tải video.`;
-          try {
-            const errText = await response.text();
-            try {
-              const errJson = JSON.parse(errText);
-              if (errJson.error) {
-                errorDetail = errJson.error;
-              }
-            } catch {
-              if (errText && errText.trim().length > 0 && errText.length < 300) {
-                errorDetail = errText.trim();
-              }
-            }
-          } catch {
-            // Non-readable error body
+        // Try direct fetch with blob streaming if CORS is supported by CDN
+        try {
+          const response = await fetch(directUrl);
+
+          // Anti-bot check: Platform returned CAPTCHA or HTML page instead of video
+          const contentType = response.headers.get('content-type') || '';
+          if (contentType.includes('text/html')) {
+            throw new Error('Bị chặn bởi nền tảng. Vui lòng thử tải lại hoặc dùng tiện ích mở rộng Cytools.');
           }
-          throw new Error(errorDetail);
-        }
 
-        // Guard against server returning JSON error body even if status was 200
-        const contentType = response.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          try {
-            const jsonBody = await response.json();
-            if (jsonBody.error) {
-              throw new Error(jsonBody.error);
-            }
-          } catch (jsonErr) {
-            if (jsonErr instanceof Error && jsonErr.message) {
-              throw jsonErr;
-            }
-          }
-          throw new Error('Máy chủ trả về dữ liệu JSON thay vì luồng tệp tin video/audio.');
-        }
-
-        // Check if content-length is explicitly 0 without consuming the body
-        if (response.headers.get('content-length') === '0') {
-          throw new Error('Máy chủ phản hồi file rỗng (0 bytes). Vui lòng thử lại chất lượng khác.');
-        }
-
-        // Consume the stream once and cleanly using native browser blob implementation
-        let blob: Blob | null = await response.blob();
-
-        if (blob.size === 0) {
-          throw new Error('Dữ liệu nhận được rỗng (0 bytes). Vui lòng chọn chất lượng khác hoặc thử lại sau.');
-        }
-
-        // Guard against disguised error payloads (e.g. server returned small error string/json under octet-stream)
-        if (blob.size < 500) {
-          const sampleText = await blob.text();
-          if (
-            sampleText.includes('{"error"') ||
-            sampleText.includes('Error:') ||
-            sampleText.includes('<!DOCTYPE') ||
-            sampleText.includes('<html')
-          ) {
-            try {
-              const errParsed = JSON.parse(sampleText);
-              if (errParsed.error) throw new Error(errParsed.error);
-            } catch (pErr) {
-              if (pErr instanceof Error && !pErr.message.includes('JSON')) {
-                throw pErr;
+          if (response.ok) {
+            let blob: Blob | null = await response.blob();
+            if (blob && blob.size > 0) {
+              // Safety check: Detect small anti-bot HTML disguises
+              if (blob.size < 1500) {
+                const sampleText = await blob.text();
+                if (
+                  sampleText.includes('<!DOCTYPE') ||
+                  sampleText.includes('<html') ||
+                  sampleText.includes('darker-dark-theme') ||
+                  sampleText.includes('consent.youtube.com')
+                ) {
+                  throw new Error('Bị chặn bởi nền tảng (Anti-Bot). Vui lòng thử tải lại hoặc dùng tiện ích mở rộng Cytools.');
+                }
               }
+
+              const objectUrl = URL.createObjectURL(blob);
+              triggerNativeBrowserSave(objectUrl, targetFileName);
+              setTimeout(() => {
+                URL.revokeObjectURL(objectUrl);
+              }, 1000);
+
+              const fileSize = blob.size;
+              blob = null;
+
+              if (stageTimer) clearTimeout(stageTimer);
+
+              setDownloadProgress((prev) => ({
+                ...prev,
+                loadedBytes: fileSize,
+                totalBytes: fileSize,
+                percentage: 100,
+                stage: 'done',
+                status: 'completed',
+              }));
+
+              downloadedViaBlob = true;
             }
-            throw new Error(`Máy chủ báo lỗi: ${sampleText.slice(0, 150).replace(/[<>]/g, '')}`);
           }
+        } catch (fetchErr) {
+          // If error is explicit Anti-Bot or CAPTCHA, rethrow to display clean UI alert
+          if (fetchErr instanceof Error && fetchErr.message.includes('Bị chặn bởi nền tảng')) {
+            throw fetchErr;
+          }
+          // If CORS failed or direct fetch was blocked, fallback to native browser direct download!
+          console.warn('[useSocialDownloader] Direct fetch CORS restricted, triggering native download anchor:', fetchErr);
         }
 
-        const objectUrl = URL.createObjectURL(blob);
+        if (!downloadedViaBlob) {
+          // Direct fallback: Let browser handle streaming natively without passing through Vercel
+          triggerNativeBrowserSave(directUrl, targetFileName);
 
-        // Trigger browser save
-        const a = document.createElement('a');
-        a.href = objectUrl;
-        a.download = targetFileName;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
+          if (stageTimer) clearTimeout(stageTimer);
 
-        // Immediate revoke to prevent memory leaks in renderer heap (500ms instead of 60s)
-        setTimeout(() => {
-          URL.revokeObjectURL(objectUrl);
-        }, 500);
-
-        const fileSize = blob.size;
-        // Nullify reference immediately so GC can reclaim RAM
-        blob = null;
-
-        if (stageTimer) clearTimeout(stageTimer);
-
-        setDownloadProgress((prev) => ({
-          ...prev,
-          loadedBytes: fileSize,
-          totalBytes: fileSize,
-          percentage: 100,
-          stage: 'done',
-          status: 'completed',
-        }));
+          setDownloadProgress((prev) => ({
+            ...prev,
+            percentage: 100,
+            stage: 'done',
+            status: 'completed',
+          }));
+        }
 
         setTimeout(() => {
           setDownloadProgress(INITIAL_PROGRESS);
@@ -327,16 +303,29 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
         for (let i = 0; i < images.length; i++) {
           const item = images[i];
-          const proxyUrl = getApiUrl(`/api/download?url=${encodeURIComponent(item.url)}&filename=image_${i + 1}.jpg`);
+          let arrayBuffer: ArrayBuffer | null = null;
 
+          // Try direct client fetch first (fast, residential IP)
           try {
-            const res = await fetch(proxyUrl);
+            const res = await fetch(item.url);
             if (res.ok) {
-              const arrayBuffer = await res.arrayBuffer();
-              folder.file(`image_${String(i + 1).padStart(2, '0')}.jpg`, arrayBuffer);
+              arrayBuffer = await res.arrayBuffer();
             }
-          } catch (e) {
-            console.warn(`Failed to fetch image ${i + 1} for zip:`, e);
+          } catch {
+            // Fallback to proxy for small images if CORS restricted
+            try {
+              const proxyUrl = getApiUrl(`/api/download?url=${encodeURIComponent(item.url)}&filename=image_${i + 1}.jpg`);
+              const res = await fetch(proxyUrl);
+              if (res.ok) {
+                arrayBuffer = await res.arrayBuffer();
+              }
+            } catch (e) {
+              console.warn(`Failed to fetch image ${i + 1} for zip:`, e);
+            }
+          }
+
+          if (arrayBuffer) {
+            folder.file(`image_${String(i + 1).padStart(2, '0')}.jpg`, arrayBuffer);
           }
 
           setDownloadProgress((prev) => ({
