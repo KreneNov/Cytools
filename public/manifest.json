@@ -18,6 +18,8 @@
     "downloads"
   ],
   "host_permissions": [
+    "https://cytools.vercel.app/*",
+    "*://*.vercel.app/*",
     "<all_urls>"
   ],
   "background": {

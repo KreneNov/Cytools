@@ -3,34 +3,22 @@
  * across Web Browser and Chrome Extension (Manifest V3) environments.
  */
 
-export function isExtensionEnvironment(): boolean {
-  if (typeof window === 'undefined') return false;
-  // Strict check: Only consider it an extension environment when loaded under chrome-extension: protocol
-  return window.location.protocol === 'chrome-extension:';
-}
+import { getApiUrl, isExtensionEnvironment, PRODUCTION_API_URL } from './api';
+
+export { getApiUrl, isExtensionEnvironment, PRODUCTION_API_URL };
 
 /**
  * Returns the backend API base origin:
  * - Empty string in standard Web app (so relative paths /api/... hit Vite proxy or hosting origin)
- * - Configured base URL (VITE_API_BASE_URL) or default localhost:3000/5173 when in Chrome Extension
+ * - https://cytools.vercel.app when running inside Chrome Extension
  */
-export function getApiBaseUrl(path?: string): string {
+export function getApiBaseUrl(): string {
   if (typeof window === 'undefined') return '';
   const envUrl = (import.meta as unknown as { env?: { VITE_API_BASE_URL?: string } }).env?.VITE_API_BASE_URL;
-  if (envUrl && envUrl.trim().length > 0) return envUrl.trim();
+  if (envUrl && envUrl.trim().length > 0) return envUrl.trim().replace(/\/+$/, '');
 
   if (isExtensionEnvironment()) {
-    // Route download, video info, payment and hall of fame API calls to dedicated Express backend (port 3000)
-    if (
-      path &&
-      (path.includes('/api/download') ||
-        path.includes('/api/info') ||
-        path.includes('/api/payment') ||
-        path.includes('/api/hall-of-fame'))
-    ) {
-      return 'http://localhost:3000';
-    }
-    return 'http://localhost:5173';
+    return PRODUCTION_API_URL;
   }
   return '';
 }
@@ -39,14 +27,7 @@ export function getApiBaseUrl(path?: string): string {
  * Resolves an API path into a fully qualified URL when running inside an extension.
  */
 export function resolveApiUrl(path: string): string {
-  if (!path) return '';
-  if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('blob:') || path.startsWith('data:')) {
-    return path;
-  }
-
-  const baseUrl = getApiBaseUrl(path);
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-  return baseUrl ? `${baseUrl}${normalizedPath}` : normalizedPath;
+  return getApiUrl(path);
 }
 
 interface BackgroundFetchResponse<T = unknown> {

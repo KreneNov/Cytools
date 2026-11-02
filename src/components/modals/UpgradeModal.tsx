@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import { usePro } from '../../context/ProContext';
 import { HallOfFame } from '../community/HallOfFame';
-import { resolveApiUrl } from '../../utils/apiConfig';
+import { getApiUrl } from '../../utils/api';
 import { generateClientPaymentCode } from '../../utils/paymentUtils';
 
 const BANK_NAME = 'VietinBank (Ngân hàng TMCP Công Thương)';
@@ -95,7 +95,7 @@ export const UpgradeModal: React.FC = () => {
 
     setIsUpdatingDonorName(true);
     try {
-      const url = resolveApiUrl('/api/payment/update-name');
+      const url = getApiUrl('/api/payment/update-name');
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -163,7 +163,7 @@ export const UpgradeModal: React.FC = () => {
       setSessionStatus('IDLE');
 
       try {
-        const url = resolveApiUrl('/api/payment/create-session');
+        const url = getApiUrl('/api/payment/create-session');
         const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -201,7 +201,7 @@ export const UpgradeModal: React.FC = () => {
 
     const interval = setInterval(async () => {
       try {
-        const url = resolveApiUrl(`/api/payment/status?code=${sessionCode}&t=${Date.now()}`);
+        const url = getApiUrl(`/api/payment/status?code=${sessionCode}&t=${Date.now()}`);
         const res = await fetch(url, { cache: 'no-store' });
         const data = await res.json();
         if (data.success && (data.paid === true || data.status === 'PAID')) {
@@ -228,7 +228,7 @@ export const UpgradeModal: React.FC = () => {
   const handleDonorNameBlur = async () => {
     if (!sessionCode || !donorNameInput.trim()) return;
     try {
-      const url = resolveApiUrl('/api/payment/update-name');
+      const url = getApiUrl('/api/payment/update-name');
       await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -256,7 +256,7 @@ export const UpgradeModal: React.FC = () => {
     let paidData: { licenseKey?: string; donorName?: string; amount?: number } = {};
 
     try {
-      const url = resolveApiUrl(`/api/payment/status?code=${sessionCode}&t=${Date.now()}`);
+      const url = getApiUrl(`/api/payment/status?code=${sessionCode}&t=${Date.now()}`);
       const res = await fetch(url, { cache: 'no-store' });
       const data = await res.json();
       if (data.success && (data.paid === true || data.status === 'PAID')) {

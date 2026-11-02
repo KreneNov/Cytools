@@ -1,7 +1,7 @@
 /* oxlint-disable react/only-export-components */
 import React, { createContext, useState, useEffect, useCallback } from 'react';
 import confetti from 'canvas-confetti';
-import { resolveApiUrl } from '../utils/apiConfig';
+import { getApiUrl } from '../utils/api';
 
 interface ProContextType {
   isPro: boolean;
@@ -220,7 +220,7 @@ export const ProProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
 
       try {
-        const url = resolveApiUrl('/api/payment/verify-key');
+        const url = getApiUrl('/api/payment/verify-key');
         const res = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

@@ -6,7 +6,8 @@ import type {
   DownloadStage,
   SlideshowImageItem,
 } from '../types/socialDownloader';
-import { apiFetch, resolveApiUrl } from '../utils/apiConfig';
+import { apiFetch } from '../utils/apiConfig';
+import { getApiUrl } from '../utils/api';
 
 export interface UseSocialDownloaderReturn {
   isExtracting: boolean;
@@ -52,7 +53,18 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
     try {
       const response = await apiFetch(`/api/social/extract?url=${encodeURIComponent(url.trim())}`);
-      const data: ExtractionResult = await response.json();
+      const rawText = await response.text();
+
+      let data: ExtractionResult;
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        throw new Error(
+          response.status === 404
+            ? 'Không tìm thấy cổng dịch vụ bóc tách phương tiện trên máy chủ (HTTP 404).'
+            : `Máy chủ phản hồi định dạng không hợp lệ (${response.status}): ${rawText.slice(0, 100)}`
+        );
+      }
 
       if (!response.ok || !data.success) {
         throw new Error(data.error || 'Không thể trích xuất phương tiện từ liên kết này.');
@@ -116,7 +128,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         const rawDownloadUrl = mediaUrl.startsWith('/api/')
           ? `${mediaUrl}${mediaUrl.includes('?') ? '&' : '?'}filename=${encodeURIComponent(targetFileName)}`
           : `/api/download?url=${encodeURIComponent(mediaUrl)}&filename=${encodeURIComponent(targetFileName)}`;
-        const downloadUrl = resolveApiUrl(rawDownloadUrl);
+        const downloadUrl = getApiUrl(rawDownloadUrl);
 
         // 1. Chrome Extension Native Streaming Optimization:
         // When running in Extension with downloads API, stream directly to disk with 0 MB JS heap allocation!
@@ -315,7 +327,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
         for (let i = 0; i < images.length; i++) {
           const item = images[i];
-          const proxyUrl = resolveApiUrl(`/api/social/proxy-download?url=${encodeURIComponent(item.url)}&filename=image_${i + 1}.jpg`);
+          const proxyUrl = getApiUrl(`/api/download?url=${encodeURIComponent(item.url)}&filename=image_${i + 1}.jpg`);
 
           try {
             const res = await fetch(proxyUrl);

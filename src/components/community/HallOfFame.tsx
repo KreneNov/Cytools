@@ -11,7 +11,7 @@ import {
 import { HALL_OF_FAME_DATA, type DonorEntry } from '../../data/hallOfFame';
 import { usePro } from '../../context/ProContext';
 import { DonationTree } from './DonationTree';
-import { resolveApiUrl } from '../../utils/apiConfig';
+import { getApiUrl } from '../../utils/api';
 
 function parseDonationAmount(amountStr?: string): number {
   if (!amountStr) return 0;
@@ -50,7 +50,7 @@ export const HallOfFame: React.FC<HallOfFameProps> = ({
     let isMounted = true;
     const fetchLiveHallOfFame = async () => {
       try {
-        const url = resolveApiUrl(`/api/hall-of-fame?t=${Date.now()}`);
+        const url = getApiUrl(`/api/hall-of-fame?t=${Date.now()}`);
         const res = await fetch(url, { cache: 'no-store' });
         if (!res.ok) return;
         const data = await res.json();

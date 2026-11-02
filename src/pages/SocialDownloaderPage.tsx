@@ -203,7 +203,19 @@ export const SocialDownloaderPage: React.FC<SocialDownloaderPageProps> = ({ isCo
 
       try {
         const response = await apiFetch(`/api/social/extract?url=${encodeURIComponent(item.url)}`);
-        const data: ExtractionResult = await response.json();
+        const rawText = await response.text();
+
+        let data: ExtractionResult;
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          throw new Error(
+            response.status === 404
+              ? 'Máy chủ không tìm thấy endpoint bóc tách (404).'
+              : `Máy chủ phản hồi lỗi (${response.status}): ${rawText.slice(0, 100)}`
+          );
+        }
+
         if (!response.ok || !data.success) {
           throw new Error(data.error || 'Không thể trích xuất phương tiện từ liên kết này');
         }
