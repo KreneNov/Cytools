@@ -109,7 +109,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           setDownloadProgress((prev) => {
             if (!prev.isDownloading) return prev;
             let nextPercent = prev.percentage + 18;
-            if (nextPercent > 92) nextPercent = 92;
+            if (nextPercent > 90) nextPercent = 90;
             let nextStage: DownloadStage = 'video';
             if (nextPercent >= 70) nextStage = 'muxing';
             else if (nextPercent >= 35) nextStage = 'audio';
@@ -126,9 +126,49 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       scheduleStageProgression();
 
       try {
-        const directUrl = mediaUrl;
+        let directUrl = mediaUrl;
 
-        // 1. Chrome Extension Native Streaming Optimization:
+        // Phase 1: If YouTube and URL not yet resolved (or empty), resolve stream client-side via Cobalt v10
+        if ((!directUrl || optionId?.startsWith('youtube_')) && result?.videoId) {
+          const isAudio = optionId === 'youtube_audio';
+          const quality = optionId === 'youtube_1080p' ? '1080' : '720';
+          const targetYtUrl = `https://www.youtube.com/watch?v=${result.videoId}`;
+
+          try {
+            const cobaltRes = await fetch('https://rue-cobalt.xenon.zone', {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                url: targetYtUrl,
+                videoQuality: quality,
+                audioFormat: 'mp3',
+                isAudioOnly: isAudio,
+              }),
+              signal: AbortSignal.timeout(12000),
+            });
+
+            if (cobaltRes.ok) {
+              const cJson = await cobaltRes.json();
+              if (
+                cJson.url &&
+                (cJson.status === 'tunnel' || cJson.status === 'redirect' || cJson.status === 'stream')
+              ) {
+                directUrl = cJson.url;
+              }
+            }
+          } catch (cobaltErr) {
+            console.warn('[useSocialDownloader] Client Cobalt attempt failed:', cobaltErr);
+          }
+        }
+
+        if (!directUrl) {
+          throw new Error('Không thể phân giải đường dẫn tải xuống phương tiện. Vui lòng thử lại sau giây lát.');
+        }
+
+        // Phase 2: Chrome Extension Native Streaming Optimization:
         // Use user's local residential IP directly via chrome.downloads API.
         // Completely bypasses Vercel 10s timeouts, datacenter IP bans, and uses 0 MB heap!
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -171,36 +211,36 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           return;
         }
 
-        // 2. Standard Web Browser Client-Side Direct Download (Bypasses Vercel Proxy Timeouts)
-        const triggerNativeBrowserSave = (url: string, filename: string) => {
+        // Phase 3: Web Browser Client-Side Force Download via Local Blob (NEVER opens new tab!)
+        const triggerBlobSave = (blob: Blob, filename: string) => {
+          const objectUrl = URL.createObjectURL(blob);
           const a = document.createElement('a');
-          a.href = url;
+          a.href = objectUrl;
           a.download = filename;
-          a.target = '_blank';
-          a.rel = 'noopener noreferrer';
+          // STRICT RULE: DO NOT set a.target = '_blank'!
           document.body.appendChild(a);
           a.click();
           document.body.removeChild(a);
+          setTimeout(() => {
+            URL.revokeObjectURL(objectUrl);
+          }, 2000);
         };
 
-        let downloadedViaBlob = false;
+        let downloadedBlob: Blob | null = null;
 
-        // Try direct fetch with blob streaming if CORS is supported by CDN
+        // Step 3A: Attempt direct fetch first if CDN allows CORS
         try {
-          const response = await fetch(directUrl);
-
-          // Anti-bot check: Platform returned CAPTCHA or HTML page instead of video
+          const response = await fetch(directUrl, { signal: AbortSignal.timeout(25000) });
           const contentType = response.headers.get('content-type') || '';
           if (contentType.includes('text/html')) {
             throw new Error('Bị chặn bởi nền tảng. Vui lòng thử tải lại hoặc dùng tiện ích mở rộng Cytools.');
           }
 
           if (response.ok) {
-            let blob: Blob | null = await response.blob();
-            if (blob && blob.size > 0) {
-              // Safety check: Detect small anti-bot HTML disguises
-              if (blob.size < 1500) {
-                const sampleText = await blob.text();
+            const rawBlob = await response.blob();
+            if (rawBlob && rawBlob.size > 0) {
+              if (rawBlob.size < 1500) {
+                const sampleText = await rawBlob.text();
                 if (
                   sampleText.includes('<!DOCTYPE') ||
                   sampleText.includes('<html') ||
@@ -210,56 +250,57 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
                   throw new Error('Bị chặn bởi nền tảng (Anti-Bot). Vui lòng thử tải lại hoặc dùng tiện ích mở rộng Cytools.');
                 }
               }
-
-              const objectUrl = URL.createObjectURL(blob);
-              triggerNativeBrowserSave(objectUrl, targetFileName);
-              setTimeout(() => {
-                URL.revokeObjectURL(objectUrl);
-              }, 1000);
-
-              const fileSize = blob.size;
-              blob = null;
-
-              if (stageTimer) clearTimeout(stageTimer);
-
-              setDownloadProgress((prev) => ({
-                ...prev,
-                loadedBytes: fileSize,
-                totalBytes: fileSize,
-                percentage: 100,
-                stage: 'done',
-                status: 'completed',
-              }));
-
-              downloadedViaBlob = true;
+              downloadedBlob = rawBlob;
             }
           }
         } catch (fetchErr) {
-          // If error is explicit Anti-Bot or CAPTCHA, rethrow to display clean UI alert
           if (fetchErr instanceof Error && fetchErr.message.includes('Bị chặn bởi nền tảng')) {
             throw fetchErr;
           }
-          // If CORS failed or direct fetch was blocked, fallback to native browser direct download!
-          console.warn('[useSocialDownloader] Direct fetch CORS restricted, triggering native download anchor:', fetchErr);
+          console.warn('[useSocialDownloader] Direct fetch failed or CORS restricted, falling back to proxy:', fetchErr);
         }
 
-        if (!downloadedViaBlob) {
-          // Direct fallback: Let browser handle streaming natively without passing through Vercel
-          triggerNativeBrowserSave(directUrl, targetFileName);
+        // Step 3B: If direct fetch failed or was blocked by CORS (e.g. i.pinimg.com), fetch via /api/download proxy!
+        if (!downloadedBlob) {
+          const proxyUrl = getApiUrl(
+            `/api/download?url=${encodeURIComponent(directUrl)}&filename=${encodeURIComponent(targetFileName)}`
+          );
+          const proxyRes = await fetch(proxyUrl, { signal: AbortSignal.timeout(45000) });
+          if (!proxyRes.ok) {
+            let errMsg = `Máy chủ CDN upstream phản hồi lỗi: HTTP ${proxyRes.status}`;
+            try {
+              const errJson = await proxyRes.json();
+              if (errJson.error) errMsg = errJson.error;
+            } catch {
+              // Ignore
+            }
+            throw new Error(errMsg);
+          }
 
-          if (stageTimer) clearTimeout(stageTimer);
-
-          setDownloadProgress((prev) => ({
-            ...prev,
-            percentage: 100,
-            stage: 'done',
-            status: 'completed',
-          }));
+          const rawBlob = await proxyRes.blob();
+          if (!rawBlob || rawBlob.size === 0) {
+            throw new Error('Tệp tải về rỗng từ máy chủ.');
+          }
+          downloadedBlob = rawBlob;
         }
+
+        // Trigger local file save via Blob URL
+        triggerBlobSave(downloadedBlob, targetFileName);
+
+        if (stageTimer) clearTimeout(stageTimer);
+
+        setDownloadProgress((prev) => ({
+          ...prev,
+          loadedBytes: downloadedBlob!.size,
+          totalBytes: downloadedBlob!.size,
+          percentage: 100,
+          stage: 'done',
+          status: 'completed',
+        }));
 
         setTimeout(() => {
           setDownloadProgress(INITIAL_PROGRESS);
-        }, 4000);
+        }, 3500);
       } catch (err) {
         if (stageTimer) clearTimeout(stageTimer);
         const msg = err instanceof Error ? err.message : 'Lỗi khi tải tệp về máy tính.';
@@ -271,7 +312,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         }));
       }
     },
-    []
+    [result]
   );
 
   const downloadAllAsZip = useCallback(

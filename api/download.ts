@@ -119,13 +119,28 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
   );
 
   try {
+    const upstreamHeaders: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      Accept: '*/*',
+    };
+
+    const host = parsedMediaUrl.hostname.toLowerCase();
+    if (host.includes('pinimg.com') || host.includes('pinterest.com')) {
+      upstreamHeaders['Referer'] = 'https://www.pinterest.com/';
+    } else if (host.includes('fbcdn.net') || host.includes('facebook.com')) {
+      upstreamHeaders['Referer'] = 'https://www.facebook.com/';
+    } else if (host.includes('tiktok.com') || host.includes('tikwm.com') || host.includes('byteoversea.com')) {
+      upstreamHeaders['Referer'] = 'https://www.tiktok.com/';
+    } else if (host.includes('instagram.com') || host.includes('cdninstagram.com')) {
+      upstreamHeaders['Referer'] = 'https://www.instagram.com/';
+    } else if (host.includes('googlevideo.com') || host.includes('youtube.com')) {
+      upstreamHeaders['Referer'] = 'https://www.youtube.com/';
+    }
+
     const remoteRes = await fetch(cleanUrl, {
       method: 'GET',
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        Accept: '*/*',
-      },
+      headers: upstreamHeaders,
       redirect: 'follow',
       signal: AbortSignal.timeout(30000),
     });
