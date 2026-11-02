@@ -24,6 +24,7 @@ import {
 import { usePro } from '../../context/ProContext';
 import { HallOfFame } from '../community/HallOfFame';
 import { resolveApiUrl } from '../../utils/apiConfig';
+import { generateClientPaymentCode } from '../../utils/paymentUtils';
 
 const BANK_NAME = 'VietinBank (Ngân hàng TMCP Công Thương)';
 const ACCOUNT_NUMBER = '0862151811';
@@ -47,8 +48,8 @@ export const UpgradeModal: React.FC = () => {
   const activeTab = userSelectedTab ?? modalInitialTab ?? 'pro';
   const [copiedField, setCopiedField] = useState<string | null>(null);
 
-  // Dynamic Payment Session State
-  const [sessionCode, setSessionCode] = useState<string | null>(null);
+  // Dynamic Payment Session State (Guaranteed non-null, dynamic 10-character code matching SEVQR[A-Z0-9]{5})
+  const [sessionCode, setSessionCode] = useState<string>(() => generateClientPaymentCode());
   const [qrUrl, setQrUrl] = useState<string | null>(null);
   const [sessionStatus, setSessionStatus] = useState<'IDLE' | 'PENDING' | 'PAID' | 'ERROR'>('IDLE');
   const [donorNameInput, setDonorNameInput] = useState<string>('');
@@ -113,8 +114,15 @@ export const UpgradeModal: React.FC = () => {
 
     let isMounted = true;
     const createPaymentSession = async () => {
+      const initialCode = generateClientPaymentCode();
+      await Promise.resolve();
+      if (!isMounted) return;
+
+      setSessionCode(initialCode);
+      setQrUrl(null);
       setIsCreatingSession(true);
       setSessionStatus('IDLE');
+
       try {
         const url = resolveApiUrl('/api/payment/create-session');
         const res = await fetch(url, {
@@ -124,12 +132,13 @@ export const UpgradeModal: React.FC = () => {
           body: JSON.stringify({
             type: activeTab === 'donate' ? 'DONOR' : 'PRO',
             donorName: donorNameInputRef.current.trim() || undefined,
+            code: initialCode,
           }),
         });
         const data = await res.json();
         if (isMounted && data.success) {
-          setSessionCode(data.code);
-          setQrUrl(data.qrUrl);
+          if (data.code) setSessionCode(data.code);
+          if (data.qrUrl) setQrUrl(data.qrUrl);
           setSessionStatus('PENDING');
         }
       } catch (err) {
@@ -286,7 +295,7 @@ export const UpgradeModal: React.FC = () => {
     }, 2000);
   };
 
-  const currentTransferContent = sessionCode || 'SEVQR';
+  const currentTransferContent = sessionCode || generateClientPaymentCode();
   const effectiveQrUrl =
     qrUrl ||
     (activeTab === 'pro'

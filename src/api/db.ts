@@ -131,17 +131,29 @@ export function generatePaymentCode(db: CytoolsDb): string {
 }
 
 /**
- * Creates a new pending payment order.
+ * Creates a new pending payment order with dynamic code validation.
  */
 export async function createOrder({
   type = 'PRO',
   donorName = '',
+  code: requestedCode,
 }: {
   type?: 'PRO' | 'DONOR';
   donorName?: string;
+  code?: string;
 }): Promise<{ order: Order; qrUrl: string }> {
   const db = await getDb();
-  const code = generatePaymentCode(db);
+  
+  let code = '';
+  if (requestedCode && typeof requestedCode === 'string') {
+    const clean = requestedCode.trim().toUpperCase();
+    if (/^SEVQR[A-Z0-9]{5}$/.test(clean) && !db.orders.some((o) => o.code.toUpperCase() === clean)) {
+      code = clean;
+    }
+  }
+  if (!code) {
+    code = generatePaymentCode(db);
+  }
   const expectedAmount = type === 'PRO' ? 5000 : 0;
   const now = new Date().toISOString();
 

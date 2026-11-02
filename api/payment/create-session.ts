@@ -5,6 +5,7 @@ interface ExtendedRequest extends IncomingMessage {
   body?: {
     type?: 'PRO' | 'DONOR';
     donorName?: string;
+    code?: string;
   };
 }
 
@@ -38,12 +39,13 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
   }
 
   try {
-    const { type = 'PRO', donorName = '' } = req.body || {};
+    const { type = 'PRO', donorName = '', code } = req.body || {};
     const normalizedType = type === 'DONOR' ? 'DONOR' : 'PRO';
 
     const { order, qrUrl } = await createOrder({
       type: normalizedType,
       donorName: typeof donorName === 'string' ? donorName.trim() : '',
+      code: typeof code === 'string' ? code.trim() : undefined,
     });
 
     return sendJson(res, 200, {
