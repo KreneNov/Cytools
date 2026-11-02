@@ -1,3 +1,4 @@
+import Redis from 'ioredis';
 import { createClient } from '@vercel/kv';
 
 export interface Order {
@@ -19,6 +20,7 @@ export interface License {
 
 export interface Donor {
   id: number;
+  code?: string;
   name: string;
   role: string;
   badgeType: 'pro' | 'coffee' | 'heart';
@@ -58,25 +60,85 @@ const AVATAR_COLORS = [
 
 // In-memory fallback database for local development or when KV is unconfigured/unavailable
 let inMemoryDb: CytoolsDb = JSON.parse(JSON.stringify(INITIAL_DB));
+
+let _redisTcpClient: Redis | null = null;
 let _kvClient: ReturnType<typeof createClient> | null = null;
 
 /**
- * Safely initializes or retrieves the Vercel KV client.
- * Returns null if environment variables are missing, avoiding top-level crashes.
+ * Resolves standard Redis TCP connection string (e.g. KV_REDIS_URL or REDIS_URL from Redis Cloud).
  */
-function getKvClient() {
-  if (_kvClient) return _kvClient;
+function getRedisTcpUrl(): string | null {
+  if (typeof process === 'undefined' || !process.env) return null;
+  const url = process.env.KV_REDIS_URL || process.env.REDIS_URL;
+  return url && url.trim() ? url.trim() : null;
+}
+
+/**
+ * Safely initializes or retrieves the ioredis client for standard TCP Redis connections.
+ */
+function getRedisTcpClient(): Redis | null {
+  if (_redisTcpClient) return _redisTcpClient;
+  const url = getRedisTcpUrl();
+  if (!url) return null;
+
+  try {
+    _redisTcpClient = new Redis(url, {
+      lazyConnect: false,
+      connectTimeout: 5000,
+      maxRetriesPerRequest: 2,
+      enableReadyCheck: false,
+      retryStrategy(times) {
+        if (times > 3) return null;
+        return Math.min(times * 100, 1000);
+      },
+      tls: url.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined,
+    });
+
+    _redisTcpClient.on('error', (err) => {
+      console.warn('[Redis TCP] Socket warning:', err.message);
+    });
+
+    return _redisTcpClient;
+  } catch (err) {
+    console.warn('[Redis TCP] Lỗi khi tạo Redis TCP client:', err);
+    return null;
+  }
+}
+
+/**
+ * Resolves Vercel KV REST connection parameters.
+ * Supports both Vercel KV (KV_REST_API_URL/TOKEN) and Upstash Integration (UPSTASH_REDIS_REST_URL/TOKEN).
+ */
+function getKvConfig(): { url: string; token: string } | null {
   if (typeof process === 'undefined' || !process.env) return null;
 
-  const url = process.env.KV_REST_API_URL || process.env.KV_URL;
-  const token = process.env.KV_REST_API_TOKEN;
+  const url =
+    process.env.KV_REST_API_URL ||
+    process.env.UPSTASH_REDIS_REST_URL ||
+    process.env.KV_URL;
+
+  const token =
+    process.env.KV_REST_API_TOKEN ||
+    process.env.UPSTASH_REDIS_REST_TOKEN;
 
   if (!url || !token) {
     return null;
   }
 
+  return { url: url.trim(), token: token.trim() };
+}
+
+/**
+ * Safely initializes or retrieves the Vercel KV / Upstash Redis client.
+ * Returns null if environment variables are missing, avoiding top-level crashes.
+ */
+function getKvClient() {
+  if (_kvClient) return _kvClient;
+  const cfg = getKvConfig();
+  if (!cfg) return null;
+
   try {
-    _kvClient = createClient({ url, token });
+    _kvClient = createClient(cfg);
     return _kvClient;
   } catch (err) {
     console.warn('[Vercel KV] Lỗi khi tạo KV client:', err);
@@ -85,24 +147,54 @@ function getKvClient() {
 }
 
 /**
- * Reads the database state from Vercel KV with safe in-memory fallback.
+ * Returns current storage driver: 'redis-tcp' | 'vercel-kv' | 'in-memory'.
+ */
+export function getStorageDriver(): 'redis-tcp' | 'vercel-kv' | 'in-memory' {
+  if (getRedisTcpClient()) return 'redis-tcp';
+  if (getKvClient()) return 'vercel-kv';
+  return 'in-memory';
+}
+
+/**
+ * Reads the database state from Redis TCP, Vercel KV, or safe in-memory fallback.
  */
 export async function getDb(): Promise<CytoolsDb> {
-  const client = getKvClient();
-  if (client) {
+  // 1. Primary: Redis TCP client (KV_REDIS_URL / REDIS_URL)
+  const redisTcp = getRedisTcpClient();
+  if (redisTcp) {
     try {
-      const data = await client.get<CytoolsDb>(DB_KEY);
+      const raw = await redisTcp.get(DB_KEY);
+      if (raw) {
+        const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (data && typeof data === 'object') {
+          if (!Array.isArray(data.orders)) data.orders = [];
+          if (!Array.isArray(data.licenses)) data.licenses = [];
+          if (!Array.isArray(data.donors)) data.donors = [];
+          return data;
+        }
+      }
+      await redisTcp.set(DB_KEY, JSON.stringify(INITIAL_DB));
+      return JSON.parse(JSON.stringify(INITIAL_DB));
+    } catch (err) {
+      console.warn('[Redis TCP] Lỗi khi đọc dữ liệu từ Redis TCP, thử fallback tiếp theo:', err);
+    }
+  }
+
+  // 2. Secondary: Vercel KV REST client (KV_REST_API_URL / TOKEN)
+  const kvClient = getKvClient();
+  if (kvClient) {
+    try {
+      const data = await kvClient.get<CytoolsDb>(DB_KEY);
       if (data && typeof data === 'object') {
         if (!Array.isArray(data.orders)) data.orders = [];
         if (!Array.isArray(data.licenses)) data.licenses = [];
         if (!Array.isArray(data.donors)) data.donors = [];
         return data;
       }
-      await client.set(DB_KEY, INITIAL_DB);
+      await kvClient.set(DB_KEY, INITIAL_DB);
       return JSON.parse(JSON.stringify(INITIAL_DB));
     } catch (err) {
-      console.warn('[Vercel KV] Lỗi khi đọc dữ liệu từ Vercel KV, chuyển sang chế độ fallback:', err);
-      return inMemoryDb;
+      console.warn('[Vercel KV] Lỗi khi đọc dữ liệu từ Vercel KV, chuyển sang in-memory fallback:', err);
     }
   }
 
@@ -110,13 +202,25 @@ export async function getDb(): Promise<CytoolsDb> {
 }
 
 /**
- * Saves database state to Vercel KV with safe in-memory fallback.
+ * Saves database state to Redis TCP, Vercel KV, or safe in-memory fallback.
  */
 export async function saveDb(data: CytoolsDb): Promise<void> {
-  const client = getKvClient();
-  if (client) {
+  // 1. Primary: Redis TCP client
+  const redisTcp = getRedisTcpClient();
+  if (redisTcp) {
     try {
-      await client.set(DB_KEY, data);
+      await redisTcp.set(DB_KEY, JSON.stringify(data));
+      return;
+    } catch (err) {
+      console.warn('[Redis TCP] Lỗi khi lưu dữ liệu vào Redis TCP, thử fallback tiếp theo:', err);
+    }
+  }
+
+  // 2. Secondary: Vercel KV REST client
+  const kvClient = getKvClient();
+  if (kvClient) {
+    try {
+      await kvClient.set(DB_KEY, data);
       return;
     } catch (err) {
       console.warn('[Vercel KV] Lỗi khi lưu dữ liệu vào Vercel KV, lưu tạm vào memory:', err);
@@ -208,7 +312,7 @@ export async function getOrder(code: string): Promise<Order | null> {
 }
 
 /**
- * Updates the display name for a pending order.
+ * Updates the display name for a pending or completed order, and syncs to Hall of Fame donors list.
  */
 export async function updateOrderName(code: string, donorName: string): Promise<Order | null> {
   if (!code) return null;
@@ -217,13 +321,31 @@ export async function updateOrderName(code: string, donorName: string): Promise<
   const order = db.orders.find((o) => o.code.toUpperCase() === upper);
   if (!order) return null;
 
-  order.donorName = (donorName || '').trim();
+  const trimmed = (donorName || '').trim();
+  order.donorName = trimmed;
+
+  // Sync to corresponding donor in Hall of Fame
+  if (Array.isArray(db.donors)) {
+    const donor = db.donors.find((d) => d && (d.code === upper || String(d.id) === upper));
+    if (donor && trimmed) {
+      donor.name = trimmed;
+    }
+  }
+
+  // Sync to corresponding license
+  if (Array.isArray(db.licenses)) {
+    const license = db.licenses.find((l) => l && l.key === upper);
+    if (license && trimmed) {
+      license.donorName = trimmed;
+    }
+  }
+
   await saveDb(db);
   return order;
 }
 
 /**
- * Marks an order as PAID, registers license key, and inserts donor into Hall of Fame.
+ * Marks an order as PAID, registers license key, and inserts/updates donor in Hall of Fame immediately.
  * If the order was not pre-registered in DB (e.g. direct VietQR transfer or KV reset),
  * automatically provisions the order record so valid customer transactions are NEVER lost.
  */
@@ -255,7 +377,7 @@ export async function markOrderPaid(
     order = {
       code: upper,
       type: isPro ? 'PRO' : 'DONOR',
-      donorName: 'Người bạn ẩn danh',
+      donorName: 'Người bạn đồng hành',
       expectedAmount: actualAmount,
       actualAmount: actualAmount,
       status: 'PAID',
@@ -265,7 +387,8 @@ export async function markOrderPaid(
     db.orders.push(order);
   } else {
     if (order.status === 'PAID') {
-      return { success: true, order, alreadyPaid: true };
+      const existingDonor = db.donors.find((d) => d && (d.code === upper || String(d.id) === upper));
+      return { success: true, order, donor: existingDonor, alreadyPaid: true };
     }
 
     if (order.type === 'PRO' && actualAmount < 5000) {
@@ -277,10 +400,11 @@ export async function markOrderPaid(
     order.paidAt = paidIso;
   }
 
-  const finalName = order.donorName?.trim() || 'Người bạn ẩn danh';
+  const finalName = order.donorName?.trim() || 'Người bạn đồng hành';
+  const isPro = order.type === 'PRO' || actualAmount >= 5000;
 
-  // 1. Register license key (order code acts as the license key)
-  if (!db.licenses.some((l) => l && l.key && l.key.toUpperCase() === upper)) {
+  // 1. Register license key (order code acts as the license key) for any PRO or 5k+ donation
+  if (isPro && !db.licenses.some((l) => l && l.key && l.key.toUpperCase() === upper)) {
     db.licenses.push({
       key: upper,
       donorName: finalName,
@@ -288,10 +412,9 @@ export async function markOrderPaid(
     });
   }
 
-  // 2. Prepend new donor to Hall of Fame
+  // 2. Prepend or update donor in Hall of Fame
   const formattedDate = `${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`;
   const formattedAmount = `${new Intl.NumberFormat('vi-VN').format(actualAmount)}đ`;
-  const isPro = order.type === 'PRO';
   const role = isPro ? 'PRO Member' : actualAmount >= 50000 ? 'Super Supporter' : 'Donator';
   const badgeType: 'pro' | 'coffee' | 'heart' = isPro ? 'pro' : actualAmount >= 50000 ? 'coffee' : 'heart';
   const randomColor = AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)];
@@ -299,23 +422,40 @@ export async function markOrderPaid(
     ? 'Kích hoạt gói PRO tự động qua VietQR.'
     : 'Ủng hộ dự án Cytools phát triển cộng đồng.';
 
-  const newDonor: Donor = {
-    id: Date.now(),
-    name: finalName,
-    role,
-    badgeType,
-    amount: formattedAmount,
-    numericAmount: actualAmount,
-    type: order.type,
-    message: defaultMessage,
-    date: formattedDate,
-    avatarColor: randomColor,
-  };
+  let donor: Donor;
+  const existingDonorIdx = db.donors.findIndex((d) => d && (d.code === upper || String(d.id) === upper));
 
-  db.donors.unshift(newDonor);
+  if (existingDonorIdx >= 0) {
+    db.donors[existingDonorIdx] = {
+      ...db.donors[existingDonorIdx],
+      code: upper,
+      name: finalName,
+      amount: formattedAmount,
+      numericAmount: actualAmount,
+      type: isPro ? 'PRO' : 'DONOR',
+      role,
+      badgeType,
+    };
+    donor = db.donors[existingDonorIdx];
+  } else {
+    donor = {
+      id: Date.now(),
+      code: upper,
+      name: finalName,
+      role,
+      badgeType,
+      amount: formattedAmount,
+      numericAmount: actualAmount,
+      type: isPro ? 'PRO' : 'DONOR',
+      message: defaultMessage,
+      date: formattedDate,
+      avatarColor: randomColor,
+    };
+    db.donors.unshift(donor);
+  }
+
   await saveDb(db);
-
-  return { success: true, order, donor: newDonor };
+  return { success: true, order, donor };
 }
 
 /**

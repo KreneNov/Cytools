@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'http';
-import { getHallOfFame } from './_db.js';
+import { getHallOfFame, getStorageDriver } from './_db.js';
 
 interface ExtendedResponse extends ServerResponse {
   status?: (code: number) => ExtendedResponse;
@@ -34,6 +34,7 @@ export default async function handler(req: IncomingMessage, res: ExtendedRespons
     const data = await getHallOfFame();
     return sendJson(res, 200, {
       success: true,
+      storageDriver: getStorageDriver(),
       donors: data.donors,
       totalAmount: data.totalAmount,
       proCount: data.proCount,

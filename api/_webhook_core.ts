@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'http';
-import { markOrderPaid } from './_db.js';
+import { markOrderPaid, getStorageDriver } from './_db.js';
 
 export interface ExtendedRequest extends IncomingMessage {
   query?: Record<string, string>;
@@ -225,10 +225,12 @@ export async function handleWebhookRequest(req: ExtendedRequest, res: ExtendedRe
     return sendJson(res, 200, {
       success: true,
       matched: true,
+      storageDriver: getStorageDriver(),
       alreadyPaid: Boolean(result.alreadyPaid),
       code,
       actualAmount: result.order?.actualAmount,
       licenseKey: result.order?.code,
+      donor: result.donor,
       message: 'Giao dịch đã được xác nhận và đồng bộ lên Vercel KV thành công!',
     });
   } catch (error) {

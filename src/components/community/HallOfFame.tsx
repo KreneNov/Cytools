@@ -65,8 +65,14 @@ export const HallOfFame: React.FC<HallOfFameProps> = ({
 
     fetchLiveHallOfFame();
 
+    const handleHofEvent = () => {
+      fetchLiveHallOfFame();
+    };
+    window.addEventListener('cytools:hof-updated', handleHofEvent);
+
     return () => {
       isMounted = false;
+      window.removeEventListener('cytools:hof-updated', handleHofEvent);
     };
   }, [refreshTrigger]);
 

@@ -54,6 +54,7 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
 
     return sendJson(res, 200, {
       success: true,
+      paid: order.status === 'PAID',
       code: order.code,
       status: order.status,
       type: order.type,
