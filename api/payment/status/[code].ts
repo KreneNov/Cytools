@@ -1,3 +1,4 @@
-import handler from '../status';
+import handler from '../status.js';
 
 export default handler;
+

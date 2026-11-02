@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'http';
-import { getHallOfFame } from '../src/api/db';
+import { getHallOfFame } from './_db.js';
 
 interface ExtendedResponse extends ServerResponse {
   status?: (code: number) => ExtendedResponse;

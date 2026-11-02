@@ -1,3 +1,3 @@
-import handler from './payment/webhook';
+import { handleWebhookRequest } from './_webhook_core.js';
 
-export default handler;
+export default handleWebhookRequest;

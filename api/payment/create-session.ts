@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'http';
-import { createOrder } from '../../src/api/db';
+import { createOrder } from '../_db.js';
 
 interface ExtendedRequest extends IncomingMessage {
   body?: {

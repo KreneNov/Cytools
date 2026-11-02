@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'http';
-import { verifyLicenseKey } from '../../src/api/db';
+import { verifyLicenseKey } from '../_db.js';
 
 interface ExtendedRequest extends IncomingMessage {
   body?: {
