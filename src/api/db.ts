@@ -167,8 +167,8 @@ export async function getDb(): Promise<CytoolsDb> {
       const data = await kv.get<CytoolsDb>(DB_KEY);
       if (data && typeof data === 'object') {
         if (!Array.isArray(data.orders)) data.orders = [];
-        if (!Array.isArray(data.licenses)) data.licenses = INITIAL_DB.licenses;
-        if (!Array.isArray(data.donors) || data.donors.length === 0) data.donors = INITIAL_DB.donors;
+        if (!Array.isArray(data.licenses)) data.licenses = [];
+        if (!Array.isArray(data.donors)) data.donors = [];
         return data;
       }
       // Seed initial data into Vercel KV
