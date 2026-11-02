@@ -1,5 +1,6 @@
 import { kv } from '@vercel/kv';
-
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
 export interface Order {
   code: string;
   type: 'PRO' | 'DONOR';
