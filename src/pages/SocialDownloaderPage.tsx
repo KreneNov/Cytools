@@ -310,7 +310,7 @@ export const SocialDownloaderPage: React.FC<SocialDownloaderPageProps> = ({ isCo
   };
 
   return (
-    <div className={`max-w-5xl mx-auto ${isCompact ? 'space-y-4 pb-2' : 'space-y-6 pb-12'}`}>
+    <div className={`w-full max-w-5xl mx-auto ${isCompact ? 'space-y-4 pb-2' : 'space-y-6 pb-12'}`}>
       {/* Page Header */}
       {!isCompact && (
         <div className="space-y-2">
@@ -324,7 +324,7 @@ export const SocialDownloaderPage: React.FC<SocialDownloaderPageProps> = ({ isCo
       )}
 
       {/* Tabs Selector: Single Link vs Batch Multi-Link */}
-      <div className="flex items-center gap-2 border-b border-slate-200 dark:border-slate-800 pb-2">
+      <div className="flex items-center gap-2 border-b border-slate-200 dark:border-slate-800 pb-2 overflow-x-auto no-scrollbar">
         <button
           onClick={() => setActiveTab('single')}
           className={`relative flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold transition-colors cursor-pointer ${
@@ -390,7 +390,7 @@ export const SocialDownloaderPage: React.FC<SocialDownloaderPageProps> = ({ isCo
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -6 }}
             transition={{ duration: 0.2, ease: 'easeOut' }}
-            className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 md:p-8 space-y-4"
+            className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 sm:p-6 md:p-8 space-y-4"
           >
           <div className="space-y-2">
             <div className="flex items-center justify-between text-xs">
@@ -475,7 +475,7 @@ export const SocialDownloaderPage: React.FC<SocialDownloaderPageProps> = ({ isCo
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0, y: -6 }}
             transition={{ duration: 0.2, ease: 'easeOut' }}
-            className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 md:p-8 space-y-4"
+            className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 sm:p-6 md:p-8 space-y-4"
           >
           <form onSubmit={handleExtract} className="space-y-4">
             <div className="space-y-2">

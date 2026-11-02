@@ -10,6 +10,7 @@ import {
   Download,
 } from 'lucide-react';
 import { ChromeIcon } from '../ui/ChromeIcon';
+import { RAW_EXTENSION_DRIVE_URL, getDirectDriveDownloadUrl } from '../../config/downloadConfig';
 
 interface InstallExtensionModalProps {
   isOpen: boolean;
@@ -21,7 +22,6 @@ export const InstallExtensionModal: React.FC<InstallExtensionModalProps> = ({
   onClose,
 }) => {
   const [isCopied, setIsCopied] = useState(false);
-  const [downloadTimestamp] = useState(() => Date.now());
 
   const handleCopy = useCallback(async (textToCopy: string = 'chrome://extensions') => {
     try {
@@ -125,8 +125,9 @@ export const InstallExtensionModal: React.FC<InstallExtensionModalProps> = ({
                 </div>
 
                 <a
-                  href={`/cytools-extension.zip?t=${downloadTimestamp}`}
-                  download="cytools-extension.zip"
+                  href={getDirectDriveDownloadUrl(RAW_EXTENSION_DRIVE_URL)}
+                  target="_blank"
+                  rel="noopener noreferrer"
                   className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-[#FF758F] hover:bg-[#ff5d7b] text-white text-sm font-bold transition-all active:scale-95 cursor-pointer flex items-center justify-center gap-2 shadow-xs shrink-0 no-underline"
                 >
                   <Download className="w-4 h-4" />

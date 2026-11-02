@@ -5,6 +5,7 @@ import { AnimatedThemeToggle } from '../theme/AnimatedThemeToggle';
 import { SocialDownloaderPage } from '../../pages/SocialDownloaderPage';
 import { UpgradeModal } from '../modals/UpgradeModal';
 import { usePro } from '../../context/ProContext';
+import { CYTOOLS_WEB_URL } from '../../config/downloadConfig';
 
 export const ExtensionPopupView: React.FC = () => {
   const { isPro, openProModal } = usePro();
@@ -64,9 +65,16 @@ export const ExtensionPopupView: React.FC = () => {
         </span>
 
         <a
-          href="https://cytools.app"
+          href={CYTOOLS_WEB_URL}
           target="_blank"
           rel="noopener noreferrer"
+          onClick={(e) => {
+            const chromeApi = typeof window !== 'undefined' ? (window as unknown as { chrome?: any }).chrome : undefined;
+            if (chromeApi?.tabs?.create) {
+              e.preventDefault();
+              chromeApi.tabs.create({ url: CYTOOLS_WEB_URL });
+            }
+          }}
           className="font-semibold text-pink-600 dark:text-pink-400 hover:text-pink-500 hover:underline flex items-center gap-1 group text-xs cursor-pointer"
           title="Mở toàn bộ công cụ tiện ích tại Cytools Web"
         >

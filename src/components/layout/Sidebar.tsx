@@ -63,9 +63,15 @@ const NAV_ITEMS: NavItem[] = [
 
 interface SidebarProps {
   isCompact?: boolean;
+  isMobileDrawer?: boolean;
+  onNavigate?: () => void;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ isCompact = false }) => {
+export const Sidebar: React.FC<SidebarProps> = ({
+  isCompact = false,
+  isMobileDrawer = false,
+  onNavigate,
+}) => {
   const location = useLocation();
   const { isPro, isPendingPro, openProModal } = usePro();
   const navContainerRef = useRef<HTMLDivElement>(null);
@@ -127,8 +133,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCompact = false }) => {
 
   return (
     <aside
-      className={`shrink-0 bg-white dark:bg-zinc-950/95 border-r border-zinc-200 dark:border-zinc-800/80 flex flex-col h-screen sticky top-0 select-none transition-all duration-200 ${
-        isCompact ? 'w-16' : 'w-64'
+      className={`shrink-0 bg-white dark:bg-zinc-950/95 flex flex-col h-screen sticky top-0 select-none transition-all duration-200 ${
+        isMobileDrawer
+          ? 'w-full h-full border-r-0'
+          : isCompact
+          ? 'w-16 border-r border-zinc-200 dark:border-zinc-800/80'
+          : 'w-64 border-r border-zinc-200 dark:border-zinc-800/80'
       }`}
     >
       {/* Brand Header */}
@@ -137,7 +147,14 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCompact = false }) => {
           isCompact ? 'p-3 flex justify-center' : 'p-5'
         }`}
       >
-        <NavLink to="/" className="block">
+        <NavLink
+          to="/"
+          onClick={() => {
+            onNavigate?.();
+            window.scrollTo({ top: 0, behavior: 'instant' });
+          }}
+          className="block"
+        >
           <BrandLogo size={isCompact ? 'sm' : 'md'} showText={!isCompact} />
         </NavLink>
       </div>
@@ -203,6 +220,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCompact = false }) => {
             <NavLink
               key={item.id}
               to={item.path}
+              onClick={() => {
+                onNavigate?.();
+                window.scrollTo({ top: 0, behavior: 'instant' });
+              }}
               ref={(el) => {
                 if (el) {
                   itemRefs.current.set(item.id, el);
@@ -242,7 +263,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCompact = false }) => {
         {isCompact ? (
           <button
             type="button"
-            onClick={() => openProModal('Nâng cấp Gói PRO 5.000đ để sở hữu tính năng không giới hạn', 'pro')}
+            onClick={() => {
+              onNavigate?.();
+              openProModal('Nâng cấp Gói PRO 5.000đ để sở hữu tính năng không giới hạn', 'pro');
+            }}
             title="Kích hoạt PRO 5.000đ"
             className="w-full p-2.5 rounded-xl bg-pink-500/10 hover:bg-pink-500/20 border border-pink-500/30 flex items-center justify-center text-pink-600 dark:text-pink-400 font-bold transition-all cursor-pointer shadow-xs active:scale-95"
           >
@@ -259,7 +283,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCompact = false }) => {
         ) : isPendingPro ? (
           <button
             type="button"
-            onClick={() => openProModal('Xem lại thông tin chuyển khoản gói PRO 5.000đ', 'pro')}
+            onClick={() => {
+              onNavigate?.();
+              openProModal('Xem lại thông tin chuyển khoản gói PRO 5.000đ', 'pro');
+            }}
             className="w-full p-2.5 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 flex items-center justify-between text-xs text-amber-600 dark:text-amber-400 font-semibold transition-all cursor-pointer"
           >
             <span className="flex items-center gap-2">
@@ -271,7 +298,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCompact = false }) => {
         ) : (
           <button
             type="button"
-            onClick={() => openProModal('Nâng cấp Gói PRO 5.000đ để sở hữu tính năng không giới hạn', 'pro')}
+            onClick={() => {
+              onNavigate?.();
+              openProModal('Nâng cấp Gói PRO 5.000đ để sở hữu tính năng không giới hạn', 'pro');
+            }}
             className="w-full p-2.5 rounded-xl bg-gradient-to-r from-pink-500/10 via-pink-500/15 to-pink-500/10 hover:from-pink-500/20 hover:to-pink-500/20 border border-pink-500/30 flex items-center justify-between text-xs text-pink-600 dark:text-pink-400 font-bold transition-all cursor-pointer shadow-xs active:scale-[0.98]"
           >
             <div className="flex items-center gap-2.5">
@@ -295,7 +325,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCompact = false }) => {
         {isCompact ? (
           <button
             type="button"
-            onClick={() => openProModal('Ủng hộ nhà phát triển Cytools', 'donate')}
+            onClick={() => {
+              onNavigate?.();
+              openProModal('Ủng hộ nhà phát triển Cytools', 'donate');
+            }}
             title="Liên hệ & Ủng hộ Dev"
             className="w-full p-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 border border-slate-200/80 dark:border-slate-800 text-xs font-semibold text-pink-500 transition-colors flex items-center justify-center cursor-pointer group"
           >
@@ -304,7 +337,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ isCompact = false }) => {
         ) : (
           <button
             type="button"
-            onClick={() => openProModal('Ủng hộ nhà phát triển Cytools', 'donate')}
+            onClick={() => {
+              onNavigate?.();
+              openProModal('Ủng hộ nhà phát triển Cytools', 'donate');
+            }}
             className="w-full px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-900/60 dark:hover:bg-slate-800/80 border border-slate-200/80 dark:border-slate-800 text-xs font-semibold text-slate-600 dark:text-slate-300 transition-colors flex items-center justify-between cursor-pointer group"
             title="Ủng hộ cà phê & liên hệ tác giả"
           >

@@ -84,7 +84,7 @@ export const DonationTree: React.FC<DonationTreeProps> = ({
   const currentStage = getStageByAmount(totalDonationAmount);
 
   return (
-    <div className="w-full rounded-3xl bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 p-6 shadow-xs flex flex-col items-center text-center">
+    <div className="w-full rounded-3xl bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 p-6 shadow-xs flex flex-col items-center text-center shrink-0">
       {/* Top Header: Badge & Sequential Heading Level (h2) */}
       <div className="space-y-2 mb-3">
         <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-slate-100 dark:bg-zinc-800 text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-zinc-700 text-sm font-semibold tracking-wide uppercase">
@@ -97,11 +97,11 @@ export const DonationTree: React.FC<DonationTreeProps> = ({
       </div>
 
       {/* Central Living Tree Image Asset - Static, Elegant, No AI Transforms */}
-      <div className="my-3 flex items-center justify-center w-full min-h-[220px]">
+      <div className="my-3 flex items-center justify-center w-full h-52 shrink-0">
         <img
           src={currentStage.image}
           alt={currentStage.name}
-          className="max-h-52 w-auto object-contain select-none"
+          className="w-44 h-44 sm:w-48 sm:h-48 aspect-square shrink-0 object-contain select-none mx-auto"
           loading="lazy"
           decoding="async"
         />
