@@ -240,11 +240,70 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           throw new Error('Không thể phân giải đường dẫn tải xuống phương tiện. Vui lòng thử lại sau giây lát.');
         }
 
-        // Phase 2: Chrome Extension Native Streaming Optimization:
-        // Use user's local residential IP directly via chrome.downloads API.
-        // Completely bypasses Vercel 10s timeouts, datacenter IP bans, and uses 0 MB heap!
+        // Phase 2: Dedicated YouTube Residential Direct Download Bypass:
+        // YouTube (Cobalt tunnels / googlevideo streams) blocks Vercel datacenter IPs with HTTP 403.
+        // We trigger native download directly on the client using the user's residential IP.
+        const isYouTube =
+          optionId?.startsWith('youtube_') ||
+          result?.platform === 'youtube' ||
+          directUrl.includes('googlevideo.com') ||
+          directUrl.includes('cobalt');
+
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
+
+        if (isYouTube) {
+          if (chromeObj?.downloads?.download) {
+            await new Promise<void>((resolve, reject) => {
+              chromeObj.downloads.download(
+                {
+                  url: directUrl,
+                  filename: targetFileName,
+                  saveAs: false,
+                },
+                (downloadId?: number) => {
+                  if (chromeObj.runtime?.lastError || !downloadId) {
+                    reject(
+                      new Error(
+                        chromeObj.runtime?.lastError?.message ||
+                          'Không thể khởi động tải xuống qua trình quản lý tiện ích.'
+                      )
+                    );
+                  } else {
+                    resolve();
+                  }
+                }
+              );
+            });
+          } else {
+            // Web environment direct native download (bypasses CORS and Vercel 403 IP block)
+            const a = document.createElement('a');
+            a.href = directUrl;
+            a.target = '_blank';
+            a.download = targetFileName || '';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+          }
+
+          if (stageTimer) clearTimeout(stageTimer);
+
+          setDownloadProgress((prev) => ({
+            ...prev,
+            percentage: 100,
+            stage: 'done',
+            status: 'completed',
+          }));
+
+          setTimeout(() => {
+            setDownloadProgress(INITIAL_PROGRESS);
+          }, 3500);
+          return;
+        }
+
+        // Phase 3: Chrome Extension Native Streaming Optimization for other platforms:
+        // Use user's local residential IP directly via chrome.downloads API.
+        // Completely bypasses Vercel 10s timeouts, datacenter IP bans, and uses 0 MB heap!
         if (chromeObj?.downloads?.download) {
           await new Promise<void>((resolve, reject) => {
             chromeObj.downloads.download(
@@ -283,7 +342,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           return;
         }
 
-        // Phase 3: Web Browser Client-Side Force Download via Local Blob (NEVER opens new tab!)
+        // Phase 4: Non-YouTube Web Browser Client-Side Force Download via Local Blob (NEVER opens new tab!)
         const triggerBlobSave = (blob: Blob, filename: string) => {
           const objectUrl = URL.createObjectURL(blob);
           const a = document.createElement('a');
