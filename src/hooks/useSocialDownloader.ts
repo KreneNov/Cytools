@@ -127,177 +127,229 @@ async function decryptSaveTubeData(encryptedBase64: string): Promise<any> {
   return JSON.parse(decodedText);
 }
 
-const COBALT_FALLBACK_INSTANCES = [
-  'https://rue-cobalt.xenon.zone/',
-  'https://cobalt.q0.wtf/api/json',
-  'https://co.wuk.sh/api/json',
-  'https://api.cobalt.tools/api/json',
+const SAVETUBE_DISCOVERY_ENDPOINTS = [
+  'https://media.savetube.vip/api/random-cdn',
+  'https://media.savetube.me/api/random-cdn',
 ];
+
+interface YouTubeResolutionResult {
+  url: string | null;
+  failureReason?: 'rate_limit' | 'timeout' | 'network';
+}
 
 /**
  * Resolves a direct YouTube download URL 100% client-side (completely bypassing Vercel /api/download):
- * 1. Provider 1 (Primary): SaveTube VIP CDN v2 (https://media.savetube.vip/api/random-cdn)
- *    - Explicitly detects HTTP 429 Too Many Requests and immediately falls back without hammering.
- * 2. Provider 2 (Fallback): Client-side Cobalt v10 Round-Robin across public instances with loose CORS.
- * 3. Provider 3 (Extension Fallback): Chrome Extension Direct Innertube ANDROID_VR.
+ * 1. Engine 1 (Primary): SaveTube VIP / ME CDN v2 (45s timeout for long 1080p muxing + fresh node retry on 429/error).
+ * 2. Engine 2 (Fallback 1): Client-side Cobalt v10 via https://rue-cobalt.xenon.zone/ (strict v10 payload, no dead /api/json URLs).
+ * 3. Engine 3 (Fallback 2): Loader.to / OceanSaver (https://p.savenow.to) client-side polling.
+ * 4. Engine 4 (Extension Fallback): Chrome Extension Direct Innertube ANDROID_VR.
  */
 async function resolveYouTubeClientSide(
   videoId: string,
   quality: '1080p' | '720p',
   type: 'video' | 'audio'
-): Promise<string | null> {
+): Promise<YouTubeResolutionResult> {
   const targetYouTubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  let failureReason: 'rate_limit' | 'timeout' | 'network' = 'network';
 
-  // Provider 1 (Primary): SaveTube VIP CDN v2 (supports 1080p, 720p, and MP3 with Content-Disposition: attachment)
-  try {
-    const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!cdnRes.ok || cdnRes.status === 429) {
-      throw new Error(`Savetube random-cdn failed with status ${cdnRes.status}`);
+  // Engine 1 (Primary): SaveTube VIP / ME CDN v2 with 45s muxing timeout & fresh CDN node retry
+  for (const discoveryUrl of SAVETUBE_DISCOVERY_ENDPOINTS) {
+    try {
+      const cdnRes = await fetch(discoveryUrl, {
+        signal: AbortSignal.timeout(6000),
+      });
+      if (cdnRes.status === 429) {
+        failureReason = 'rate_limit';
+        continue;
+      }
+      if (!cdnRes.ok) {
+        continue;
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const cdnData: any = await cdnRes.json();
+      const cdnHost = cdnData?.cdn || 'cdn405.savetube.vip';
+
+      const infoRes = await fetch(`https://${cdnHost}/v2/info`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ url: targetYouTubeUrl }),
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (infoRes.status === 429) {
+        failureReason = 'rate_limit';
+        continue;
+      }
+      if (!infoRes.ok) {
+        continue;
+      }
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const infoJson: any = await infoRes.json();
+      if (infoJson?.status && typeof infoJson.data === 'string') {
+        const decrypted = await decryptSaveTubeData(infoJson.data);
+        if (decrypted?.key) {
+          const downloadType = type === 'audio' ? 'audio' : 'video';
+          const targetQualities =
+            type === 'audio'
+              ? ['128']
+              : quality === '1080p'
+                ? ['1080', '720', '360']
+                : ['720', '360'];
+
+          for (const q of targetQualities) {
+            const dlRes = await fetch(`https://${cdnHost}/download`, {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                downloadType,
+                quality: q,
+                key: decrypted.key,
+                title: cleanDownloadFilename(decrypted?.title || 'video'),
+              }),
+              // 45s timeout so long 1080p gaming videos are never prematurely canceled during muxing
+              signal: AbortSignal.timeout(45000),
+            });
+
+            if (dlRes.status === 429) {
+              failureReason = 'rate_limit';
+              throw new Error('SAVETUBE_RATE_LIMITED_429');
+            }
+
+            if (!dlRes.ok) {
+              continue;
+            }
+
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const dlJson: any = await dlRes.json();
+            if (dlJson?.status === false && String(dlJson?.message || '').includes('429')) {
+              failureReason = 'rate_limit';
+              throw new Error('SAVETUBE_RATE_LIMITED_429');
+            }
+
+            const resolvedLink = dlJson?.data?.downloadUrl;
+            if (
+              resolvedLink &&
+              typeof resolvedLink === 'string' &&
+              resolvedLink.startsWith('http')
+            ) {
+              return { url: resolvedLink };
+            }
+          }
+        }
+      }
+    } catch (saveTubeErr) {
+      if (
+        saveTubeErr instanceof Error &&
+        (saveTubeErr.name === 'TimeoutError' || saveTubeErr.name === 'AbortError')
+      ) {
+        failureReason = 'timeout';
+      }
+      console.warn(
+        `[useSocialDownloader] Savetube node (${discoveryUrl}) failed, retrying next CDN or fallback:`,
+        saveTubeErr
+      );
     }
+  }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const cdnData: any = await cdnRes.json();
-    const cdnHost = cdnData?.cdn || 'cdn405.savetube.vip';
-
-    const infoRes = await fetch(`https://${cdnHost}/v2/info`, {
+  // Engine 2 (Fallback 1): Strict Cobalt v10 on https://rue-cobalt.xenon.zone/ (root path /, NO isAudioOnly)
+  try {
+    const cobaltRes = await fetch('https://rue-cobalt.xenon.zone/', {
       method: 'POST',
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ url: targetYouTubeUrl }),
-      signal: AbortSignal.timeout(8000),
+      body: JSON.stringify({
+        url: targetYouTubeUrl,
+        videoQuality: quality === '1080p' ? '1080' : '720',
+        downloadMode: type === 'audio' ? 'audio' : 'auto',
+        youtubeVideoCodec: 'h264',
+      }),
+      signal: AbortSignal.timeout(15000),
     });
 
-    if (!infoRes.ok || infoRes.status === 429) {
-      throw new Error(`Savetube v2/info failed with status ${infoRes.status}`);
+    if (cobaltRes.status === 429) {
+      failureReason = 'rate_limit';
+    } else if (cobaltRes.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const data: any = await cobaltRes.json().catch(() => null);
+      const cobaltUrl = data?.url || data?.picker?.[0]?.url;
+      if (cobaltUrl && typeof cobaltUrl === 'string' && cobaltUrl.startsWith('http')) {
+        return { url: cobaltUrl };
+      }
     }
+  } catch (cobaltErr) {
+    if (
+      cobaltErr instanceof Error &&
+      (cobaltErr.name === 'TimeoutError' || cobaltErr.name === 'AbortError')
+    ) {
+      failureReason = 'timeout';
+    }
+    console.warn('[useSocialDownloader] Fallback 1 (rue-cobalt.xenon.zone) failed:', cobaltErr);
+  }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const infoJson: any = await infoRes.json();
-    if (infoJson?.status && typeof infoJson.data === 'string') {
-      const decrypted = await decryptSaveTubeData(infoJson.data);
-      if (decrypted?.key) {
-        const downloadType = type === 'audio' ? 'audio' : 'video';
-        const targetQualities =
-          type === 'audio'
-            ? ['128']
-            : quality === '1080p'
-              ? ['1080', '720', '360']
-              : ['720', '360'];
+  // Engine 3 (Fallback 2): Loader.to / OceanSaver (p.savenow.to) Client-Side Polling
+  try {
+    const format = type === 'audio' ? 'mp3' : quality === '1080p' ? '1080' : '720';
+    const initUrl = `https://p.savenow.to/ajax/download.php?copyright=0&format=${format}&url=${encodeURIComponent(targetYouTubeUrl)}&api=dfcb6d76f2f6a9894gjkege8a4ab232222`;
+    const initRes = await fetch(initUrl, {
+      signal: AbortSignal.timeout(12000),
+    });
 
-        for (const q of targetQualities) {
-          const dlRes = await fetch(`https://${cdnHost}/download`, {
-            method: 'POST',
-            headers: {
-              Accept: 'application/json',
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              downloadType,
-              quality: q,
-              key: decrypted.key,
-              title: cleanDownloadFilename(decrypted?.title || 'video'),
-            }),
-            signal: AbortSignal.timeout(10000),
-          });
-
-          // Immediately abort Savetube loop and fail over to Provider 2 if rate-limited (HTTP 429)
-          if (dlRes.status === 429) {
-            throw new Error('SAVETUBE_RATE_LIMITED_429');
-          }
-
-          if (!dlRes.ok) {
-            continue;
-          }
+    if (initRes.status === 429) {
+      failureReason = 'rate_limit';
+    } else if (initRes.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const initData: any = await initRes.json().catch(() => null);
+      if (initData?.id) {
+        for (let attempt = 0; attempt < 25; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+          const progRes = await fetch(
+            `https://p.savenow.to/ajax/progress.php?id=${encodeURIComponent(initData.id)}`,
+            { signal: AbortSignal.timeout(8000) }
+          );
+          if (!progRes.ok) continue;
 
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const dlJson: any = await dlRes.json();
-          if (dlJson?.status === false && String(dlJson?.message || '').includes('429')) {
-            throw new Error('SAVETUBE_RATE_LIMITED_429');
-          }
-
-          const resolvedLink = dlJson?.data?.downloadUrl;
+          const progData: any = await progRes.json().catch(() => null);
           if (
-            resolvedLink &&
-            typeof resolvedLink === 'string' &&
-            resolvedLink.startsWith('http')
+            progData &&
+            (progData.progress === 1000 || progData.success === 1) &&
+            typeof progData.download_url === 'string' &&
+            progData.download_url.startsWith('http')
           ) {
-            return resolvedLink;
+            return { url: progData.download_url };
+          }
+          if (
+            progData &&
+            progData.success === 0 &&
+            typeof progData.text === 'string' &&
+            progData.text.toLowerCase().includes('error')
+          ) {
+            break;
           }
         }
       }
     }
-  } catch (saveTubeErr) {
-    console.warn(
-      '[useSocialDownloader] Provider 1 (Savetube) failed or hit 429 rate-limit, switching to Provider 2 (Cobalt Round-Robin):',
-      saveTubeErr
-    );
-  }
-
-  // Provider 2 (Fallback): Client-Side Cobalt Round-Robin
-  for (const instanceUrl of COBALT_FALLBACK_INSTANCES) {
-    const candidatePayloads = [
-      // 1. Strict Cobalt v10 schema (rue-cobalt.xenon.zone, api.cobalt.tools) — NO isAudioOnly key
-      {
-        url: targetYouTubeUrl,
-        videoQuality: quality === '1080p' ? '1080' : '720',
-        downloadMode: type === 'audio' ? 'audio' : 'auto',
-      },
-      // 2. Minimal Cobalt v10 payload fallback
-      {
-        url: targetYouTubeUrl,
-        downloadMode: type === 'audio' ? 'audio' : 'auto',
-      },
-      // 3. Legacy Cobalt v7 schema fallback
-      {
-        url: targetYouTubeUrl,
-        videoQuality: quality === '1080p' ? '1080' : '720',
-        isAudioOnly: type === 'audio',
-      },
-    ];
-
-    for (const payload of candidatePayloads) {
-      try {
-        const cobaltRes = await fetch(instanceUrl, {
-          method: 'POST',
-          headers: {
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(6000),
-        });
-
-        if (cobaltRes.status === 429) {
-          break; // Rate-limited on this instance, switch to next instance
-        }
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const data: any = await cobaltRes.json().catch(() => null);
-        if (!data) continue;
-
-        if (data.status === 'error') {
-          if (data.error?.code === 'error.api.invalid_body') {
-            continue; // Try next payload variant on this same instance
-          }
-          break; // Other upstream error on this instance, move to next instance
-        }
-
-        const cobaltUrl = data.url || data.picker?.[0]?.url;
-        if (cobaltUrl && typeof cobaltUrl === 'string' && cobaltUrl.startsWith('http')) {
-          return cobaltUrl;
-        }
-      } catch (cobaltErr) {
-        console.warn(`[useSocialDownloader] Provider 2 Cobalt instance (${instanceUrl}) failed:`, cobaltErr);
-        break;
-      }
+  } catch (savenowErr) {
+    if (
+      savenowErr instanceof Error &&
+      (savenowErr.name === 'TimeoutError' || savenowErr.name === 'AbortError')
+    ) {
+      failureReason = 'timeout';
     }
+    console.warn('[useSocialDownloader] Fallback 2 (p.savenow.to) failed:', savenowErr);
   }
 
-  // Provider 3 (Extension Fallback): Chrome Extension Direct Innertube ANDROID_VR
+  // Engine 4 (Extension Fallback): Chrome Extension Direct Innertube ANDROID_VR
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
   if (chromeObj?.downloads?.download) {
@@ -339,13 +391,13 @@ async function resolveYouTubeClientSide(
             const aFmt =
               adaptive.find((f: any) => f.url && f.itag === 140) ||
               adaptive.find((f: any) => f.url && f.mimeType?.includes('audio/mp4'));
-            if (aFmt?.url) return aFmt.url;
+            if (aFmt?.url) return { url: aFmt.url };
           } else {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const preMuxed =
               formats.find((f: any) => f.url && f.mimeType?.includes('video/mp4')) ||
               formats.find((f: any) => f.url);
-            if (preMuxed?.url) return preMuxed.url;
+            if (preMuxed?.url) return { url: preMuxed.url };
           }
         }
       }
@@ -354,7 +406,7 @@ async function resolveYouTubeClientSide(
     }
   }
 
-  return null;
+  return { url: null, failureReason };
 }
 
 /**
@@ -400,11 +452,10 @@ export async function triggerDirectDownload(url: string, filename: string): Prom
   // These headers force the browser to trigger a download even in a hidden iframe without navigating away.
   const isAttachmentGuaranteed =
     url.includes('/tunnel') ||
-    url.includes('api.cobalt.tools') ||
-    url.includes('cobalt.q0.wtf') ||
-    url.includes('co.wuk.sh') ||
     url.includes('xenon.zone') ||
     url.includes('savenow.to') ||
+    url.includes('oceansaver.in') ||
+    url.includes('loader.to') ||
     url.includes('savetube.vip') ||
     url.includes('savetube.me') ||
     url.includes('savetube.su');
@@ -678,8 +729,9 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             stage: isAudio ? 'audio' : 'video',
           }));
 
-          // Resolve direct stream URL 100% client-side (Provider 1: Savetube -> Provider 2: Cobalt Round-Robin -> Provider 3: Extension Innertube)
-          let resolvedYtUrl = await resolveYouTubeClientSide(result.videoId, quality, mediaType);
+          // Resolve direct stream URL 100% client-side (Engine 1: Savetube -> Engine 2: rue-cobalt -> Engine 3: savenow.to -> Engine 4: Extension Innertube)
+          const ytResolution = await resolveYouTubeClientSide(result.videoId, quality, mediaType);
+          let resolvedYtUrl = ytResolution.url;
 
           // Fallback to pre-extracted direct URL if available and not a raw youtube watch URL or IP-bound googlevideo URL
           if (
@@ -694,8 +746,18 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           }
 
           if (!resolvedYtUrl) {
+            if (ytResolution.failureReason === 'rate_limit') {
+              throw new Error(
+                'Hệ thống máy chủ xử lý đang quá tải (HTTP 429). Vui lòng thử lại sau ít phút hoặc sử dụng Extension.'
+              );
+            }
+            if (ytResolution.failureReason === 'timeout') {
+              throw new Error(
+                'Quá thời gian chờ ghép kênh video 1080p dung lượng lớn (Timeout). Vui lòng thử lại hoặc chọn bản 720p.'
+              );
+            }
             throw new Error(
-              'Hệ thống máy chủ xử lý đang quá tải (Error 429). Vui lòng thử lại sau ít phút hoặc sử dụng Extension.'
+              'Không thể kết nối máy chủ phân giải luồng YouTube vào lúc này. Vui lòng thử lại sau giây lát.'
             );
           }
 
@@ -981,7 +1043,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         const msg =
           err instanceof Error
             ? err.message
-            : 'Hệ thống máy chủ xử lý đang quá tải (Error 429). Vui lòng thử lại sau ít phút hoặc sử dụng Extension.';
+            : 'Không thể tải tệp về máy tính vào lúc này. Vui lòng thử lại sau giây lát.';
         console.error('Download stream error:', err);
         setDownloadProgress((prev) => ({
           ...prev,
