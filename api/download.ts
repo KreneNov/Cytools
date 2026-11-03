@@ -126,7 +126,12 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
     };
 
     const host = parsedMediaUrl.hostname.toLowerCase();
-    if (host.includes('pinimg.com') || host.includes('pinterest.com')) {
+    if (host.includes('lookaside.fbsbx.com') || host.includes('fbsbx.com')) {
+      upstreamHeaders['User-Agent'] =
+        'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
+      upstreamHeaders['Accept'] = '*/*';
+      delete upstreamHeaders['Referer'];
+    } else if (host.includes('pinimg.com') || host.includes('pinterest.com')) {
       upstreamHeaders['Referer'] = 'https://www.pinterest.com/';
     } else if (host.includes('fbcdn.net') || host.includes('facebook.com')) {
       upstreamHeaders['Referer'] = 'https://www.facebook.com/';

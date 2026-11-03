@@ -817,8 +817,11 @@ export async function extractPinterest(url: string): Promise<ExtractionResult> {
  */
 export async function extractFacebook(url: string): Promise<ExtractionResult> {
   let resolvedUrl = url;
+
+  // Step 1: Follow redirects (for fb.watch or /share/v/ or /share/r/)
   try {
-    const res = await fetch(url, {
+    const headRes = await fetch(url, {
+      method: 'GET',
       headers: {
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -826,77 +829,151 @@ export async function extractFacebook(url: string): Promise<ExtractionResult> {
         'Sec-Fetch-Mode': 'navigate',
       },
       redirect: 'follow',
-      signal: AbortSignal.timeout(7000),
+      signal: AbortSignal.timeout(5000),
     });
-
-    if (res.ok) {
-      resolvedUrl = res.url || resolvedUrl;
-      const html = await res.text();
-      const unescaped = html.replace(/\\\//g, '/').replace(/\\u0025/g, '%').replace(/\\u0026/g, '&');
-
-      const hdMatch =
-        unescaped.match(/"browser_native_hd_url":"(https:[^"]+)"/) ||
-        unescaped.match(/"playable_url_quality_hd":"(https:[^"]+)"/) ||
-        unescaped.match(/"hd_src":"(https:[^"]+)"/);
-
-      const sdMatch =
-        unescaped.match(/"browser_native_sd_url":"(https:[^"]+)"/) ||
-        unescaped.match(/"playable_url":"(https:[^"]+)"/) ||
-        unescaped.match(/"sd_src":"(https:[^"]+)"/);
-
-      const ogTitle = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
-      const ogImage = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
-
-      const hdUrl = hdMatch && hdMatch[1] && !hdMatch[1].includes('facebook.com') ? hdMatch[1] : null;
-      const sdUrl = sdMatch && sdMatch[1] && !sdMatch[1].includes('facebook.com') ? sdMatch[1] : null;
-
-      if (hdUrl || sdUrl) {
-        const primaryUrl = (hdUrl || sdUrl)!;
-        const mediaOptions: MediaDownloadOption[] = [];
-
-        if (hdUrl) {
-          mediaOptions.push({
-            id: 'facebook_hd',
-            label: 'Tải Video Facebook (MP4 HD)',
-            description: 'Độ nét cao nhất từ máy chủ Facebook',
-            format: 'mp4',
-            quality: 'HD 1080p / 720p',
-            url: hdUrl,
-          });
-        }
-
-        if (sdUrl && sdUrl !== hdUrl) {
-          mediaOptions.push({
-            id: 'facebook_sd',
-            label: 'Tải Video Facebook (MP4 SD)',
-            description: 'Dung lượng nhẹ, tốc độ tải nhanh',
-            format: 'mp4',
-            quality: 'SD Tiêu Chuẩn',
-            url: sdUrl,
-          });
-        }
-
-        return {
-          success: true,
-          platform: 'facebook',
-          type: 'video',
-          title: ogTitle && ogTitle[1] ? ogTitle[1].trim() : 'Video Facebook HD',
-          thumbnail: ogImage && ogImage[1] ? ogImage[1] : undefined,
-          videoHd: hdUrl || primaryUrl,
-          videoSd: sdUrl || primaryUrl,
-          mediaOptions,
-        };
-      }
+    if (headRes.ok) {
+      resolvedUrl = headRes.url || resolvedUrl;
     }
   } catch {
-    // Continue to Cobalt fallback
+    // Continue
   }
 
-  // Secondary Fallback: Cobalt
+  let ogTitleStr: string | null = null;
+  let ogImageStr: string | null = null;
+  let hdUrl: string | null = null;
+  let sdUrl: string | null = null;
+
+  // Step 2: Query Facebook Video Embed Plugin endpoint (Bypasses lookaside redirect & extracts direct fbcdn.net)
+  try {
+    const embedPluginUrl = `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(resolvedUrl)}&show_text=0`;
+    const pluginRes = await fetch(embedPluginUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+      },
+      signal: AbortSignal.timeout(6000),
+    });
+
+    if (pluginRes.ok) {
+      const pText = await pluginRes.text();
+      const pUnescaped = pText.replaceAll('\\/', '/').replaceAll('\\u0025', '%').replaceAll('\\u0026', '&');
+
+      const pHd =
+        pUnescaped.match(/"hd_src":"(https:[^"]+)"/) ||
+        pUnescaped.match(/"browser_native_hd_url":"(https:[^"]+)"/) ||
+        pUnescaped.match(/"playable_url_quality_hd":"(https:[^"]+)"/);
+
+      const pSd =
+        pUnescaped.match(/"sd_src":"(https:[^"]+)"/) ||
+        pUnescaped.match(/"browser_native_sd_url":"(https:[^"]+)"/) ||
+        pUnescaped.match(/"playable_url":"(https:[^"]+)"/);
+
+      if (pHd && pHd[1] && !pHd[1].includes('facebook.com')) hdUrl = pHd[1];
+      if (pSd && pSd[1] && !pSd[1].includes('facebook.com')) sdUrl = pSd[1];
+    }
+  } catch {
+    // Continue to HTML scraping
+  }
+
+  // Step 3: Fetch main Facebook page HTML if plugin didn't extract both streams
+  if (!hdUrl || !sdUrl) {
+    try {
+      const res = await fetch(resolvedUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Sec-Fetch-Mode': 'navigate',
+        },
+        signal: AbortSignal.timeout(6000),
+      });
+
+      if (res.ok) {
+        const html = await res.text();
+        const unescaped = html.replaceAll('\\/', '/').replaceAll('\\u0025', '%').replaceAll('\\u0026', '&');
+
+        const hdMatch =
+          unescaped.match(/"browser_native_hd_url":"(https:[^"]+)"/) ||
+          unescaped.match(/"playable_url_quality_hd":"(https:[^"]+)"/) ||
+          unescaped.match(/"hd_src":"(https:[^"]+)"/);
+
+        const sdMatch =
+          unescaped.match(/"browser_native_sd_url":"(https:[^"]+)"/) ||
+          unescaped.match(/"playable_url":"(https:[^"]+)"/) ||
+          unescaped.match(/"sd_src":"(https:[^"]+)"/);
+
+        const ogTitle = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
+        const ogImage = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
+
+        if (ogTitle && ogTitle[1]) ogTitleStr = ogTitle[1].trim();
+        if (ogImage && ogImage[1]) ogImageStr = ogImage[1];
+
+        if (!hdUrl && hdMatch && hdMatch[1] && !hdMatch[1].includes('facebook.com')) {
+          hdUrl = hdMatch[1];
+        }
+        if (!sdUrl && sdMatch && sdMatch[1] && !sdMatch[1].includes('facebook.com')) {
+          sdUrl = sdMatch[1];
+        }
+
+        // Lookaside crawler fallback if no direct fbcdn stream was found
+        if (!hdUrl && !sdUrl) {
+          const ogVideo = html.match(/<meta\s+property=["']og:video(?::secure_url)?["']\s+content=["']([^"']+)["']/i);
+          if (ogVideo && ogVideo[1] && (ogVideo[1].includes('lookaside') || ogVideo[1].includes('fbcdn'))) {
+            sdUrl = ogVideo[1];
+          }
+        }
+      }
+    } catch {
+      // Continue
+    }
+  }
+
+  if (hdUrl || sdUrl) {
+    const primaryUrl = (hdUrl || sdUrl)!;
+    const mediaOptions: MediaDownloadOption[] = [];
+
+    if (hdUrl) {
+      mediaOptions.push({
+        id: 'facebook_hd',
+        label: 'Tải Video Facebook (MP4 HD)',
+        description: 'Độ nét cao nhất từ máy chủ Facebook',
+        format: 'mp4',
+        quality: 'HD 1080p / 720p',
+        url: hdUrl,
+      });
+    }
+
+    if (sdUrl && sdUrl !== hdUrl) {
+      mediaOptions.push({
+        id: 'facebook_sd',
+        label: 'Tải Video Facebook (MP4 SD)',
+        description: 'Dung lượng nhẹ, tốc độ tải nhanh',
+        format: 'mp4',
+        quality: 'SD Tiêu Chuẩn',
+        url: sdUrl,
+      });
+    }
+
+    return {
+      success: true,
+      platform: 'facebook',
+      type: 'video',
+      title: ogTitleStr || 'Video Facebook HD',
+      thumbnail: ogImageStr || undefined,
+      videoHd: hdUrl || primaryUrl,
+      videoSd: sdUrl || primaryUrl,
+      mediaOptions,
+    };
+  }
+
+  // Step 4: Secondary Fallback to Cobalt
   try {
     const cobaltRes = await extractCobalt(resolvedUrl, 'facebook');
     if (cobaltRes.success && cobaltRes.mediaOptions && cobaltRes.mediaOptions.length > 0) {
-      // Ensure none of the media options point to facebook.com
       const validOptions = cobaltRes.mediaOptions.filter(
         (opt) => opt.url && !opt.url.includes('facebook.com') && !opt.url.includes('fb.watch')
       );
@@ -924,8 +1001,77 @@ export function extractYouTubeVideoId(url: string): string | null {
 }
 
 /**
+ * Direct YouTube Innertube player API query using ANDROID_VR client.
+ * Returns pre-muxed itag 18 MP4 (video+audio) and high-bitrate itag 140 M4A audio.
+ */
+export async function resolveInnertubeStreams(videoId: string): Promise<{
+  preMuxedUrl: string | null;
+  audioUrl: string | null;
+}> {
+  try {
+    const body = {
+      videoId,
+      context: {
+        client: {
+          clientName: 'ANDROID_VR',
+          clientVersion: '1.60.19',
+          deviceMake: 'Oculus',
+          deviceModel: 'Quest 3',
+          osName: 'Android',
+          osVersion: '12L',
+          androidSdkVersion: 32,
+          hl: 'vi',
+          gl: 'VN',
+        },
+      },
+    };
+
+    const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (res.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const data: any = await res.json();
+      if (data.playabilityStatus?.status === 'OK') {
+        const formats = data.streamingData?.formats || [];
+        const adaptive = data.streamingData?.adaptiveFormats || [];
+
+        // Pre-muxed video (itag 18 has video + audio)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const preMuxed =
+          formats.find((f: any) => f.url && f.mimeType?.includes('video/mp4')) ||
+          formats.find((f: any) => f.url);
+
+        // Direct high-quality M4A audio (itag 140)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const audio =
+          adaptive.find((f: any) => f.url && f.itag === 140) ||
+          adaptive.find((f: any) => f.url && f.mimeType?.includes('audio/mp4'));
+
+        return {
+          preMuxedUrl: preMuxed?.url || null,
+          audioUrl: audio?.url || null,
+        };
+      }
+    }
+  } catch (err) {
+    console.warn('[Innertube Stream Warning]:', err instanceof Error ? err.message : err);
+  }
+
+  return { preMuxedUrl: null, audioUrl: null };
+}
+
+/**
  * Extracts YouTube video using official oEmbed for instant metadata (<300ms, 0% failure rate)
- * combined with client-side Cobalt waterfall. NEVER throws Anti-Bot on metadata extraction!
+ * combined with client-side Cobalt waterfall & Innertube fallback. NEVER throws Anti-Bot on metadata extraction!
  */
 export async function extractYouTube(url: string): Promise<ExtractionResult> {
   const videoId = extractYouTubeVideoId(url);
@@ -968,16 +1114,26 @@ export async function extractYouTube(url: string): Promise<ExtractionResult> {
     // Metadata defaults are already safely set
   }
 
-  // Phase 2: Stream Resolution attempt via Cobalt (non-blocking)
+  // Phase 2: Parallel Stream Resolution attempt (Cobalt + Innertube fallback)
   let cobaltStreamUrl: string = '';
-  try {
-    const cobaltRes = await extractCobalt(url, 'youtube');
-    if (cobaltRes && cobaltRes.success && cobaltRes.videoHd) {
-      cobaltStreamUrl = cobaltRes.videoHd;
-    }
-  } catch {
-    // Non-blocking: If datacenter IP was blocked by Cloudflare, client browser / extension resolves on click!
+  let preMuxedUrl: string = '';
+  let audioStreamUrl: string = '';
+
+  const [cobaltSettled, innertubeSettled] = await Promise.allSettled([
+    extractCobalt(url, 'youtube'),
+    resolveInnertubeStreams(videoId),
+  ]);
+
+  if (cobaltSettled.status === 'fulfilled' && cobaltSettled.value.success && cobaltSettled.value.videoHd) {
+    cobaltStreamUrl = cobaltSettled.value.videoHd;
   }
+  if (innertubeSettled.status === 'fulfilled') {
+    if (innertubeSettled.value.preMuxedUrl) preMuxedUrl = innertubeSettled.value.preMuxedUrl;
+    if (innertubeSettled.value.audioUrl) audioStreamUrl = innertubeSettled.value.audioUrl;
+  }
+
+  const primaryVideoUrl = cobaltStreamUrl || preMuxedUrl;
+  const primaryAudioUrl = audioStreamUrl || cobaltStreamUrl || preMuxedUrl;
 
   return {
     success: true,
@@ -988,7 +1144,8 @@ export async function extractYouTube(url: string): Promise<ExtractionResult> {
     thumbnail,
     videoId,
     videoHd: cobaltStreamUrl,
-    videoSd: cobaltStreamUrl,
+    videoSd: preMuxedUrl || cobaltStreamUrl,
+    audioUrl: primaryAudioUrl,
     mediaOptions: [
       {
         id: 'youtube_1080p',
@@ -996,24 +1153,24 @@ export async function extractYouTube(url: string): Promise<ExtractionResult> {
         description: 'Hình ảnh kèm âm thanh chất lượng cao, tải trực tiếp không cần ghép audio',
         format: 'mp4',
         quality: '1080p / HD',
-        url: cobaltStreamUrl,
+        url: cobaltStreamUrl || primaryVideoUrl,
       },
       {
         id: 'youtube_720p',
         label: 'Tải Video MP4 720p (Tiêu Chuẩn)',
-        description: 'Dung lượng nhẹ, tốc độ tải nhanh',
+        description: 'Độ nét tiêu chuẩn, tốc độ tải nhanh',
         format: 'mp4',
         quality: '720p',
-        url: cobaltStreamUrl,
+        url: preMuxedUrl || cobaltStreamUrl,
       },
       {
         id: 'youtube_audio',
-        label: 'Tách Âm Thanh MP3',
+        label: 'Tách Âm Thanh MP3 / M4A',
         description: 'Trích xuất âm thanh gốc chất lượng cao',
         format: 'mp3',
         quality: 'Audio',
         isAudio: true,
-        url: cobaltStreamUrl,
+        url: primaryAudioUrl,
       },
     ],
   };

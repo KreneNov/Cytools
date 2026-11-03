@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'http';
-import { extractSocialMedia } from '../_social_extractor.js';
+import { extractSocialMedia, resolveInnertubeStreams } from '../_social_extractor.js';
 
 interface ExtendedRequest extends IncomingMessage {
   query?: Record<string, string>;
@@ -75,21 +75,48 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
 
   try {
     let targetUrl: string | null = null;
+    let action: string | null = null;
+    let videoId: string | null = null;
 
     // 1. Try URL Query parameters
     if (req.url) {
       try {
         const parsed = new URL(req.url, 'http://127.0.0.1');
         targetUrl = parsed.searchParams.get('url');
+        action = parsed.searchParams.get('action');
+        videoId = parsed.searchParams.get('videoId');
       } catch {
         // Continue
       }
+    }
+
+    // Handle instant stream resolution action for YouTube
+    if (action === 'resolve' && videoId) {
+      const streams = await resolveInnertubeStreams(videoId);
+      return sendJson(res, 200, {
+        success: true,
+        videoId,
+        preMuxedUrl: streams.preMuxedUrl,
+        audioUrl: streams.audioUrl,
+      });
     }
 
     // 2. Try parsed body for POST
     if (!targetUrl && req.method === 'POST') {
       const body = await parseBody(req);
       targetUrl = body.url || null;
+      if (!action && body.action) action = body.action;
+      if (!videoId && body.videoId) videoId = body.videoId;
+
+      if (action === 'resolve' && videoId) {
+        const streams = await resolveInnertubeStreams(videoId);
+        return sendJson(res, 200, {
+          success: true,
+          videoId,
+          preMuxedUrl: streams.preMuxedUrl,
+          audioUrl: streams.audioUrl,
+        });
+      }
     }
 
     if (!targetUrl || typeof targetUrl !== 'string' || !targetUrl.trim()) {

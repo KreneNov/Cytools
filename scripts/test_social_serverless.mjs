@@ -4,6 +4,7 @@ import {
   extractPinterest,
   extractFacebook,
   extractYouTube,
+  resolveInnertubeStreams,
 } from '../api/_social_extractor.ts';
 import extractHandler from '../api/social/extract.ts';
 import downloadHandler from '../api/download.ts';
@@ -102,28 +103,42 @@ async function runTests() {
     console.log('Pinterest test notice:', e.message);
   }
 
-  console.log('\n=== TEST 6: Facebook Video Direct Stream Extraction ===');
+  console.log('\n=== TEST 6: Facebook Reel Plugin Scraper (Direct fbcdn.net) ===');
   try {
-    const fbRes = await extractFacebook('https://www.facebook.com/watch/?v=10153231379946729');
-    console.log('Facebook result:', {
+    const fbRes = await extractFacebook('https://www.facebook.com/reel/27671016255913880');
+    console.log('Facebook Reel result:', {
       success: fbRes.success,
       platform: fbRes.platform,
       type: fbRes.type,
-      title: fbRes.title?.slice(0, 40),
       options: fbRes.mediaOptions?.map((o) => ({ id: o.id, url: o.url?.slice(0, 60) })),
     });
     console.assert(fbRes.success === true, 'Facebook extraction should succeed');
     console.assert(fbRes.platform === 'facebook', 'Platform should be facebook');
     for (const opt of fbRes.mediaOptions) {
-      console.assert(!opt.url.includes('facebook.com/watch'), 'Option MUST NOT point to facebook.com watch page!');
-      console.assert(opt.url.includes('fbcdn.net'), 'Option should point to fbcdn.net stream');
+      console.assert(!opt.url.includes('facebook.com/reel'), 'Option MUST NOT point to facebook.com reel page!');
+      console.assert(opt.url.includes('fbcdn.net') || opt.url.includes('lookaside'), 'Option should point to direct stream');
     }
-    console.log('✔ Facebook extraction returned direct fbcdn.net MP4 stream (NEVER page URL)!');
+    console.log('✔ Facebook Reel extracted direct stream successfully without loopback!');
   } catch (e) {
     console.log('Facebook test notice:', e.message);
   }
 
-  console.log('\n=== TEST 7: YouTube Instant Metadata & Anti-Bot Prevention ===');
+  console.log('\n=== TEST 7: YouTube Innertube ANDROID_VR Stream Resolution ===');
+  try {
+    const streams = await resolveInnertubeStreams('dQw4w9WgXcQ');
+    console.log('Innertube streams:', {
+      hasPreMuxed: !!streams.preMuxedUrl,
+      hasAudio: !!streams.audioUrl,
+    });
+    console.assert(streams.preMuxedUrl !== null, 'Innertube should return itag 18 pre-muxed stream');
+    console.assert(streams.audioUrl !== null, 'Innertube should return itag 140 audio stream');
+    console.assert(streams.preMuxedUrl.includes('googlevideo.com'), 'Stream should be googlevideo.com');
+    console.log('✔ YouTube Innertube ANDROID_VR player returned direct pre-muxed MP4 & M4A streams!');
+  } catch (e) {
+    console.warn('Innertube test notice:', e.message);
+  }
+
+  console.log('\n=== TEST 8: YouTube Instant Metadata & Pre-muxed Options ===');
   try {
     const ytRes = await extractYouTube('https://youtu.be/dQw4w9WgXcQ');
     console.log('YouTube result:', {
@@ -143,17 +158,26 @@ async function runTests() {
     throw e;
   }
 
-  console.log('\n=== TEST 8: /api/download Proxy Validation ===');
-  const dReq = { method: 'GET', url: '/api/download?url=' + encodeURIComponent('https://i.pinimg.com/originals/test.jpg') + '&filename=test.jpg' };
+  console.log('\n=== TEST 9: /api/social/extract?action=resolve Endpoint ===');
+  const resolveReq = { method: 'GET', url: '/api/social/extract?action=resolve&videoId=dQw4w9WgXcQ' };
+  const resolveRes = new MockResponse();
+  await extractHandler(resolveReq, resolveRes);
+  console.assert(resolveRes.statusCode === 200, `Expected 200 for action=resolve, got ${resolveRes.statusCode}`);
+  const rJson = JSON.parse(resolveRes.body);
+  console.assert(rJson.success === true, 'Expected success: true from action=resolve');
+  console.assert(!!rJson.preMuxedUrl, 'Expected preMuxedUrl in action=resolve');
+  console.log('✔ /api/social/extract?action=resolve returned instant preMuxed stream!');
+
+  console.log('\n=== TEST 10: /api/download Proxy Validation & Lookaside Headers ===');
+  const dReq = { method: 'GET', url: '/api/download?url=' + encodeURIComponent('https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=123') + '&filename=reel.mp4' };
   const dRes = new MockResponse();
-  // Call download handler to verify validation & headers
   try {
     await downloadHandler(dReq, dRes);
   } catch {
-    // Upstream network call might fail in mock test, which is normal
+    // Upstream call mock catch
   }
   console.assert(dRes.getHeader('access-control-allow-origin') === '*', 'Missing download CORS header');
-  console.log('✔ /api/download: CORS and validation headers verified');
+  console.log('✔ /api/download: Lookaside proxy headers verified');
 
   console.log('\n========================================');
   console.log('ALL VERIFICATION CHECKS PASSED PERFECTLY!');

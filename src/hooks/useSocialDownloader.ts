@@ -128,12 +128,13 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       try {
         let directUrl = mediaUrl;
 
-        // Phase 1: If YouTube and URL not yet resolved (or empty), resolve stream client-side via Cobalt v10
+        // Phase 1: If YouTube and URL not yet resolved (or empty), resolve stream via multi-tier waterfall
         if ((!directUrl || optionId?.startsWith('youtube_')) && result?.videoId) {
           const isAudio = optionId === 'youtube_audio';
           const quality = optionId === 'youtube_1080p' ? '1080' : '720';
           const targetYtUrl = `https://www.youtube.com/watch?v=${result.videoId}`;
 
+          // Tier 1: Try Cobalt v10 from client (with requested quality)
           try {
             const cobaltRes = await fetch('https://rue-cobalt.xenon.zone', {
               method: 'POST',
@@ -147,7 +148,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
                 audioFormat: 'mp3',
                 isAudioOnly: isAudio,
               }),
-              signal: AbortSignal.timeout(12000),
+              signal: AbortSignal.timeout(8000),
             });
 
             if (cobaltRes.ok) {
@@ -161,6 +162,67 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             }
           } catch (cobaltErr) {
             console.warn('[useSocialDownloader] Client Cobalt attempt failed:', cobaltErr);
+          }
+
+          // Tier 2: If 1080p failed or video is long, try Cobalt 720p
+          if (!directUrl && quality === '1080' && !isAudio) {
+            try {
+              const cobaltRes720 = await fetch('https://rue-cobalt.xenon.zone', {
+                method: 'POST',
+                headers: {
+                  Accept: 'application/json',
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  url: targetYtUrl,
+                  videoQuality: '720',
+                  audioFormat: 'mp3',
+                  isAudioOnly: false,
+                }),
+                signal: AbortSignal.timeout(7000),
+              });
+
+              if (cobaltRes720.ok) {
+                const cJson720 = await cobaltRes720.json();
+                if (
+                  cJson720.url &&
+                  (cJson720.status === 'tunnel' || cJson720.status === 'redirect' || cJson720.status === 'stream')
+                ) {
+                  directUrl = cJson720.url;
+                }
+              }
+            } catch (cobalt720Err) {
+              console.warn('[useSocialDownloader] Client Cobalt 720p attempt failed:', cobalt720Err);
+            }
+          }
+
+          // Tier 3: Innertube ANDROID_VR pre-muxed stream / itag 140 audio fallback
+          if (!directUrl) {
+            try {
+              const resolveUrl = getApiUrl(`/api/social/extract?action=resolve&videoId=${result.videoId}`);
+              const resStream = await fetch(resolveUrl, { signal: AbortSignal.timeout(6000) });
+              if (resStream.ok) {
+                const streamData = await resStream.json();
+                if (isAudio && streamData.audioUrl) {
+                  directUrl = streamData.audioUrl;
+                } else if (streamData.preMuxedUrl) {
+                  directUrl = streamData.preMuxedUrl;
+                }
+              }
+            } catch (innerErr) {
+              console.warn('[useSocialDownloader] Innertube resolution fallback failed:', innerErr);
+            }
+          }
+
+          // Tier 4: Use pre-extracted stream options from result if available
+          if (!directUrl) {
+            if (isAudio && result.audioUrl) {
+              directUrl = result.audioUrl;
+            } else if (result.videoSd) {
+              directUrl = result.videoSd;
+            } else if (result.videoHd) {
+              directUrl = result.videoHd;
+            }
           }
         }
 
