@@ -1116,6 +1116,83 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
     console.warn('[Ytdl Stream Resolution Warning]:', ytdlErr instanceof Error ? ytdlErr.message : ytdlErr);
   }
 
+  // Strategy 3: SaveTube VIP CDN v2 Fallback (Works on Datacenter IPs where YouTube blocks Innertube)
+  try {
+    const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', {
+      signal: AbortSignal.timeout(4000),
+    });
+    if (cdnRes.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const cdnData: any = await cdnRes.json();
+      const cdnHost = cdnData?.cdn || 'cdn405.savetube.vip';
+      const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+      const infoRes = await fetch(`https://${cdnHost}/v2/info`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ url: targetUrl }),
+        signal: AbortSignal.timeout(6000),
+      });
+
+      if (infoRes.ok) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const infoJson: any = await infoRes.json();
+        if (infoJson?.status && typeof infoJson.data === 'string') {
+          const cleanB64 = infoJson.data.replace(/\s/g, '');
+          const rawBuf = Buffer.from(cleanB64, 'base64');
+          const iv = rawBuf.subarray(0, 16);
+          const ciphertext = rawBuf.subarray(16);
+          const keyBuf = Buffer.from('C5D58EF67A7584E4A29F6C35BBC4EB12', 'hex');
+
+          const cryptoMod = await import('node:crypto');
+          const decipher = cryptoMod.createDecipheriv('aes-128-cbc', keyBuf, iv);
+          const decryptedStr = Buffer.concat([
+            decipher.update(ciphertext),
+            decipher.final(),
+          ]).toString('utf8');
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const decrypted: any = JSON.parse(decryptedStr);
+
+          if (decrypted?.key) {
+            const [vidDl, audDl] = await Promise.allSettled([
+              fetch(`https://${cdnHost}/download`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ downloadType: 'video', quality: '720', key: decrypted.key }),
+                signal: AbortSignal.timeout(6000),
+              }).then((r) => r.json()),
+              fetch(`https://${cdnHost}/download`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ downloadType: 'audio', quality: '128', key: decrypted.key }),
+                signal: AbortSignal.timeout(6000),
+              }).then((r) => r.json()),
+            ]);
+
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const preMuxedUrl = vidDl.status === 'fulfilled' ? (vidDl.value as any)?.data?.downloadUrl || null : null;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const audioUrl = audDl.status === 'fulfilled' ? (audDl.value as any)?.data?.downloadUrl || null : null;
+
+            if (preMuxedUrl || audioUrl) {
+              return {
+                preMuxedUrl,
+                audioUrl,
+                resolvedBy: 'savetube_vip_cdn',
+                debugReason: 'OK',
+              };
+            }
+          }
+        }
+      }
+    }
+  } catch (stErr) {
+    console.warn('[SaveTube Stream Fallback Warning]:', stErr instanceof Error ? stErr.message : stErr);
+  }
+
   return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No stream available' };
 }
 

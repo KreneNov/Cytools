@@ -22,6 +22,8 @@
     "*://*.vercel.app/*",
     "*://*.youtube.com/*",
     "*://*.googlevideo.com/*",
+    "*://*.cobalt.tools/*",
+    "*://*.savetube.vip/*",
     "<all_urls>"
   ],
   "background": {

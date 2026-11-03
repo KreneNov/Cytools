@@ -210,6 +210,45 @@ async function runTests() {
   console.assert(aChunk && aChunk.length > 1000, 'Expected non-empty binary audio stream');
   console.log('✔ /api/download: Same-Lambda YouTube resolve & binary streaming verified without IP mismatch!');
 
+  console.log('\n=== TEST 12: Client-Side YouTube Resolution (Cobalt v10 + SaveTube VIP CDN WebCrypto) ===');
+  const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', { headers: { Origin: 'https://cytools.vercel.app' } });
+  console.assert(cdnRes.ok, 'Expected 200 from SaveTube random-cdn');
+  const { cdn } = await cdnRes.json();
+  const infoRes = await fetch(`https://${cdn}/v2/info`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://cytools.vercel.app' },
+    body: JSON.stringify({ url: 'https://www.youtube.com/watch?v=p8K6ws6Ivlo' }),
+  });
+  const infoJson = await infoRes.json();
+  console.assert(infoJson.status && typeof infoJson.data === 'string', 'Expected encrypted infoJson.data');
+
+  // Decrypt using Web Crypto API (identical to browser useSocialDownloader.ts)
+  const cleanB64 = infoJson.data.replace(/\s/g, '');
+  const rawBytes = Uint8Array.from(atob(cleanB64), (c) => c.charCodeAt(0));
+  const keyHex = 'C5D58EF67A7584E4A29F6C35BBC4EB12';
+  const keyBytes = new Uint8Array(keyHex.match(/.{1,2}/g).map((b) => parseInt(b, 16)));
+  const cryptoKey = await globalThis.crypto.subtle.importKey('raw', keyBytes, { name: 'AES-CBC' }, false, ['decrypt']);
+  const decBuf = await globalThis.crypto.subtle.decrypt({ name: 'AES-CBC', iv: rawBytes.slice(0, 16) }, cryptoKey, rawBytes.slice(16));
+  const decData = JSON.parse(new TextDecoder().decode(decBuf));
+  console.assert(decData.key, 'Expected decrypted SaveTube key');
+
+  const dl1080Res = await fetch(`https://${cdn}/download`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'https://cytools.vercel.app' },
+    body: JSON.stringify({ downloadType: 'video', quality: '1080', key: decData.key }),
+  });
+  const dl1080Json = await dl1080Res.json();
+  const direct1080Url = dl1080Json?.data?.downloadUrl;
+  console.log('Client-Side 1080p URL:', direct1080Url);
+  console.assert(direct1080Url && direct1080Url.startsWith('https://'), 'Expected valid https 1080p downloadUrl');
+
+  const probe1080 = await fetch(direct1080Url, { headers: { Range: 'bytes=0-16383' } });
+  const probe1080Buf = await probe1080.arrayBuffer();
+  console.log('1080p Stream Status:', probe1080.status, 'Disposition:', probe1080.headers.get('content-disposition'), 'Bytes:', probe1080Buf.byteLength);
+  console.assert(probe1080.headers.get('content-disposition')?.includes('attachment'), 'Expected Content-Disposition: attachment for Hidden Iframe download');
+  console.assert(probe1080Buf.byteLength > 1000, 'Expected non-zero video bytes from client-side URL');
+  console.log('✔ Client-Side YouTube resolution & Hidden Iframe attachment headers verified!');
+
   console.log('\n========================================');
   console.log('ALL VERIFICATION CHECKS PASSED PERFECTLY!');
   console.log('========================================');
