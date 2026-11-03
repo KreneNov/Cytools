@@ -43,6 +43,29 @@ const INITIAL_PROGRESS: DownloadProgress = {
 const SAVETUBE_AES_KEY_HEX = 'C5D58EF67A7584E4A29F6C35BBC4EB12';
 
 /**
+ * Strips unwanted upstream branding domains and suffixes (e.g. -ytshorts.savetube.me, savenow, cobalt...)
+ * from download filenames before saving.
+ */
+export function cleanDownloadFilename(filename: string): string {
+  if (!filename) return 'media.mp4';
+
+  const dotIdx = filename.lastIndexOf('.');
+  const ext = dotIdx !== -1 ? filename.slice(dotIdx) : '.mp4';
+  let name = dotIdx !== -1 ? filename.slice(0, dotIdx) : filename;
+
+  // Remove known branding domains, subdomains, and platform artifacts
+  const brandingRegex =
+    /[-_.]?(?:ytshorts\.)?(?:savetube\.(?:me|vip|su)|oceansaver\.(?:in|net)|savenow\.to|cobalt\.tools|loader\.to|tikwm\.com|snaptik\.app|y2mate\.com|ytshorts)/gi;
+  name = name.replace(brandingRegex, '');
+
+  // Collapse consecutive dashes/underscores and trim trailing/leading separators
+  name = name.replace(/[-_]{2,}/g, '-').replace(/^[-_]+|[-_]+$/g, '');
+
+  if (!name.trim()) name = 'media';
+  return name + ext;
+}
+
+/**
  * Decrypts SaveTube VIP v2 AES-128-CBC encrypted info payload using native Web Crypto API.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -105,6 +128,7 @@ async function resolveYouTubeClientSide(
         videoQuality: quality === '1080p' ? '1080' : '720',
         isAudioOnly: type === 'audio',
         downloadMode: 'auto',
+        filenameStyle: 'basic',
       }),
       signal: AbortSignal.timeout(5000),
     });
@@ -167,6 +191,7 @@ async function resolveYouTubeClientSide(
                     downloadType,
                     quality: q,
                     key: decrypted.key,
+                    title: cleanDownloadFilename(decrypted?.title || 'video'),
                   }),
                   signal: AbortSignal.timeout(10000),
                 });
@@ -260,6 +285,7 @@ async function resolveYouTubeClientSide(
  * - Web App: Uses Hidden Iframe Injection to trigger Content-Disposition: attachment without opening a new tab or 0-byte CORS errors.
  */
 async function triggerDirectDownload(url: string, filename: string): Promise<void> {
+  const cleanFilename = cleanDownloadFilename(filename);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
 
@@ -268,7 +294,7 @@ async function triggerDirectDownload(url: string, filename: string): Promise<voi
       chromeObj.downloads.download(
         {
           url,
-          filename,
+          filename: cleanFilename,
           saveAs: false,
         },
         (downloadId?: number) => {
@@ -353,13 +379,15 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       targetFileName: string,
       optionId?: string
     ): Promise<void> => {
+      const cleanTargetFileName = cleanDownloadFilename(targetFileName);
+
       setDownloadProgress({
         isDownloading: true,
         activeOptionId: optionId,
         loadedBytes: 0,
         totalBytes: 0,
         percentage: 15,
-        fileName: targetFileName,
+        fileName: cleanTargetFileName,
         stage: 'video',
         status: 'downloading',
       });
@@ -447,7 +475,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           }));
 
           // Trigger direct download (chrome.downloads on Extension, Hidden Iframe on Web App)
-          await triggerDirectDownload(resolvedYtUrl, targetFileName);
+          await triggerDirectDownload(resolvedYtUrl, cleanTargetFileName);
 
           if (stageTimer) clearTimeout(stageTimer);
           setDownloadProgress((prev) => ({
@@ -470,7 +498,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             chromeObj.downloads.download(
               {
                 url: directUrl,
-                filename: targetFileName,
+                filename: cleanTargetFileName,
                 saveAs: false,
               },
               (downloadId?: number) => {
@@ -555,7 +583,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         // Step 3B: If direct fetch failed or was blocked by CORS (e.g. i.pinimg.com), fetch via /api/download proxy!
         if (!downloadedBlob) {
           const proxyUrl = getApiUrl(
-            `/api/download?url=${encodeURIComponent(directUrl)}&filename=${encodeURIComponent(targetFileName)}`
+            `/api/download?url=${encodeURIComponent(directUrl)}&filename=${encodeURIComponent(cleanTargetFileName)}`
           );
           const proxyRes = await fetch(proxyUrl, { signal: AbortSignal.timeout(45000) });
           if (!proxyRes.ok) {
@@ -577,7 +605,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         }
 
         // Trigger local file save via Blob URL
-        triggerBlobSave(downloadedBlob, targetFileName);
+        triggerBlobSave(downloadedBlob, cleanTargetFileName);
 
         if (stageTimer) clearTimeout(stageTimer);
 
