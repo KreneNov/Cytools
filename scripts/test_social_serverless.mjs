@@ -251,15 +251,44 @@ async function runTests() {
 
   console.log('\n=== TEST 13: cleanDownloadFilename Sanitizer Verification ===');
   function cleanDownloadFilename(filename) {
-    if (!filename) return 'media.mp4';
+    if (!filename) return 'cytools-video.mp4';
     const dotIdx = filename.lastIndexOf('.');
-    const ext = dotIdx !== -1 ? filename.slice(dotIdx) : '.mp4';
-    let name = dotIdx !== -1 ? filename.slice(0, dotIdx) : filename;
+    const hasExt = dotIdx !== -1 && dotIdx > 0;
+    const ext = hasExt ? filename.slice(dotIdx) : '.mp4';
+    let name = hasExt ? filename.slice(0, dotIdx) : filename;
+
+    // 1. Remove known branding domains, subdomains, and platform artifacts
     const brandingRegex =
       /[-_.]?(?:ytshorts\.)?(?:savetube\.(?:me|vip|su)|oceansaver\.(?:in|net)|savenow\.to|cobalt\.tools|loader\.to|tikwm\.com|snaptik\.app|y2mate\.com|ytshorts)/gi;
     name = name.replace(brandingRegex, '');
+
+    // 2. Replace illegal OS characters (\ / : * ? " < > |) with underscore
+    name = name.replace(/[\\/:"*?<>|]/g, '_');
+
+    // 3. Remove non-printable control characters (ASCII 0-31, 127-159)
+    // eslint-disable-next-line no-control-regex
+    name = name.replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+
+    // 4. Remove leading dots, slashes, or whitespace (prevents hidden files or relative path traversal)
+    name = name.replace(/^[.\s\\/]+/, '');
+
+    // 5. Remove trailing dots or whitespace before the extension (Windows illegal trailing period)
+    name = name.replace(/[.\s]+$/, '');
+
+    // 6. Collapse consecutive dashes/underscores and trim trailing/leading separators
     name = name.replace(/[-_]{2,}/g, '-').replace(/^[-_]+|[-_]+$/g, '');
-    if (!name.trim()) name = 'media';
+
+    // 7. Safe fallback if filename became empty after stripping illegal characters
+    if (!name.trim()) {
+      const isAudio =
+        ext.toLowerCase().includes('mp3') ||
+        ext.toLowerCase().includes('m4a') ||
+        ext.toLowerCase().includes('wav') ||
+        ext.toLowerCase().includes('aac') ||
+        ext.toLowerCase().includes('opus');
+      name = isAudio ? 'cytools-audio' : 'cytools-video';
+    }
+
     return name + ext;
   }
 
@@ -272,6 +301,13 @@ async function runTests() {
     { input: 'funny-video-savenow.to.mp4', expected: 'funny-video.mp4' },
     { input: 'tikwm.com_12345.mp4', expected: '12345.mp4' },
     { input: 'clean-title-1080.mp4', expected: 'clean-title-1080.mp4' },
+    // OS illegal character test cases:
+    { input: 'Song Title | Official Music Video [1080p].mp4', expected: 'Song Title _ Official Music Video [1080p].mp4' },
+    { input: 'Tutorial: How to Code? <React & Node>.mp4', expected: 'Tutorial_ How to Code_ _React & Node.mp4' },
+    { input: 'Watch "Now" *Best* / Test \\ 123.mp4', expected: 'Watch _Now_ _Best_ _ Test _ 123.mp4' },
+    { input: '...hidden_video.mp4', expected: 'hidden_video.mp4' },
+    { input: ':::***???<>>>|||.mp4', expected: 'cytools-video.mp4' },
+    { input: ':::***???<>>>|||.mp3', expected: 'cytools-audio.mp3' },
   ];
 
   for (const tc of testCases) {
@@ -279,7 +315,7 @@ async function runTests() {
     console.assert(actual === tc.expected, `Expected ${tc.expected}, got ${actual}`);
     console.log(`  ${tc.input} -> ${actual}`);
   }
-  console.log('✔ cleanDownloadFilename: All 8 upstream branding patterns sanitized perfectly!');
+  console.log('✔ cleanDownloadFilename: All 14 test cases (branding + OS illegal chars + fallback) sanitized perfectly!');
 
   console.log('\n=== TEST 14: Client-Side Instagram Extraction & Hidden Iframe Flow ===');
   const igReelUrl = 'https://www.instagram.com/reel/C8q_t_0M6lY/';

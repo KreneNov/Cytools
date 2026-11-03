@@ -44,24 +44,49 @@ const SAVETUBE_AES_KEY_HEX = 'C5D58EF67A7584E4A29F6C35BBC4EB12';
 
 /**
  * Strips unwanted upstream branding domains and suffixes (e.g. -ytshorts.savetube.me, savenow, cobalt...)
- * from download filenames before saving.
+ * and sanitizes illegal OS file system characters (\ / : * ? " < > |), control characters,
+ * leading dots/slashes, and trailing dots to prevent Chrome Extension "Invalid filename" errors.
  */
 export function cleanDownloadFilename(filename: string): string {
-  if (!filename) return 'media.mp4';
+  if (!filename) return 'cytools-video.mp4';
 
   const dotIdx = filename.lastIndexOf('.');
-  const ext = dotIdx !== -1 ? filename.slice(dotIdx) : '.mp4';
-  let name = dotIdx !== -1 ? filename.slice(0, dotIdx) : filename;
+  const hasExt = dotIdx !== -1 && dotIdx > 0;
+  const ext = hasExt ? filename.slice(dotIdx) : '.mp4';
+  let name = hasExt ? filename.slice(0, dotIdx) : filename;
 
-  // Remove known branding domains, subdomains, and platform artifacts
+  // 1. Remove known branding domains, subdomains, and platform artifacts
   const brandingRegex =
     /[-_.]?(?:ytshorts\.)?(?:savetube\.(?:me|vip|su)|oceansaver\.(?:in|net)|savenow\.to|cobalt\.tools|loader\.to|tikwm\.com|snaptik\.app|y2mate\.com|ytshorts)/gi;
   name = name.replace(brandingRegex, '');
 
-  // Collapse consecutive dashes/underscores and trim trailing/leading separators
+  // 2. Replace illegal OS characters (\ / : * ? " < > |) with underscore
+  name = name.replace(/[\\/:"*?<>|]/g, '_');
+
+  // 3. Remove non-printable control characters (ASCII 0-31, 127-159)
+  // eslint-disable-next-line no-control-regex
+  name = name.replace(/[\x00-\x1f\x7f-\x9f]/g, '');
+
+  // 4. Remove leading dots, slashes, or whitespace (prevents hidden files or relative path traversal)
+  name = name.replace(/^[.\s\\/]+/, '');
+
+  // 5. Remove trailing dots or whitespace before the extension (Windows illegal trailing period)
+  name = name.replace(/[.\s]+$/, '');
+
+  // 6. Collapse consecutive dashes/underscores and trim trailing/leading separators
   name = name.replace(/[-_]{2,}/g, '-').replace(/^[-_]+|[-_]+$/g, '');
 
-  if (!name.trim()) name = 'media';
+  // 7. Safe fallback if filename became empty after stripping illegal characters
+  if (!name.trim()) {
+    const isAudio =
+      ext.toLowerCase().includes('mp3') ||
+      ext.toLowerCase().includes('m4a') ||
+      ext.toLowerCase().includes('wav') ||
+      ext.toLowerCase().includes('aac') ||
+      ext.toLowerCase().includes('opus');
+    name = isAudio ? 'cytools-audio' : 'cytools-video';
+  }
+
   return name + ext;
 }
 
