@@ -134,20 +134,28 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           const quality = optionId === 'youtube_1080p' ? '1080' : '720';
           const targetYtUrl = `https://www.youtube.com/watch?v=${result.videoId}`;
 
-          // Tier 1: Try Cobalt v10 from client (with requested quality)
+          // Tier 1: Try Cobalt v10 from client with strict v10 schema
           try {
+            const cobaltBody = isAudio
+              ? {
+                  url: targetYtUrl,
+                  downloadMode: 'audio',
+                  audioFormat: 'mp3',
+                }
+              : {
+                  url: targetYtUrl,
+                  downloadMode: 'auto',
+                  videoQuality: quality,
+                  youtubeVideoCodec: 'h264',
+                };
+
             const cobaltRes = await fetch('https://rue-cobalt.xenon.zone', {
               method: 'POST',
               headers: {
                 Accept: 'application/json',
                 'Content-Type': 'application/json',
               },
-              body: JSON.stringify({
-                url: targetYtUrl,
-                videoQuality: quality,
-                audioFormat: 'mp3',
-                isAudioOnly: isAudio,
-              }),
+              body: JSON.stringify(cobaltBody),
               signal: AbortSignal.timeout(8000),
             });
 
@@ -164,10 +172,10 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             console.warn('[useSocialDownloader] Client Cobalt attempt failed:', cobaltErr);
           }
 
-          // Tier 2: If 1080p failed or video is long, try Cobalt 720p
-          if (!directUrl && quality === '1080' && !isAudio) {
+          // Tier 2: If Tier 1 failed, try Cobalt v10 with minimal schema (no quality restrictions)
+          if (!directUrl) {
             try {
-              const cobaltRes720 = await fetch('https://rue-cobalt.xenon.zone', {
+              const cobaltResSimple = await fetch('https://rue-cobalt.xenon.zone', {
                 method: 'POST',
                 headers: {
                   Accept: 'application/json',
@@ -175,28 +183,26 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
                 },
                 body: JSON.stringify({
                   url: targetYtUrl,
-                  videoQuality: '720',
-                  audioFormat: 'mp3',
-                  isAudioOnly: false,
+                  downloadMode: isAudio ? 'audio' : 'auto',
                 }),
-                signal: AbortSignal.timeout(7000),
+                signal: AbortSignal.timeout(6000),
               });
 
-              if (cobaltRes720.ok) {
-                const cJson720 = await cobaltRes720.json();
+              if (cobaltResSimple.ok) {
+                const cJsonSimple = await cobaltResSimple.json();
                 if (
-                  cJson720.url &&
-                  (cJson720.status === 'tunnel' || cJson720.status === 'redirect' || cJson720.status === 'stream')
+                  cJsonSimple.url &&
+                  (cJsonSimple.status === 'tunnel' || cJsonSimple.status === 'redirect' || cJsonSimple.status === 'stream')
                 ) {
-                  directUrl = cJson720.url;
+                  directUrl = cJsonSimple.url;
                 }
               }
-            } catch (cobalt720Err) {
-              console.warn('[useSocialDownloader] Client Cobalt 720p attempt failed:', cobalt720Err);
+            } catch (cobaltSimpleErr) {
+              console.warn('[useSocialDownloader] Client Cobalt minimal attempt failed:', cobaltSimpleErr);
             }
           }
 
-          // Tier 3: Innertube ANDROID_VR pre-muxed stream / itag 140 audio fallback
+          // Tier 3: Server Stream Resolver fallback (Innertube multi-client + Cobalt server tunnel)
           if (!directUrl) {
             try {
               const resolveUrl = getApiUrl(`/api/social/extract?action=resolve&videoId=${result.videoId}`);
@@ -207,14 +213,16 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
                   directUrl = streamData.audioUrl;
                 } else if (streamData.preMuxedUrl) {
                   directUrl = streamData.preMuxedUrl;
+                } else if (streamData.videoUrl) {
+                  directUrl = streamData.videoUrl;
                 }
               }
             } catch (innerErr) {
-              console.warn('[useSocialDownloader] Innertube resolution fallback failed:', innerErr);
+              console.warn('[useSocialDownloader] Stream resolution fallback failed:', innerErr);
             }
           }
 
-          // Tier 4: Use pre-extracted stream options from result if available
+          // Tier 4: Use pre-extracted stream options from result if available, or original mediaUrl
           if (!directUrl) {
             if (isAudio && result.audioUrl) {
               directUrl = result.audioUrl;
@@ -222,6 +230,8 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
               directUrl = result.videoSd;
             } else if (result.videoHd) {
               directUrl = result.videoHd;
+            } else if (mediaUrl) {
+              directUrl = mediaUrl;
             }
           }
         }

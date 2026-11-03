@@ -94,10 +94,12 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
     if (action === 'resolve' && videoId) {
       const streams = await resolveInnertubeStreams(videoId);
       return sendJson(res, 200, {
-        success: true,
+        success: !!(streams.preMuxedUrl || streams.audioUrl),
         videoId,
         preMuxedUrl: streams.preMuxedUrl,
         audioUrl: streams.audioUrl,
+        resolvedBy: streams.resolvedBy || 'innertube',
+        debugReason: streams.debugReason || 'OK',
       });
     }
 
@@ -111,10 +113,12 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
       if (action === 'resolve' && videoId) {
         const streams = await resolveInnertubeStreams(videoId);
         return sendJson(res, 200, {
-          success: true,
+          success: !!(streams.preMuxedUrl || streams.audioUrl),
           videoId,
           preMuxedUrl: streams.preMuxedUrl,
           audioUrl: streams.audioUrl,
+          resolvedBy: streams.resolvedBy || 'innertube',
+          debugReason: streams.debugReason || 'OK',
         });
       }
     }

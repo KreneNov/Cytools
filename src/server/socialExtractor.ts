@@ -819,6 +819,7 @@ async function extractCobalt(url: string, platform: SocialPlatform): Promise<Ext
           })
         : JSON.stringify({
             url,
+            downloadMode: 'auto',
             videoQuality: '1080',
             audioFormat: 'mp3',
             ...(isYouTube ? { youtubeVideoCodec: 'h264' } : {}),
@@ -835,7 +836,7 @@ async function extractCobalt(url: string, platform: SocialPlatform): Promise<Ext
         signal: AbortSignal.timeout(4500),
       });
 
-      // If v10 returned 400 invalid body, retry with simple body { url }
+      // If v10 returned 400 invalid body, retry with simple body { url, downloadMode: 'auto' }
       if (!response.ok && response.status === 400 && !isV7) {
         try {
           response = await fetch(inst.endpoint, {
@@ -845,7 +846,7 @@ async function extractCobalt(url: string, platform: SocialPlatform): Promise<Ext
               'Content-Type': 'application/json',
               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
             },
-            body: JSON.stringify({ url }),
+            body: JSON.stringify({ url, downloadMode: 'auto' }),
             signal: AbortSignal.timeout(4500),
           });
         } catch {
@@ -1178,6 +1179,116 @@ export async function extractSocialMedia(url: string): Promise<ExtractionResult>
 }
 
 /**
+ * Direct YouTube Innertube player API query using ANDROID_VR client with server Cobalt tunnel fallback.
+ * Returns pre-muxed itag 18 MP4 (video+audio) and high-bitrate itag 140 M4A audio.
+ */
+export async function resolveInnertubeStreams(videoId: string): Promise<{
+  preMuxedUrl: string | null;
+  audioUrl: string | null;
+  resolvedBy?: string;
+  debugReason?: string;
+}> {
+  // 1. Try Innertube player API with ANDROID_VR client
+  try {
+    const body = {
+      videoId,
+      context: {
+        client: {
+          clientName: 'ANDROID_VR',
+          clientVersion: '1.60.19',
+          deviceMake: 'Oculus',
+          deviceModel: 'Quest 3',
+          osName: 'Android',
+          osVersion: '12L',
+          androidSdkVersion: 32,
+          hl: 'vi',
+          gl: 'VN',
+        },
+      },
+    };
+
+    const res = await fetch('https://www.youtube.com/youtubei/v1/player', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (res.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const data: any = await res.json();
+      if (data.playabilityStatus?.status === 'OK') {
+        const formats = data.streamingData?.formats || [];
+        const adaptive = data.streamingData?.adaptiveFormats || [];
+
+        // Pre-muxed video (itag 18 has video + audio)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const preMuxed =
+          formats.find((f: any) => f.url && f.mimeType?.includes('video/mp4')) ||
+          formats.find((f: any) => f.url);
+
+        // Direct high-quality M4A audio (itag 140)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const audio =
+          adaptive.find((f: any) => f.url && f.itag === 140) ||
+          adaptive.find((f: any) => f.url && f.mimeType?.includes('audio/mp4'));
+
+        if (preMuxed?.url || audio?.url) {
+          return {
+            preMuxedUrl: preMuxed?.url || null,
+            audioUrl: audio?.url || null,
+            resolvedBy: 'innertube_android_vr',
+            debugReason: 'OK',
+          };
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[Innertube Stream Warning]:', err instanceof Error ? err.message : err);
+  }
+
+  // 2. Server-side Cobalt instance fallback
+  try {
+    const cRes = await fetch('https://rue-cobalt.xenon.zone', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        downloadMode: 'auto',
+      }),
+      signal: AbortSignal.timeout(4000),
+    });
+
+    if (cRes.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const cData: any = await cRes.json();
+      if (
+        cData.url &&
+        (cData.status === 'tunnel' || cData.status === 'redirect' || cData.status === 'stream')
+      ) {
+        return {
+          preMuxedUrl: cData.url,
+          audioUrl: cData.url,
+          resolvedBy: 'cobalt_server_tunnel',
+          debugReason: 'OK',
+        };
+      }
+    }
+  } catch (cErr) {
+    console.warn('[Cobalt Server Stream Warning]:', cErr instanceof Error ? cErr.message : cErr);
+  }
+
+  return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No valid stream found' };
+}
+
+/**
  * Vite plugin implementing /api/social/extract and /api/social/proxy-download middlewares.
  */
 export function socialDownloadProxyPlugin(): Plugin {
@@ -1228,6 +1339,25 @@ export function socialDownloadProxyPlugin(): Plugin {
           res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
 
           try {
+            const action = urlObj.searchParams.get('action');
+            const videoId = urlObj.searchParams.get('videoId');
+
+            if (action === 'resolve' && videoId) {
+              const streams = await resolveInnertubeStreams(videoId);
+              res.statusCode = 200;
+              res.end(
+                JSON.stringify({
+                  success: !!(streams.preMuxedUrl || streams.audioUrl),
+                  videoId,
+                  preMuxedUrl: streams.preMuxedUrl,
+                  audioUrl: streams.audioUrl,
+                  resolvedBy: streams.resolvedBy || 'innertube',
+                  debugReason: streams.debugReason || 'OK',
+                })
+              );
+              return;
+            }
+
             let targetUrl = urlObj.searchParams.get('url');
 
             // If POST request, read body
@@ -1240,6 +1370,21 @@ export function socialDownloadProxyPlugin(): Plugin {
               try {
                 const bodyJson = JSON.parse(bodyStr);
                 targetUrl = bodyJson.url;
+                if (bodyJson.action === 'resolve' && bodyJson.videoId) {
+                  const streams = await resolveInnertubeStreams(bodyJson.videoId);
+                  res.statusCode = 200;
+                  res.end(
+                    JSON.stringify({
+                      success: !!(streams.preMuxedUrl || streams.audioUrl),
+                      videoId: bodyJson.videoId,
+                      preMuxedUrl: streams.preMuxedUrl,
+                      audioUrl: streams.audioUrl,
+                      resolvedBy: streams.resolvedBy || 'innertube',
+                      debugReason: streams.debugReason || 'OK',
+                    })
+                  );
+                  return;
+                }
               } catch {
                 targetUrl = new URLSearchParams(bodyStr).get('url');
               }

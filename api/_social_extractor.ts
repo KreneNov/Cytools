@@ -180,6 +180,7 @@ export async function extractCobalt(url: string, platform: SocialPlatform): Prom
           })
         : JSON.stringify({
             url,
+            downloadMode: 'auto',
             videoQuality: '1080',
             audioFormat: 'mp3',
             ...(isYouTube ? { youtubeVideoCodec: 'h264' } : {}),
@@ -196,7 +197,7 @@ export async function extractCobalt(url: string, platform: SocialPlatform): Prom
         signal: AbortSignal.timeout(2800),
       });
 
-      // If v10 returned 400 invalid body, retry with simple body { url }
+      // If v10 returned 400 invalid body, retry with simple body { url, downloadMode: 'auto' }
       if (!response.ok && response.status === 400 && !isV7) {
         try {
           response = await fetch(inst.endpoint, {
@@ -206,7 +207,7 @@ export async function extractCobalt(url: string, platform: SocialPlatform): Prom
               'Content-Type': 'application/json',
               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
             },
-            body: JSON.stringify({ url }),
+            body: JSON.stringify({ url, downloadMode: 'auto' }),
             signal: AbortSignal.timeout(2500),
           });
         } catch {
@@ -1007,7 +1008,10 @@ export function extractYouTubeVideoId(url: string): string | null {
 export async function resolveInnertubeStreams(videoId: string): Promise<{
   preMuxedUrl: string | null;
   audioUrl: string | null;
+  resolvedBy?: string;
+  debugReason?: string;
 }> {
+  // 1. Try Innertube player API with ANDROID_VR client
   try {
     const body = {
       videoId,
@@ -1056,17 +1060,55 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
           adaptive.find((f: any) => f.url && f.itag === 140) ||
           adaptive.find((f: any) => f.url && f.mimeType?.includes('audio/mp4'));
 
-        return {
-          preMuxedUrl: preMuxed?.url || null,
-          audioUrl: audio?.url || null,
-        };
+        if (preMuxed?.url || audio?.url) {
+          return {
+            preMuxedUrl: preMuxed?.url || null,
+            audioUrl: audio?.url || null,
+            resolvedBy: 'innertube_android_vr',
+            debugReason: 'OK',
+          };
+        }
       }
     }
   } catch (err) {
     console.warn('[Innertube Stream Warning]:', err instanceof Error ? err.message : err);
   }
 
-  return { preMuxedUrl: null, audioUrl: null };
+  // 2. Server-side Cobalt instance fallback
+  try {
+    const cRes = await fetch('https://rue-cobalt.xenon.zone', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        downloadMode: 'auto',
+      }),
+      signal: AbortSignal.timeout(4000),
+    });
+
+    if (cRes.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const cData: any = await cRes.json();
+      if (
+        cData.url &&
+        (cData.status === 'tunnel' || cData.status === 'redirect' || cData.status === 'stream')
+      ) {
+        return {
+          preMuxedUrl: cData.url,
+          audioUrl: cData.url,
+          resolvedBy: 'cobalt_server_tunnel',
+          debugReason: 'OK',
+        };
+      }
+    }
+  } catch (cErr) {
+    console.warn('[Cobalt Server Stream Warning]:', cErr instanceof Error ? cErr.message : cErr);
+  }
+
+  return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No valid stream found' };
 }
 
 /**
