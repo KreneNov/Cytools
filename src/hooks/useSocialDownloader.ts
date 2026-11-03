@@ -128,10 +128,10 @@ async function decryptSaveTubeData(encryptedBase64: string): Promise<any> {
 }
 
 const COBALT_FALLBACK_INSTANCES = [
+  'https://rue-cobalt.xenon.zone/',
   'https://cobalt.q0.wtf/api/json',
   'https://co.wuk.sh/api/json',
   'https://api.cobalt.tools/api/json',
-  'https://rue-cobalt.xenon.zone/',
 ];
 
 /**
@@ -237,37 +237,63 @@ async function resolveYouTubeClientSide(
     );
   }
 
-  // Provider 2 (Fallback): Client-Side Cobalt v10 Round-Robin
-  for (const endpoint of COBALT_FALLBACK_INSTANCES) {
-    try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          url: targetYouTubeUrl,
-          videoQuality: quality === '1080p' ? '1080' : '720',
-          isAudioOnly: type === 'audio',
-          downloadMode: type === 'audio' ? 'audio' : 'auto',
-          filenameStyle: 'basic',
-        }),
-        signal: AbortSignal.timeout(6000),
-      });
+  // Provider 2 (Fallback): Client-Side Cobalt Round-Robin
+  for (const instanceUrl of COBALT_FALLBACK_INSTANCES) {
+    const candidatePayloads = [
+      // 1. Strict Cobalt v10 schema (rue-cobalt.xenon.zone, api.cobalt.tools) — NO isAudioOnly key
+      {
+        url: targetYouTubeUrl,
+        videoQuality: quality === '1080p' ? '1080' : '720',
+        downloadMode: type === 'audio' ? 'audio' : 'auto',
+      },
+      // 2. Minimal Cobalt v10 payload fallback
+      {
+        url: targetYouTubeUrl,
+        downloadMode: type === 'audio' ? 'audio' : 'auto',
+      },
+      // 3. Legacy Cobalt v7 schema fallback
+      {
+        url: targetYouTubeUrl,
+        videoQuality: quality === '1080p' ? '1080' : '720',
+        isAudioOnly: type === 'audio',
+      },
+    ];
 
-      if (!response.ok || response.status === 429) {
-        continue;
-      }
+    for (const payload of candidatePayloads) {
+      try {
+        const cobaltRes = await fetch(instanceUrl, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(6000),
+        });
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const res: any = await response.json();
-      const cobaltUrl = res?.url || res?.picker?.[0]?.url;
-      if (cobaltUrl && typeof cobaltUrl === 'string' && cobaltUrl.startsWith('http')) {
-        return cobaltUrl;
+        if (cobaltRes.status === 429) {
+          break; // Rate-limited on this instance, switch to next instance
+        }
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const data: any = await cobaltRes.json().catch(() => null);
+        if (!data) continue;
+
+        if (data.status === 'error') {
+          if (data.error?.code === 'error.api.invalid_body') {
+            continue; // Try next payload variant on this same instance
+          }
+          break; // Other upstream error on this instance, move to next instance
+        }
+
+        const cobaltUrl = data.url || data.picker?.[0]?.url;
+        if (cobaltUrl && typeof cobaltUrl === 'string' && cobaltUrl.startsWith('http')) {
+          return cobaltUrl;
+        }
+      } catch (cobaltErr) {
+        console.warn(`[useSocialDownloader] Provider 2 Cobalt instance (${instanceUrl}) failed:`, cobaltErr);
+        break;
       }
-    } catch (cobaltErr) {
-      console.warn(`[useSocialDownloader] Provider 2 Cobalt instance (${endpoint}) failed:`, cobaltErr);
     }
   }
 
