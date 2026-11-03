@@ -152,11 +152,11 @@ async function resolveYouTubeClientSide(
   const targetYouTubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
   let failureReason: 'rate_limit' | 'timeout' | 'network' = 'network';
 
-  // Engine 1 (Primary): SaveTube VIP / ME CDN v2 with 45s muxing timeout & fresh CDN node retry
+  // Engine 1 (Primary): SaveTube VIP / ME CDN v2 with 300s (5m) muxing timeout & fresh CDN node retry
   for (const discoveryUrl of SAVETUBE_DISCOVERY_ENDPOINTS) {
     try {
       const cdnRes = await fetch(discoveryUrl, {
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(30000),
       });
       if (cdnRes.status === 429) {
         failureReason = 'rate_limit';
@@ -177,7 +177,7 @@ async function resolveYouTubeClientSide(
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ url: targetYouTubeUrl }),
-        signal: AbortSignal.timeout(15000),
+        signal: AbortSignal.timeout(60000),
       });
 
       if (infoRes.status === 429) {
@@ -214,8 +214,8 @@ async function resolveYouTubeClientSide(
                 key: decrypted.key,
                 title: cleanDownloadFilename(decrypted?.title || 'video'),
               }),
-              // 45s timeout so long 1080p gaming videos are never prematurely canceled during muxing
-              signal: AbortSignal.timeout(45000),
+              // 300,000ms (5 minutes) timeout so massive/long videos never prematurely abort during muxing
+              signal: AbortSignal.timeout(300000),
             });
 
             if (dlRes.status === 429) {
@@ -273,7 +273,7 @@ async function resolveYouTubeClientSide(
         downloadMode: type === 'audio' ? 'audio' : 'auto',
         youtubeVideoCodec: 'h264',
       }),
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(60000),
     });
 
     if (cobaltRes.status === 429) {
@@ -301,7 +301,7 @@ async function resolveYouTubeClientSide(
     const format = type === 'audio' ? 'mp3' : quality === '1080p' ? '1080' : '720';
     const initUrl = `https://p.savenow.to/ajax/download.php?copyright=0&format=${format}&url=${encodeURIComponent(targetYouTubeUrl)}&api=dfcb6d76f2f6a9894gjkege8a4ab232222`;
     const initRes = await fetch(initUrl, {
-      signal: AbortSignal.timeout(12000),
+      signal: AbortSignal.timeout(60000),
     });
 
     if (initRes.status === 429) {
@@ -310,11 +310,11 @@ async function resolveYouTubeClientSide(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const initData: any = await initRes.json().catch(() => null);
       if (initData?.id) {
-        for (let attempt = 0; attempt < 25; attempt++) {
+        for (let attempt = 0; attempt < 60; attempt++) {
           await new Promise((resolve) => setTimeout(resolve, 1500));
           const progRes = await fetch(
             `https://p.savenow.to/ajax/progress.php?id=${encodeURIComponent(initData.id)}`,
-            { signal: AbortSignal.timeout(8000) }
+            { signal: AbortSignal.timeout(30000) }
           );
           if (!progRes.ok) continue;
 
@@ -377,7 +377,7 @@ async function resolveYouTubeClientSide(
             },
           },
         }),
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(30000),
       });
 
       if (vrRes.ok && vrRes.status !== 429) {
@@ -410,19 +410,20 @@ async function resolveYouTubeClientSide(
 }
 
 /**
- * Triggers a direct download on the client:
+ * Triggers a direct download on the client without routing large files through Vercel (/api/proxy or /api/download)
+ * and without buffering massive files into browser RAM via fetch().then(r => r.blob()):
  * - Chrome Extension: Uses chrome.downloads.download({ url, filename: cleanName }) (writes directly to disk)
  * - Web App:
- *    1. URLs with guaranteed attachment headers (SaveTube VIP CDN, Cobalt tunnel, SaveNow): Hidden iframe injection.
- *    2. Direct CDN URLs without attachment headers (e.g. Instagram fbcdn/cdninstagram, Facebook CDN):
- *       Attempts Fetch-to-Blob first. If CORS restricts direct blob fetch, routes through /api/proxy to force Content-Disposition: attachment!
+ *    1. URLs with guaranteed attachment headers (SaveTube VIP/ME CDN, Cobalt tunnel, SaveNow): Hidden iframe injection.
+ *    2. Direct CDN URLs (TikTok, Facebook, Instagram, Pinterest, etc.): Uses an <a> tag with download attribute and target="_blank"
+ *       so the browser handles the stream natively regardless of file size (e.g. 422MB+ videos).
  */
 export async function triggerDirectDownload(url: string, filename: string): Promise<void> {
   const cleanName = cleanDownloadFilename(filename);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
 
-  // 1. Extension Environment (Bulletproof - chrome.downloads writes directly to disk regardless of headers)
+  // 1. Extension Environment (Bulletproof - chrome.downloads writes directly to disk regardless of headers or size)
   if (chromeObj?.downloads?.download) {
     await new Promise<void>((resolve, reject) => {
       chromeObj.downloads.download(
@@ -449,7 +450,6 @@ export async function triggerDirectDownload(url: string, filename: string): Prom
   }
 
   // 2. Web App - Tunnel/API/CDN URLs with guaranteed attachment headers (SaveTube CDN, Cobalt tunnel, SaveNow...)
-  // These headers force the browser to trigger a download even in a hidden iframe without navigating away.
   const isAttachmentGuaranteed =
     url.includes('/tunnel') ||
     url.includes('xenon.zone') ||
@@ -469,38 +469,25 @@ export async function triggerDirectDownload(url: string, filename: string): Prom
       if (document.body.contains(iframe)) {
         document.body.removeChild(iframe);
       }
-    }, 15000);
+    }, 300000);
     return;
   }
 
-  // 3. Web App - Direct CDN URLs (e.g., Instagram cdninstagram/fbcdn, Facebook video CDN)
-  // Direct CDN URLs lack Content-Disposition: attachment, so putting them in an iframe silently plays them.
-  try {
-    // Attempt Fetch-to-Blob (Works if CDN CORS is loose)
-    const res = await fetch(url);
-    if (!res.ok) throw new Error(`Direct blob fetch failed: HTTP ${res.status}`);
-    const blob = await res.blob();
-    const blobUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = blobUrl;
-    a.download = cleanName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(blobUrl);
-  } catch (err) {
-    console.warn('[useSocialDownloader] Direct CDN blob fetch failed or blocked by CORS, falling back to proxy:', err);
-    // Strict CORS block (Instagram CDN): Route through Vercel Proxy to force attachment headers
-    const proxyUrl = getApiUrl(
-      `/api/proxy?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(cleanName)}`
-    );
-    const a = document.createElement('a');
-    a.href = proxyUrl;
-    a.download = cleanName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  }
+  // 3. Web App - Direct CDN links (TikTok, Facebook, Instagram, Pinterest, etc.)
+  // Never buffer 400MB+ files in RAM via fetch().blob() and never proxy through Vercel serverless (/api/proxy or /api/download)
+  const directDownloadUrl =
+    (url.includes('fbcdn.net') || url.includes('cdninstagram.com')) && !url.includes('dl=1')
+      ? `${url}${url.includes('?') ? '&' : '?'}dl=1`
+      : url;
+
+  const a = document.createElement('a');
+  a.href = directDownloadUrl;
+  a.setAttribute('download', cleanName);
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 }
 
 export const useSocialDownloader = (): UseSocialDownloaderReturn => {
@@ -540,7 +527,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
               url: cleanUrl,
               downloadMode: 'auto',
             }),
-            signal: AbortSignal.timeout(8000),
+            signal: AbortSignal.timeout(60000),
           });
 
           if (response.ok) {
@@ -709,9 +696,6 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
               mediaUrl.includes('googlevideo.com') ||
               mediaUrl.includes('savetube.vip')));
 
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
-
         if (isYouTube && result?.videoId) {
           const isAudio = optionId === 'youtube_audio' || optionId === 'yt_audio';
           const quality: '1080p' | '720p' =
@@ -767,7 +751,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             stage: 'muxing',
           }));
 
-          // Trigger direct download (chrome.downloads on Extension, Hidden Iframe on Web App)
+          // Trigger direct download (chrome.downloads on Extension, Hidden Iframe or <a target="_blank"> on Web App)
           await triggerDirectDownload(resolvedYtUrl, cleanTargetFileName);
 
           stopStageTimer();
@@ -784,22 +768,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           return;
         }
 
-        // Helper to force browser save via local Object URL (never opens blank tabs or plays silently!)
-        const triggerBlobSave = (blob: Blob, filename: string) => {
-          const objectUrl = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = objectUrl;
-          a.download = filename;
-          // STRICT RULE: DO NOT set a.target = '_blank'!
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          setTimeout(() => {
-            URL.revokeObjectURL(objectUrl);
-          }, 2000);
-        };
-
-        // Phase 2.5: Dedicated Instagram Download Flow
+        // Phase 2.5: Dedicated Instagram Download Flow (Direct CDN / Cobalt Tunnel without Vercel Proxy or Blob RAM buffering)
         const isInstagram =
           optionId?.startsWith('instagram_') ||
           result?.platform === 'instagram' ||
@@ -831,7 +800,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
                   url: result?.videoHd || mediaUrl,
                   downloadMode: 'auto',
                 }),
-                signal: AbortSignal.timeout(6000),
+                signal: AbortSignal.timeout(60000),
               });
               if (cobaltRes.ok) {
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -857,53 +826,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             stage: 'muxing',
           }));
 
-          // 1. Chrome Extension Environment: use chrome.downloads.download (direct disk save via residential IP)
-          if (chromeObj?.downloads?.download) {
-            await new Promise<void>((resolve, reject) => {
-              chromeObj.downloads.download(
-                {
-                  url: resolvedIgUrl,
-                  filename: cleanTargetFileName,
-                  saveAs: false,
-                },
-                (downloadId?: number) => {
-                  if (chromeObj.runtime?.lastError || !downloadId) {
-                    reject(
-                      new Error(
-                        chromeObj.runtime?.lastError?.message ||
-                          'Không thể khởi động tải xuống qua trình quản lý tiện ích.'
-                      )
-                    );
-                  } else {
-                    resolve();
-                  }
-                }
-              );
-            });
-          } else {
-            // 2. Web App Environment: fetch via /api/download proxy and trigger local blob save
-            // (Strictly prevents silent iframe play and bypasses Meta CDN CORS restrictions!)
-            const proxyUrl = getApiUrl(
-              `/api/download?url=${encodeURIComponent(resolvedIgUrl)}&filename=${encodeURIComponent(cleanTargetFileName)}`
-            );
-            const proxyRes = await fetch(proxyUrl, { signal: AbortSignal.timeout(45000) });
-            if (!proxyRes.ok) {
-              let errMsg = `Máy chủ CDN upstream phản hồi lỗi: HTTP ${proxyRes.status}`;
-              try {
-                const errJson = await proxyRes.json();
-                if (errJson.error) errMsg = errJson.error;
-              } catch {
-                // Ignore
-              }
-              throw new Error(errMsg);
-            }
-
-            const rawBlob = await proxyRes.blob();
-            if (!rawBlob || rawBlob.size === 0) {
-              throw new Error('Tệp tải về rỗng từ máy chủ.');
-            }
-            triggerBlobSave(rawBlob, cleanTargetFileName);
-          }
+          await triggerDirectDownload(resolvedIgUrl, cleanTargetFileName);
 
           stopStageTimer();
           setDownloadProgress((prev) => ({
@@ -919,117 +842,21 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           return;
         }
 
-        // Phase 3: Chrome Extension Native Streaming Optimization for other platforms:
-        // Use user's local residential IP directly via chrome.downloads API.
-        // Completely bypasses Vercel 10s timeouts, datacenter IP bans, and uses 0 MB heap!
-        if (chromeObj?.downloads?.download) {
-          await new Promise<void>((resolve, reject) => {
-            chromeObj.downloads.download(
-              {
-                url: directUrl,
-                filename: cleanTargetFileName,
-                saveAs: false,
-              },
-              (downloadId?: number) => {
-                if (chromeObj.runtime?.lastError || !downloadId) {
-                  reject(
-                    new Error(
-                      chromeObj.runtime?.lastError?.message ||
-                        'Không thể khởi động tải xuống qua trình quản lý tiện ích.'
-                    )
-                  );
-                } else {
-                  resolve();
-                }
-              }
-            );
-          });
+        // Phase 3: Smart Routing for TikTok, Facebook, Pinterest, and all other platforms
+        // Bypasses Vercel (/api/proxy & /api/download) and avoids fetch().blob() RAM/timeout crashes on 400MB+ videos
+        setDownloadProgress((prev) => ({
+          ...prev,
+          percentage: 85,
+          stage: 'muxing',
+        }));
 
-          stopStageTimer();
-
-          setDownloadProgress((prev) => ({
-            ...prev,
-            isDownloading: false,
-            percentage: 100,
-            stage: 'done',
-            status: 'completed',
-          }));
-
-          setTimeout(() => {
-            setDownloadProgress(INITIAL_PROGRESS);
-          }, 3500);
-          return;
-        }
-
-        // Phase 4: Non-YouTube Web Browser Client-Side Force Download via Local Blob (NEVER opens new tab!)
-        let downloadedBlob: Blob | null = null;
-
-        // Step 3A: Attempt direct fetch first if CDN allows CORS
-        try {
-          const response = await fetch(directUrl, { signal: AbortSignal.timeout(25000) });
-          const contentType = response.headers.get('content-type') || '';
-          if (contentType.includes('text/html')) {
-            throw new Error('Bị chặn bởi nền tảng. Vui lòng thử tải lại hoặc dùng tiện ích mở rộng Cytools.');
-          }
-
-          if (response.ok) {
-            const rawBlob = await response.blob();
-            if (rawBlob && rawBlob.size > 0) {
-              if (rawBlob.size < 1500) {
-                const sampleText = await rawBlob.text();
-                if (
-                  sampleText.includes('<!DOCTYPE') ||
-                  sampleText.includes('<html') ||
-                  sampleText.includes('darker-dark-theme') ||
-                  sampleText.includes('consent.youtube.com')
-                ) {
-                  throw new Error('Bị chặn bởi nền tảng (Anti-Bot). Vui lòng thử tải lại hoặc dùng tiện ích mở rộng Cytools.');
-                }
-              }
-              downloadedBlob = rawBlob;
-            }
-          }
-        } catch (fetchErr) {
-          if (fetchErr instanceof Error && fetchErr.message.includes('Bị chặn bởi nền tảng')) {
-            throw fetchErr;
-          }
-          console.warn('[useSocialDownloader] Direct fetch failed or CORS restricted, falling back to proxy:', fetchErr);
-        }
-
-        // Step 3B: If direct fetch failed or was blocked by CORS (e.g. i.pinimg.com), fetch via /api/download proxy!
-        if (!downloadedBlob) {
-          const proxyUrl = getApiUrl(
-            `/api/download?url=${encodeURIComponent(directUrl)}&filename=${encodeURIComponent(cleanTargetFileName)}`
-          );
-          const proxyRes = await fetch(proxyUrl, { signal: AbortSignal.timeout(45000) });
-          if (!proxyRes.ok) {
-            let errMsg = `Máy chủ CDN upstream phản hồi lỗi: HTTP ${proxyRes.status}`;
-            try {
-              const errJson = await proxyRes.json();
-              if (errJson.error) errMsg = errJson.error;
-            } catch {
-              // Ignore
-            }
-            throw new Error(errMsg);
-          }
-
-          const rawBlob = await proxyRes.blob();
-          if (!rawBlob || rawBlob.size === 0) {
-            throw new Error('Tệp tải về rỗng từ máy chủ.');
-          }
-          downloadedBlob = rawBlob;
-        }
-
-        // Trigger local file save via Blob URL
-        triggerBlobSave(downloadedBlob, cleanTargetFileName);
+        await triggerDirectDownload(directUrl, cleanTargetFileName);
 
         stopStageTimer();
 
         setDownloadProgress((prev) => ({
           ...prev,
           isDownloading: false,
-          loadedBytes: downloadedBlob!.size,
-          totalBytes: downloadedBlob!.size,
           percentage: 100,
           stage: 'done',
           status: 'completed',
