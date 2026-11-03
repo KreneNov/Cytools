@@ -1301,7 +1301,13 @@ export function socialDownloadProxyPlugin(): Plugin {
         const urlObj = new URL(reqUrl, 'http://127.0.0.1:5173');
 
         // Preflight OPTIONS CORS handling for Extension and Cross-Origin requests
-        if (req.method === 'OPTIONS' && (urlObj.pathname.startsWith('/api/social/') || urlObj.pathname === '/api/download-extension')) {
+        if (
+          req.method === 'OPTIONS' &&
+          (urlObj.pathname.startsWith('/api/social/') ||
+            urlObj.pathname === '/api/download-extension' ||
+            urlObj.pathname === '/api/proxy' ||
+            urlObj.pathname === '/api/download')
+        ) {
           res.setHeader('Access-Control-Allow-Origin', '*');
           res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
           res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
@@ -1409,8 +1415,12 @@ export function socialDownloadProxyPlugin(): Plugin {
           return;
         }
 
-        // 2. Direct Proxy Download Streamer: /api/social/proxy-download and /api/download
-        if (urlObj.pathname === '/api/social/proxy-download' || urlObj.pathname === '/api/download') {
+        // 2. Direct Proxy Download Streamer: /api/social/proxy-download, /api/download, and /api/proxy
+        if (
+          urlObj.pathname === '/api/social/proxy-download' ||
+          urlObj.pathname === '/api/download' ||
+          urlObj.pathname === '/api/proxy'
+        ) {
           res.setHeader('Access-Control-Allow-Origin', '*');
           res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
           res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');

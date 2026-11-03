@@ -12,6 +12,7 @@
   "rewrites": [
     { "source": "/api/payment/status/(.*)", "destination": "/api/payment/status?code=$1" },
     { "source": "/api/social/proxy-download", "destination": "/api/download" },
+    { "source": "/api/proxy", "destination": "/api/download" },
     { "source": "/api/(.*)", "destination": "/api/$1" },
     { "source": "/((?!api/).*)", "destination": "/index.html" }
   ]

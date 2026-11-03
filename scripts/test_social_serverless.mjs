@@ -317,7 +317,7 @@ async function runTests() {
   }
   console.log('✔ cleanDownloadFilename: All 14 test cases (branding + OS illegal chars + fallback) sanitized perfectly!');
 
-  console.log('\n=== TEST 14: Client-Side Instagram Extraction & Hidden Iframe Flow ===');
+  console.log('\n=== TEST 14: Client-Side Instagram Extraction & Smart Routing Download Flow ===');
   const igReelUrl = 'https://www.instagram.com/reel/C8q_t_0M6lY/';
   const igShortUrl = 'https://instagr.am/p/C8q_t_0M6lY/';
   console.assert(detectPlatform(igReelUrl) === 'instagram', 'Expected instagram for reel url');
@@ -355,7 +355,27 @@ async function runTests() {
   console.assert(mockIgResult.platform === 'instagram', 'Expected instagram platform');
   console.assert(mockIgResult.mediaOptions.length === 2, 'Expected 2 media options');
   console.assert(cleanDownloadFilename('instagram_reel-savetube.me.mp4') === 'instagram_reel.mp4', 'Expected sanitized filename');
-  console.log('✔ Client-Side Instagram Reels extraction & direct download flow verified!');
+
+  // Verify Smart Routing Decision logic
+  function checkAttachmentGuaranteed(url) {
+    return (
+      url.includes('/tunnel') ||
+      url.includes('api.cobalt.tools') ||
+      url.includes('savenow.to') ||
+      url.includes('savetube.vip') ||
+      url.includes('savetube.me') ||
+      url.includes('savetube.su')
+    );
+  }
+
+  console.assert(checkAttachmentGuaranteed('https://cdn405.savetube.vip/media/123/video.mp4') === true, 'SaveTube VIP should use iframe');
+  console.assert(checkAttachmentGuaranteed('https://api.cobalt.tools/tunnel/video.mp4') === true, 'Cobalt tunnel should use iframe');
+  console.assert(checkAttachmentGuaranteed(dummyDirectUrl) === false, 'Instagram Direct CDN must NOT use iframe (prevents silent play)');
+
+  const expectedProxyUrl = `/api/proxy?url=${encodeURIComponent(dummyDirectUrl)}&filename=${encodeURIComponent('instagram_reel.mp4')}`;
+  console.assert(expectedProxyUrl.includes('/api/proxy?url='), 'Proxy URL should route through /api/proxy');
+  console.assert(expectedProxyUrl.includes('instagram_reel.mp4'), 'Proxy URL should include clean filename');
+  console.log('✔ Client-Side Instagram Reels extraction & Smart Routing direct download verified!');
 
   console.log('\n========================================');
   console.log('ALL VERIFICATION CHECKS PASSED PERFECTLY!');

@@ -306,20 +306,24 @@ async function resolveYouTubeClientSide(
 
 /**
  * Triggers a direct download on the client:
- * - Chrome Extension: Uses chrome.downloads.download({ url, filename })
- * - Web App: Uses Hidden Iframe Injection to trigger Content-Disposition: attachment without opening a new tab or 0-byte CORS errors.
+ * - Chrome Extension: Uses chrome.downloads.download({ url, filename: cleanName }) (writes directly to disk)
+ * - Web App:
+ *    1. URLs with guaranteed attachment headers (SaveTube VIP CDN, Cobalt tunnel, SaveNow): Hidden iframe injection.
+ *    2. Direct CDN URLs without attachment headers (e.g. Instagram fbcdn/cdninstagram, Facebook CDN):
+ *       Attempts Fetch-to-Blob first. If CORS restricts direct blob fetch, routes through /api/proxy to force Content-Disposition: attachment!
  */
-async function triggerDirectDownload(url: string, filename: string): Promise<void> {
-  const cleanFilename = cleanDownloadFilename(filename);
+export async function triggerDirectDownload(url: string, filename: string): Promise<void> {
+  const cleanName = cleanDownloadFilename(filename);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
 
+  // 1. Extension Environment (Bulletproof - chrome.downloads writes directly to disk regardless of headers)
   if (chromeObj?.downloads?.download) {
     await new Promise<void>((resolve, reject) => {
       chromeObj.downloads.download(
         {
           url,
-          filename: cleanFilename,
+          filename: cleanName,
           saveAs: false,
         },
         (downloadId?: number) => {
@@ -339,17 +343,57 @@ async function triggerDirectDownload(url: string, filename: string): Promise<voi
     return;
   }
 
-  // Web App environment: Hidden Iframe Injection
-  const iframe = document.createElement('iframe');
-  iframe.style.display = 'none';
-  iframe.src = url;
-  document.body.appendChild(iframe);
+  // 2. Web App - Tunnel/API/CDN URLs with guaranteed attachment headers (SaveTube CDN, Cobalt tunnel, SaveNow...)
+  // These headers force the browser to trigger a download even in a hidden iframe without navigating away.
+  const isAttachmentGuaranteed =
+    url.includes('/tunnel') ||
+    url.includes('api.cobalt.tools') ||
+    url.includes('savenow.to') ||
+    url.includes('savetube.vip') ||
+    url.includes('savetube.me') ||
+    url.includes('savetube.su');
 
-  setTimeout(() => {
-    if (document.body.contains(iframe)) {
-      document.body.removeChild(iframe);
-    }
-  }, 60000);
+  if (isAttachmentGuaranteed) {
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = url;
+    document.body.appendChild(iframe);
+    setTimeout(() => {
+      if (document.body.contains(iframe)) {
+        document.body.removeChild(iframe);
+      }
+    }, 15000);
+    return;
+  }
+
+  // 3. Web App - Direct CDN URLs (e.g., Instagram cdninstagram/fbcdn, Facebook video CDN)
+  // Direct CDN URLs lack Content-Disposition: attachment, so putting them in an iframe silently plays them.
+  try {
+    // Attempt Fetch-to-Blob (Works if CDN CORS is loose)
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`Direct blob fetch failed: HTTP ${res.status}`);
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = blobUrl;
+    a.download = cleanName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(blobUrl);
+  } catch (err) {
+    console.warn('[useSocialDownloader] Direct CDN blob fetch failed or blocked by CORS, falling back to proxy:', err);
+    // Strict CORS block (Instagram CDN): Route through Vercel Proxy to force attachment headers
+    const proxyUrl = getApiUrl(
+      `/api/proxy?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(cleanName)}`
+    );
+    const a = document.createElement('a');
+    a.href = proxyUrl;
+    a.download = cleanName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  }
 }
 
 export const useSocialDownloader = (): UseSocialDownloaderReturn => {
@@ -399,33 +443,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             thumbUrl = resJson.picker?.[0]?.thumb || undefined;
           }
         } catch (cobaltErr) {
-          console.warn('[useSocialDownloader] Client Cobalt Instagram primary attempt failed:', cobaltErr);
-        }
-
-        // Fallback to working instance if primary failed
-        if (!directVideoUrl) {
-          try {
-            const fallbackRes = await fetch('https://rue-cobalt.xenon.zone/', {
-              method: 'POST',
-              headers: {
-                Accept: 'application/json',
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({
-                url: cleanUrl,
-                downloadMode: 'auto',
-              }),
-              signal: AbortSignal.timeout(6000),
-            });
-            if (fallbackRes.ok) {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const fbJson: any = await fallbackRes.json();
-              directVideoUrl = fbJson.url || fbJson.picker?.[0]?.url || null;
-              thumbUrl = fbJson.picker?.[0]?.thumb || thumbUrl;
-            }
-          } catch (fbErr) {
-            console.warn('[useSocialDownloader] Client Cobalt Instagram fallback attempt failed:', fbErr);
-          }
+          console.warn('[useSocialDownloader] Client Cobalt Instagram attempt failed:', cobaltErr);
         }
 
         if (directVideoUrl) {

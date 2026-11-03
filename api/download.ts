@@ -373,7 +373,9 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
     };
 
     const host = parsedMediaUrl.hostname.toLowerCase();
-    if (host.includes('lookaside.fbsbx.com') || host.includes('fbsbx.com')) {
+    if (host.includes('instagram') || host.includes('cdninstagram')) {
+      upstreamHeaders['Referer'] = 'https://www.instagram.com/';
+    } else if (host.includes('lookaside.fbsbx.com') || host.includes('fbsbx.com')) {
       upstreamHeaders['User-Agent'] =
         'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
       upstreamHeaders['Accept'] = '*/*';
@@ -384,8 +386,6 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
       upstreamHeaders['Referer'] = 'https://www.facebook.com/';
     } else if (host.includes('tiktok.com') || host.includes('tikwm.com') || host.includes('byteoversea.com')) {
       upstreamHeaders['Referer'] = 'https://www.tiktok.com/';
-    } else if (host.includes('instagram.com') || host.includes('cdninstagram.com')) {
-      upstreamHeaders['Referer'] = 'https://www.instagram.com/';
     } else if (host.includes('googlevideo.com') || host.includes('youtube.com')) {
       upstreamHeaders['Referer'] = 'https://www.youtube.com/';
     }
