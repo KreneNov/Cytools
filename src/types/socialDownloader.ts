@@ -105,7 +105,7 @@ export function detectPlatform(rawUrl: string): SocialPlatform {
     ) {
       return 'facebook';
     }
-    if (host.includes('instagram.com')) {
+    if (host.includes('instagram.com') || host.includes('instagr.am')) {
       return 'instagram';
     }
     if (host.includes('youtube.com') || host.includes('youtu.be')) {

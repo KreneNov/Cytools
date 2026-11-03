@@ -24,6 +24,8 @@
     "*://*.googlevideo.com/*",
     "*://*.cobalt.tools/*",
     "*://*.savetube.vip/*",
+    "*://*.instagram.com/*",
+    "*://*.cdninstagram.com/*",
     "<all_urls>"
   ],
   "background": {

@@ -340,7 +340,109 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
     setDownloadProgress(INITIAL_PROGRESS);
 
     try {
-      const response = await apiFetch(`/api/social/extract?url=${encodeURIComponent(url.trim())}`);
+      const cleanUrl = url.trim();
+      const isInstagram =
+        cleanUrl.includes('instagram.com/reel/') ||
+        cleanUrl.includes('instagram.com/p/') ||
+        cleanUrl.includes('instagram.com/tv/') ||
+        cleanUrl.includes('instagr.am') ||
+        cleanUrl.includes('instagram.com');
+
+      if (isInstagram) {
+        // Direct Client-Side Cobalt v10 Extraction for Instagram (Bypasses Vercel Datacenter Meta Blocks)
+        let directVideoUrl: string | null = null;
+        let thumbUrl: string | undefined = undefined;
+
+        try {
+          const response = await fetch('https://api.cobalt.tools/api/json', {
+            method: 'POST',
+            headers: {
+              Accept: 'application/json',
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              url: cleanUrl,
+              downloadMode: 'auto',
+            }),
+            signal: AbortSignal.timeout(8000),
+          });
+
+          if (response.ok) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const resJson: any = await response.json();
+            directVideoUrl = resJson.url || resJson.picker?.[0]?.url || null;
+            thumbUrl = resJson.picker?.[0]?.thumb || undefined;
+          }
+        } catch (cobaltErr) {
+          console.warn('[useSocialDownloader] Client Cobalt Instagram primary attempt failed:', cobaltErr);
+        }
+
+        // Fallback to working instance if primary failed
+        if (!directVideoUrl) {
+          try {
+            const fallbackRes = await fetch('https://rue-cobalt.xenon.zone/', {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                url: cleanUrl,
+                downloadMode: 'auto',
+              }),
+              signal: AbortSignal.timeout(6000),
+            });
+            if (fallbackRes.ok) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const fbJson: any = await fallbackRes.json();
+              directVideoUrl = fbJson.url || fbJson.picker?.[0]?.url || null;
+              thumbUrl = fbJson.picker?.[0]?.thumb || thumbUrl;
+            }
+          } catch (fbErr) {
+            console.warn('[useSocialDownloader] Client Cobalt Instagram fallback attempt failed:', fbErr);
+          }
+        }
+
+        if (directVideoUrl) {
+          const igData: ExtractionResult = {
+            success: true,
+            platform: 'instagram',
+            type: 'video',
+            title: 'Instagram Reels Video',
+            thumbnail: thumbUrl,
+            author: { name: 'Instagram Creator' },
+            videoHd: directVideoUrl,
+            videoSd: directVideoUrl,
+            mediaOptions: [
+              {
+                id: 'instagram_video_hd',
+                label: 'Tải Video Instagram MP4 (HD)',
+                description: 'Chất lượng cao nhất từ máy chủ CDN',
+                format: 'mp4',
+                quality: 'HD',
+                url: directVideoUrl,
+              },
+              {
+                id: 'instagram_audio',
+                label: 'Tách Âm Thanh MP3 / M4A',
+                description: 'Bóc tách âm thanh độc lập',
+                format: 'mp3',
+                quality: 'Audio',
+                isAudio: true,
+                url: directVideoUrl,
+              },
+            ],
+          };
+          setResult(igData);
+          return igData;
+        }
+
+        throw new Error(
+          'Không thể trích xuất video từ liên kết Instagram này. Vui lòng kiểm tra lại liên kết hoặc thử lại sau.'
+        );
+      }
+
+      const response = await apiFetch(`/api/social/extract?url=${encodeURIComponent(cleanUrl)}`);
       const rawText = await response.text();
 
       let data: ExtractionResult;
@@ -476,6 +578,80 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
           // Trigger direct download (chrome.downloads on Extension, Hidden Iframe on Web App)
           await triggerDirectDownload(resolvedYtUrl, cleanTargetFileName);
+
+          if (stageTimer) clearTimeout(stageTimer);
+          setDownloadProgress((prev) => ({
+            ...prev,
+            percentage: 100,
+            stage: 'done',
+            status: 'completed',
+          }));
+          setTimeout(() => {
+            setDownloadProgress(INITIAL_PROGRESS);
+          }, 3500);
+          return;
+        }
+
+        // Phase 2.5: Dedicated Instagram Client-Side Download (Bypasses Vercel Proxy)
+        const isInstagram =
+          optionId?.startsWith('instagram_') ||
+          result?.platform === 'instagram' ||
+          (mediaUrl && (mediaUrl.includes('instagram.com') || mediaUrl.includes('instagr.am')));
+
+        if (isInstagram) {
+          setDownloadProgress((prev) => ({
+            ...prev,
+            percentage: 60,
+            stage: 'video',
+          }));
+
+          let resolvedIgUrl = directUrl;
+
+          // If directUrl is not yet resolved or still an Instagram page link, resolve it via Cobalt v10
+          if (
+            !resolvedIgUrl ||
+            resolvedIgUrl.includes('instagram.com') ||
+            resolvedIgUrl.includes('instagr.am')
+          ) {
+            try {
+              const cobaltRes = await fetch('https://api.cobalt.tools/api/json', {
+                method: 'POST',
+                headers: {
+                  Accept: 'application/json',
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                  url: result?.videoHd || mediaUrl,
+                  downloadMode: 'auto',
+                }),
+                signal: AbortSignal.timeout(6000),
+              });
+              if (cobaltRes.ok) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const cJson: any = await cobaltRes.json();
+                resolvedIgUrl = cJson.url || cJson.picker?.[0]?.url || resolvedIgUrl;
+              }
+            } catch {
+              // Ignore fallback
+            }
+          }
+
+          if (
+            !resolvedIgUrl ||
+            resolvedIgUrl.includes('instagram.com') ||
+            resolvedIgUrl.includes('instagr.am')
+          ) {
+            throw new Error('Không thể phân giải luồng tải Instagram trực tiếp.');
+          }
+
+          setDownloadProgress((prev) => ({
+            ...prev,
+            percentage: 85,
+            stage: 'muxing',
+          }));
+
+          // Trigger direct download (chrome.downloads on Extension, Hidden Iframe on Web App)
+          await triggerDirectDownload(resolvedIgUrl, cleanTargetFileName);
 
           if (stageTimer) clearTimeout(stageTimer);
           setDownloadProgress((prev) => ({
