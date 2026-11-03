@@ -104,6 +104,7 @@ interface CobaltInstanceDef {
 }
 
 const COBALT_INSTANCES: CobaltInstanceDef[] = [
+  { endpoint: 'https://rue-cobalt.xenon.zone', version: 'v10' },
   { endpoint: 'https://cobaltapi.cjs.nz', version: 'v10' },
   { endpoint: 'https://co.wuk.sh/api/json', version: 'v7' },
   { endpoint: 'https://cobalt.kwiate.dev/api/json', version: 'v7' },

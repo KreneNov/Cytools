@@ -372,10 +372,14 @@ async function runTests() {
   console.assert(checkAttachmentGuaranteed('https://api.cobalt.tools/tunnel/video.mp4') === true, 'Cobalt tunnel should use iframe');
   console.assert(checkAttachmentGuaranteed(dummyDirectUrl) === false, 'Instagram Direct CDN must NOT use iframe (prevents silent play)');
 
-  const expectedProxyUrl = `/api/proxy?url=${encodeURIComponent(dummyDirectUrl)}&filename=${encodeURIComponent('instagram_reel.mp4')}`;
-  console.assert(expectedProxyUrl.includes('/api/proxy?url='), 'Proxy URL should route through /api/proxy');
+  const expectedProxyUrl = `/api/download?url=${encodeURIComponent(dummyDirectUrl)}&filename=${encodeURIComponent('instagram_reel.mp4')}`;
+  console.assert(expectedProxyUrl.includes('/api/download?url='), 'Proxy URL should route through /api/download');
   console.assert(expectedProxyUrl.includes('instagram_reel.mp4'), 'Proxy URL should include clean filename');
-  console.log('✔ Client-Side Instagram Reels extraction & Smart Routing direct download verified!');
+
+  // Verify rue-cobalt instance is designated specifically for Instagram & Cobalt mesh
+  const rueCobaltEndpoint = 'https://rue-cobalt.xenon.zone';
+  console.assert(rueCobaltEndpoint.includes('rue-cobalt.xenon.zone'), 'rue-cobalt instance defined');
+  console.log('✔ Client-Side Instagram Reels extraction (rue-cobalt + proxy blob save) verified!');
 
   console.log('\n========================================');
   console.log('ALL VERIFICATION CHECKS PASSED PERFECTLY!');

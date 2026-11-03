@@ -418,12 +418,12 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         cleanUrl.includes('instagram.com');
 
       if (isInstagram) {
-        // Direct Client-Side Cobalt v10 Extraction for Instagram (Bypasses Vercel Datacenter Meta Blocks)
+        // Direct Client-Side Cobalt v10 Extraction for Instagram using rue-cobalt.xenon.zone (Permissive CORS)
         let directVideoUrl: string | null = null;
         let thumbUrl: string | undefined = undefined;
 
         try {
-          const response = await fetch('https://api.cobalt.tools/api/json', {
+          const response = await fetch('https://rue-cobalt.xenon.zone/', {
             method: 'POST',
             headers: {
               Accept: 'application/json',
@@ -443,7 +443,23 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             thumbUrl = resJson.picker?.[0]?.thumb || undefined;
           }
         } catch (cobaltErr) {
-          console.warn('[useSocialDownloader] Client Cobalt Instagram attempt failed:', cobaltErr);
+          console.warn('[useSocialDownloader] Client rue-cobalt Instagram attempt failed:', cobaltErr);
+        }
+
+        // Parallel / Fallback: Server-side extractor via /api/social/extract if client rue-cobalt failed or returned no URL
+        if (!directVideoUrl) {
+          try {
+            const apiRes = await apiFetch(`/api/social/extract?url=${encodeURIComponent(cleanUrl)}`);
+            if (apiRes.ok) {
+              const serverData = await apiRes.json();
+              if (serverData.success && (serverData.videoHd || serverData.mediaOptions?.length)) {
+                setResult(serverData);
+                return serverData;
+              }
+            }
+          } catch (serverErr) {
+            console.warn('[useSocialDownloader] Server fallback Instagram extraction failed:', serverErr);
+          }
         }
 
         if (directVideoUrl) {
@@ -635,7 +651,22 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           return;
         }
 
-        // Phase 2.5: Dedicated Instagram Client-Side Download (Bypasses Vercel Proxy)
+        // Helper to force browser save via local Object URL (never opens blank tabs or plays silently!)
+        const triggerBlobSave = (blob: Blob, filename: string) => {
+          const objectUrl = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = objectUrl;
+          a.download = filename;
+          // STRICT RULE: DO NOT set a.target = '_blank'!
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => {
+            URL.revokeObjectURL(objectUrl);
+          }, 2000);
+        };
+
+        // Phase 2.5: Dedicated Instagram Download Flow
         const isInstagram =
           optionId?.startsWith('instagram_') ||
           result?.platform === 'instagram' ||
@@ -650,14 +681,14 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
           let resolvedIgUrl = directUrl;
 
-          // If directUrl is not yet resolved or still an Instagram page link, resolve it via Cobalt v10
+          // If directUrl is not yet resolved or still an Instagram page link, resolve it via rue-cobalt.xenon.zone
           if (
             !resolvedIgUrl ||
             resolvedIgUrl.includes('instagram.com') ||
             resolvedIgUrl.includes('instagr.am')
           ) {
             try {
-              const cobaltRes = await fetch('https://api.cobalt.tools/api/json', {
+              const cobaltRes = await fetch('https://rue-cobalt.xenon.zone/', {
                 method: 'POST',
                 headers: {
                   Accept: 'application/json',
@@ -693,8 +724,53 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             stage: 'muxing',
           }));
 
-          // Trigger direct download (chrome.downloads on Extension, Hidden Iframe on Web App)
-          await triggerDirectDownload(resolvedIgUrl, cleanTargetFileName);
+          // 1. Chrome Extension Environment: use chrome.downloads.download (direct disk save via residential IP)
+          if (chromeObj?.downloads?.download) {
+            await new Promise<void>((resolve, reject) => {
+              chromeObj.downloads.download(
+                {
+                  url: resolvedIgUrl,
+                  filename: cleanTargetFileName,
+                  saveAs: false,
+                },
+                (downloadId?: number) => {
+                  if (chromeObj.runtime?.lastError || !downloadId) {
+                    reject(
+                      new Error(
+                        chromeObj.runtime?.lastError?.message ||
+                          'Không thể khởi động tải xuống qua trình quản lý tiện ích.'
+                      )
+                    );
+                  } else {
+                    resolve();
+                  }
+                }
+              );
+            });
+          } else {
+            // 2. Web App Environment: fetch via /api/download proxy and trigger local blob save
+            // (Strictly prevents silent iframe play and bypasses Meta CDN CORS restrictions!)
+            const proxyUrl = getApiUrl(
+              `/api/download?url=${encodeURIComponent(resolvedIgUrl)}&filename=${encodeURIComponent(cleanTargetFileName)}`
+            );
+            const proxyRes = await fetch(proxyUrl, { signal: AbortSignal.timeout(45000) });
+            if (!proxyRes.ok) {
+              let errMsg = `Máy chủ CDN upstream phản hồi lỗi: HTTP ${proxyRes.status}`;
+              try {
+                const errJson = await proxyRes.json();
+                if (errJson.error) errMsg = errJson.error;
+              } catch {
+                // Ignore
+              }
+              throw new Error(errMsg);
+            }
+
+            const rawBlob = await proxyRes.blob();
+            if (!rawBlob || rawBlob.size === 0) {
+              throw new Error('Tệp tải về rỗng từ máy chủ.');
+            }
+            triggerBlobSave(rawBlob, cleanTargetFileName);
+          }
 
           if (stageTimer) clearTimeout(stageTimer);
           setDownloadProgress((prev) => ({
@@ -751,20 +827,6 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         }
 
         // Phase 4: Non-YouTube Web Browser Client-Side Force Download via Local Blob (NEVER opens new tab!)
-        const triggerBlobSave = (blob: Blob, filename: string) => {
-          const objectUrl = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = objectUrl;
-          a.download = filename;
-          // STRICT RULE: DO NOT set a.target = '_blank'!
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          setTimeout(() => {
-            URL.revokeObjectURL(objectUrl);
-          }, 2000);
-        };
-
         let downloadedBlob: Blob | null = null;
 
         // Step 3A: Attempt direct fetch first if CDN allows CORS
