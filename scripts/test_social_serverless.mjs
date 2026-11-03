@@ -179,6 +179,24 @@ async function runTests() {
   console.assert(dRes.getHeader('access-control-allow-origin') === '*', 'Missing download CORS header');
   console.log('✔ /api/download: Lookaside proxy headers verified');
 
+  console.log('\n=== TEST 11: /api/social/extract?action=savenow_init & savenow_progress ===');
+  const sInitReq = { method: 'GET', url: '/api/social/extract?action=savenow_init&videoId=dQw4w9WgXcQ&format=720' };
+  const sInitRes = new MockResponse();
+  await extractHandler(sInitReq, sInitRes);
+  console.assert(sInitRes.statusCode === 200, `Expected 200 for action=savenow_init, got ${sInitRes.statusCode}`);
+  const sInitJson = JSON.parse(sInitRes.body);
+  console.log('SaveNow Init:', { success: sInitJson.success, id: sInitJson.id });
+  console.assert(sInitJson.success === true && !!sInitJson.id, 'Expected success: true and id from savenow_init');
+
+  const sProgReq = { method: 'GET', url: `/api/social/extract?action=savenow_progress&id=${encodeURIComponent(sInitJson.id)}` };
+  const sProgRes = new MockResponse();
+  await extractHandler(sProgReq, sProgRes);
+  console.assert(sProgRes.statusCode === 200, `Expected 200 for action=savenow_progress, got ${sProgRes.statusCode}`);
+  const sProgJson = JSON.parse(sProgRes.body);
+  console.log('SaveNow Progress:', { success: sProgJson.success, progress: sProgJson.progress, hasUrl: !!sProgJson.download_url });
+  console.assert(typeof sProgJson.success === 'number', 'Expected numeric success in savenow_progress');
+  console.log('✔ /api/social/extract: SaveNow init & progress endpoints verified!');
+
   console.log('\n========================================');
   console.log('ALL VERIFICATION CHECKS PASSED PERFECTLY!');
   console.log('========================================');

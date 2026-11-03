@@ -104,7 +104,11 @@ interface CobaltInstanceDef {
 }
 
 const COBALT_INSTANCES: CobaltInstanceDef[] = [
-  { endpoint: 'https://rue-cobalt.xenon.zone', version: 'v10' },
+  { endpoint: 'https://cobaltapi.cjs.nz', version: 'v10' },
+  { endpoint: 'https://co.wuk.sh/api/json', version: 'v7' },
+  { endpoint: 'https://cobalt.kwiate.dev/api/json', version: 'v7' },
+  { endpoint: 'https://dl.khann.me', version: 'v10' },
+  { endpoint: 'https://capi.3kh0.net', version: 'v10' },
 ];
 
 /**
@@ -1005,6 +1009,95 @@ export function extractYouTubeVideoId(url: string): string | null {
  * Direct YouTube Innertube player API query using ANDROID_VR client.
  * Returns pre-muxed itag 18 MP4 (video+audio) and high-bitrate itag 140 M4A audio.
  */
+/**
+ * Fast stream probe verifying that a resolved media stream actually returns valid bytes (> 500 bytes)
+ * rather than an empty 0-byte stream or 403 Forbidden page.
+ */
+export async function probeStream(streamUrl: string): Promise<boolean> {
+  try {
+    const probe = await fetch(streamUrl, {
+      method: 'GET',
+      headers: {
+        Range: 'bytes=0-1024',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+      signal: AbortSignal.timeout(3500),
+    });
+    if (probe.status === 200 || probe.status === 206) {
+      const buf = await probe.arrayBuffer();
+      return buf.byteLength > 500;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Initiates a SaveNow / Loader.to conversion job.
+ */
+export async function initSaveNow(
+  videoId: string,
+  format: string
+): Promise<{ success: boolean; id?: string; error?: string }> {
+  try {
+    const url = encodeURIComponent('https://www.youtube.com/watch?v=' + videoId);
+    const apiUrl = `https://p.savenow.to/ajax/download.php?copyright=0&format=${encodeURIComponent(
+      format
+    )}&url=${url}&api=dfcb6d76f2f6a9894gjkege8a4ab232222`;
+    const res = await fetch(apiUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Origin: 'https://loader.to',
+        Referer: 'https://loader.to/',
+      },
+      signal: AbortSignal.timeout(6000),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const json: any = await res.json();
+    if (json && json.success && json.id) {
+      return { success: true, id: json.id };
+    }
+    return { success: false, error: json?.message || 'Không thể khởi tạo tiến trình tải SaveNow.' };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Lỗi kết nối SaveNow API.' };
+  }
+}
+
+/**
+ * Polls a SaveNow / Loader.to conversion job progress.
+ */
+export async function checkSaveNowProgress(
+  id: string
+): Promise<{ success: number; progress?: number; download_url?: string; text?: string; error?: string }> {
+  try {
+    const res = await fetch(`https://p.savenow.to/api/progress?id=${encodeURIComponent(id)}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Origin: 'https://loader.to',
+        Referer: 'https://loader.to/',
+      },
+      signal: AbortSignal.timeout(6000),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const json: any = await res.json();
+    return {
+      success: json.success ?? 0,
+      progress: json.progress ?? 0,
+      download_url: json.download_url || undefined,
+      text: json.text || undefined,
+    };
+  } catch (err) {
+    return { success: 0, error: err instanceof Error ? err.message : 'Lỗi kiểm tra tiến trình SaveNow.' };
+  }
+}
+
+/**
+ * Direct YouTube Innertube player API query using ANDROID_VR client with Range Probe verification.
+ * Returns pre-muxed itag 18 MP4 (video+audio) and high-bitrate itag 140 M4A audio.
+ */
 export async function resolveInnertubeStreams(videoId: string): Promise<{
   preMuxedUrl: string | null;
   audioUrl: string | null;
@@ -1060,11 +1153,24 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
           adaptive.find((f: any) => f.url && f.itag === 140) ||
           adaptive.find((f: any) => f.url && f.mimeType?.includes('audio/mp4'));
 
-        if (preMuxed?.url || audio?.url) {
+        let validPreMuxedUrl: string | null = null;
+        let validAudioUrl: string | null = null;
+
+        if (preMuxed?.url) {
+          const isOk = await probeStream(preMuxed.url);
+          if (isOk) validPreMuxedUrl = preMuxed.url;
+        }
+
+        if (audio?.url) {
+          const isOk = await probeStream(audio.url);
+          if (isOk) validAudioUrl = audio.url;
+        }
+
+        if (validPreMuxedUrl || validAudioUrl) {
           return {
-            preMuxedUrl: preMuxed?.url || null,
-            audioUrl: audio?.url || null,
-            resolvedBy: 'innertube_android_vr',
+            preMuxedUrl: validPreMuxedUrl,
+            audioUrl: validAudioUrl,
+            resolvedBy: 'innertube_android_vr_probed',
             debugReason: 'OK',
           };
         }
@@ -1074,46 +1180,12 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
     console.warn('[Innertube Stream Warning]:', err instanceof Error ? err.message : err);
   }
 
-  // 2. Server-side Cobalt instance fallback
-  try {
-    const cRes = await fetch('https://rue-cobalt.xenon.zone', {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-        downloadMode: 'auto',
-      }),
-      signal: AbortSignal.timeout(4000),
-    });
-
-    if (cRes.ok) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const cData: any = await cRes.json();
-      if (
-        cData.url &&
-        (cData.status === 'tunnel' || cData.status === 'redirect' || cData.status === 'stream')
-      ) {
-        return {
-          preMuxedUrl: cData.url,
-          audioUrl: cData.url,
-          resolvedBy: 'cobalt_server_tunnel',
-          debugReason: 'OK',
-        };
-      }
-    }
-  } catch (cErr) {
-    console.warn('[Cobalt Server Stream Warning]:', cErr instanceof Error ? cErr.message : cErr);
-  }
-
-  return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No valid stream found' };
+  return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No valid probed stream found' };
 }
 
 /**
  * Extracts YouTube video using official oEmbed for instant metadata (<300ms, 0% failure rate)
- * combined with client-side Cobalt waterfall & Innertube fallback. NEVER throws Anti-Bot on metadata extraction!
+ * combined with client-side SaveNow converter & probed Innertube fallback. NEVER throws Anti-Bot on metadata extraction!
  */
 export async function extractYouTube(url: string): Promise<ExtractionResult> {
   const videoId = extractYouTubeVideoId(url);
@@ -1156,26 +1228,20 @@ export async function extractYouTube(url: string): Promise<ExtractionResult> {
     // Metadata defaults are already safely set
   }
 
-  // Phase 2: Parallel Stream Resolution attempt (Cobalt + Innertube fallback)
-  let cobaltStreamUrl: string = '';
+  // Phase 2: Instant Probed Stream Resolution (Innertube)
   let preMuxedUrl: string = '';
   let audioStreamUrl: string = '';
 
-  const [cobaltSettled, innertubeSettled] = await Promise.allSettled([
-    extractCobalt(url, 'youtube'),
-    resolveInnertubeStreams(videoId),
-  ]);
-
-  if (cobaltSettled.status === 'fulfilled' && cobaltSettled.value.success && cobaltSettled.value.videoHd) {
-    cobaltStreamUrl = cobaltSettled.value.videoHd;
-  }
-  if (innertubeSettled.status === 'fulfilled') {
-    if (innertubeSettled.value.preMuxedUrl) preMuxedUrl = innertubeSettled.value.preMuxedUrl;
-    if (innertubeSettled.value.audioUrl) audioStreamUrl = innertubeSettled.value.audioUrl;
+  try {
+    const streams = await resolveInnertubeStreams(videoId);
+    if (streams.preMuxedUrl) preMuxedUrl = streams.preMuxedUrl;
+    if (streams.audioUrl) audioStreamUrl = streams.audioUrl;
+  } catch {
+    // Continue
   }
 
-  const primaryVideoUrl = cobaltStreamUrl || preMuxedUrl;
-  const primaryAudioUrl = audioStreamUrl || cobaltStreamUrl || preMuxedUrl;
+  const primaryVideoUrl = preMuxedUrl;
+  const primaryAudioUrl = audioStreamUrl || preMuxedUrl;
 
   return {
     success: true,
@@ -1185,17 +1251,17 @@ export async function extractYouTube(url: string): Promise<ExtractionResult> {
     author,
     thumbnail,
     videoId,
-    videoHd: cobaltStreamUrl,
-    videoSd: preMuxedUrl || cobaltStreamUrl,
+    videoHd: preMuxedUrl,
+    videoSd: preMuxedUrl,
     audioUrl: primaryAudioUrl,
     mediaOptions: [
       {
         id: 'youtube_1080p',
-        label: 'Tải Video MP4 1080p (Pre-muxed HD)',
-        description: 'Hình ảnh kèm âm thanh chất lượng cao, tải trực tiếp không cần ghép audio',
+        label: 'Tải Video MP4 1080p (Full HD)',
+        description: 'Chất lượng 1080p sắc nét qua bộ giải mã SaveNow CDN',
         format: 'mp4',
         quality: '1080p / HD',
-        url: cobaltStreamUrl || primaryVideoUrl,
+        url: '',
       },
       {
         id: 'youtube_720p',
@@ -1203,7 +1269,7 @@ export async function extractYouTube(url: string): Promise<ExtractionResult> {
         description: 'Độ nét tiêu chuẩn, tốc độ tải nhanh',
         format: 'mp4',
         quality: '720p',
-        url: preMuxedUrl || cobaltStreamUrl,
+        url: primaryVideoUrl,
       },
       {
         id: 'youtube_audio',

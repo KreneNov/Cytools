@@ -443,7 +443,6 @@ interface CobaltInstanceDef {
 }
 
 const COBALT_INSTANCES: CobaltInstanceDef[] = [
-  { endpoint: 'https://rue-cobalt.xenon.zone', version: 'v10' },
   { endpoint: 'https://cobaltapi.cjs.nz', version: 'v10' },
   { endpoint: 'https://co.wuk.sh/api/json', version: 'v7' },
   { endpoint: 'https://cobalt.qoid.co/api/json', version: 'v7' },
@@ -1179,7 +1178,92 @@ export async function extractSocialMedia(url: string): Promise<ExtractionResult>
 }
 
 /**
- * Direct YouTube Innertube player API query using ANDROID_VR client with server Cobalt tunnel fallback.
+ * Fast stream probe verifying that a resolved media stream actually returns valid bytes (> 500 bytes)
+ * rather than an empty 0-byte stream or 403 Forbidden page.
+ */
+export async function probeStream(streamUrl: string): Promise<boolean> {
+  try {
+    const probe = await fetch(streamUrl, {
+      method: 'GET',
+      headers: {
+        Range: 'bytes=0-1024',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      },
+      signal: AbortSignal.timeout(3500),
+    });
+    if (probe.status === 200 || probe.status === 206) {
+      const buf = await probe.arrayBuffer();
+      return buf.byteLength > 500;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Initiates a SaveNow / Loader.to conversion job.
+ */
+export async function initSaveNow(
+  videoId: string,
+  format: string
+): Promise<{ success: boolean; id?: string; error?: string }> {
+  try {
+    const url = encodeURIComponent('https://www.youtube.com/watch?v=' + videoId);
+    const apiUrl = `https://p.savenow.to/ajax/download.php?copyright=0&format=${encodeURIComponent(
+      format
+    )}&url=${url}&api=dfcb6d76f2f6a9894gjkege8a4ab232222`;
+    const res = await fetch(apiUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Origin: 'https://loader.to',
+        Referer: 'https://loader.to/',
+      },
+      signal: AbortSignal.timeout(6000),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const json: any = await res.json();
+    if (json && json.success && json.id) {
+      return { success: true, id: json.id };
+    }
+    return { success: false, error: json?.message || 'Không thể khởi tạo tiến trình tải SaveNow.' };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : 'Lỗi kết nối SaveNow API.' };
+  }
+}
+
+/**
+ * Polls a SaveNow / Loader.to conversion job progress.
+ */
+export async function checkSaveNowProgress(
+  id: string
+): Promise<{ success: number; progress?: number; download_url?: string; text?: string; error?: string }> {
+  try {
+    const res = await fetch(`https://p.savenow.to/api/progress?id=${encodeURIComponent(id)}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        Origin: 'https://loader.to',
+        Referer: 'https://loader.to/',
+      },
+      signal: AbortSignal.timeout(6000),
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const json: any = await res.json();
+    return {
+      success: json.success ?? 0,
+      progress: json.progress ?? 0,
+      download_url: json.download_url || undefined,
+      text: json.text || undefined,
+    };
+  } catch (err) {
+    return { success: 0, error: err instanceof Error ? err.message : 'Lỗi kiểm tra tiến trình SaveNow.' };
+  }
+}
+
+/**
+ * Direct YouTube Innertube player API query using ANDROID_VR client with Range Probe verification.
  * Returns pre-muxed itag 18 MP4 (video+audio) and high-bitrate itag 140 M4A audio.
  */
 export async function resolveInnertubeStreams(videoId: string): Promise<{
@@ -1237,11 +1321,24 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
           adaptive.find((f: any) => f.url && f.itag === 140) ||
           adaptive.find((f: any) => f.url && f.mimeType?.includes('audio/mp4'));
 
-        if (preMuxed?.url || audio?.url) {
+        let validPreMuxedUrl: string | null = null;
+        let validAudioUrl: string | null = null;
+
+        if (preMuxed?.url) {
+          const isOk = await probeStream(preMuxed.url);
+          if (isOk) validPreMuxedUrl = preMuxed.url;
+        }
+
+        if (audio?.url) {
+          const isOk = await probeStream(audio.url);
+          if (isOk) validAudioUrl = audio.url;
+        }
+
+        if (validPreMuxedUrl || validAudioUrl) {
           return {
-            preMuxedUrl: preMuxed?.url || null,
-            audioUrl: audio?.url || null,
-            resolvedBy: 'innertube_android_vr',
+            preMuxedUrl: validPreMuxedUrl,
+            audioUrl: validAudioUrl,
+            resolvedBy: 'innertube_android_vr_probed',
             debugReason: 'OK',
           };
         }
@@ -1251,41 +1348,7 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
     console.warn('[Innertube Stream Warning]:', err instanceof Error ? err.message : err);
   }
 
-  // 2. Server-side Cobalt instance fallback
-  try {
-    const cRes = await fetch('https://rue-cobalt.xenon.zone', {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-        downloadMode: 'auto',
-      }),
-      signal: AbortSignal.timeout(4000),
-    });
-
-    if (cRes.ok) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const cData: any = await cRes.json();
-      if (
-        cData.url &&
-        (cData.status === 'tunnel' || cData.status === 'redirect' || cData.status === 'stream')
-      ) {
-        return {
-          preMuxedUrl: cData.url,
-          audioUrl: cData.url,
-          resolvedBy: 'cobalt_server_tunnel',
-          debugReason: 'OK',
-        };
-      }
-    }
-  } catch (cErr) {
-    console.warn('[Cobalt Server Stream Warning]:', cErr instanceof Error ? cErr.message : cErr);
-  }
-
-  return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No valid stream found' };
+  return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No valid probed stream found' };
 }
 
 /**
@@ -1342,6 +1405,27 @@ export function socialDownloadProxyPlugin(): Plugin {
             const action = urlObj.searchParams.get('action');
             const videoId = urlObj.searchParams.get('videoId');
 
+            if (action === 'savenow_init' && videoId) {
+              const format = urlObj.searchParams.get('format') || '720';
+              const result = await initSaveNow(videoId, format);
+              res.statusCode = 200;
+              res.end(JSON.stringify(result));
+              return;
+            }
+
+            if (action === 'savenow_progress') {
+              const id = urlObj.searchParams.get('id');
+              if (!id) {
+                res.statusCode = 400;
+                res.end(JSON.stringify({ success: 0, error: 'Thiếu id tiến trình' }));
+                return;
+              }
+              const result = await checkSaveNowProgress(id);
+              res.statusCode = 200;
+              res.end(JSON.stringify(result));
+              return;
+            }
+
             if (action === 'resolve' && videoId) {
               const streams = await resolveInnertubeStreams(videoId);
               res.statusCode = 200;
@@ -1370,6 +1454,21 @@ export function socialDownloadProxyPlugin(): Plugin {
               try {
                 const bodyJson = JSON.parse(bodyStr);
                 targetUrl = bodyJson.url;
+
+                if (bodyJson.action === 'savenow_init' && bodyJson.videoId) {
+                  const result = await initSaveNow(bodyJson.videoId, bodyJson.format || '720');
+                  res.statusCode = 200;
+                  res.end(JSON.stringify(result));
+                  return;
+                }
+
+                if (bodyJson.action === 'savenow_progress' && bodyJson.id) {
+                  const result = await checkSaveNowProgress(bodyJson.id);
+                  res.statusCode = 200;
+                  res.end(JSON.stringify(result));
+                  return;
+                }
+
                 if (bodyJson.action === 'resolve' && bodyJson.videoId) {
                   const streams = await resolveInnertubeStreams(bodyJson.videoId);
                   res.statusCode = 200;

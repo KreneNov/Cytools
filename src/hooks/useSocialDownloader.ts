@@ -128,81 +128,66 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       try {
         let directUrl = mediaUrl;
 
-        // Phase 1: If YouTube and URL not yet resolved (or empty), resolve stream via multi-tier waterfall
-        if ((!directUrl || optionId?.startsWith('youtube_')) && result?.videoId) {
+        // Phase 1: If YouTube and URL not yet resolved (or empty), resolve stream via SaveNow or Probed Innertube
+        if ((!directUrl || optionId?.startsWith('youtube_') || result?.platform === 'youtube') && result?.videoId) {
           const isAudio = optionId === 'youtube_audio';
-          const quality = optionId === 'youtube_1080p' ? '1080' : '720';
-          const targetYtUrl = `https://www.youtube.com/watch?v=${result.videoId}`;
+          const requestedFormat = isAudio ? 'mp3' : optionId === 'youtube_1080p' ? '1080' : '720';
 
-          // Tier 1: Try Cobalt v10 from client with strict v10 schema
+          // Tier 1: SaveNow Converter & CDN Stream via backend proxy
           try {
-            const cobaltBody = isAudio
-              ? {
-                  url: targetYtUrl,
-                  downloadMode: 'audio',
-                  audioFormat: 'mp3',
-                }
-              : {
-                  url: targetYtUrl,
-                  downloadMode: 'auto',
-                  videoQuality: quality,
-                  youtubeVideoCodec: 'h264',
-                };
+            const initUrl = getApiUrl(
+              `/api/social/extract?action=savenow_init&videoId=${encodeURIComponent(
+                result.videoId
+              )}&format=${requestedFormat}`
+            );
+            const initRes = await fetch(initUrl, { signal: AbortSignal.timeout(6000) });
+            if (initRes.ok) {
+              const initData = await initRes.json();
+              if (initData.success && initData.id) {
+                const jobId = initData.id;
+                const pollStart = Date.now();
+                while (Date.now() - pollStart < 16000) {
+                  await new Promise((resolve) => setTimeout(resolve, 1500));
+                  try {
+                    const pollUrl = getApiUrl(
+                      `/api/social/extract?action=savenow_progress&id=${encodeURIComponent(jobId)}`
+                    );
+                    const pollRes = await fetch(pollUrl, { signal: AbortSignal.timeout(5000) });
+                    if (pollRes.ok) {
+                      const pollData = await pollRes.json();
+                      if (typeof pollData.progress === 'number') {
+                        const mappedPercent = Math.min(
+                          85,
+                          Math.max(30, Math.round(pollData.progress / 10))
+                        );
+                        setDownloadProgress((prev) => ({
+                          ...prev,
+                          percentage: mappedPercent,
+                          stage: mappedPercent >= 65 ? 'muxing' : 'video',
+                        }));
+                      }
 
-            const cobaltRes = await fetch('https://rue-cobalt.xenon.zone', {
-              method: 'POST',
-              headers: {
-                Accept: 'application/json',
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify(cobaltBody),
-              signal: AbortSignal.timeout(8000),
-            });
+                      if (pollData.success === 1 && pollData.download_url) {
+                        directUrl = pollData.download_url;
+                        break;
+                      }
 
-            if (cobaltRes.ok) {
-              const cJson = await cobaltRes.json();
-              if (
-                cJson.url &&
-                (cJson.status === 'tunnel' || cJson.status === 'redirect' || cJson.status === 'stream')
-              ) {
-                directUrl = cJson.url;
-              }
-            }
-          } catch (cobaltErr) {
-            console.warn('[useSocialDownloader] Client Cobalt attempt failed:', cobaltErr);
-          }
-
-          // Tier 2: If Tier 1 failed, try Cobalt v10 with minimal schema (no quality restrictions)
-          if (!directUrl) {
-            try {
-              const cobaltResSimple = await fetch('https://rue-cobalt.xenon.zone', {
-                method: 'POST',
-                headers: {
-                  Accept: 'application/json',
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                  url: targetYtUrl,
-                  downloadMode: isAudio ? 'audio' : 'auto',
-                }),
-                signal: AbortSignal.timeout(6000),
-              });
-
-              if (cobaltResSimple.ok) {
-                const cJsonSimple = await cobaltResSimple.json();
-                if (
-                  cJsonSimple.url &&
-                  (cJsonSimple.status === 'tunnel' || cJsonSimple.status === 'redirect' || cJsonSimple.status === 'stream')
-                ) {
-                  directUrl = cJsonSimple.url;
+                      if (pollData.success === 0 && pollData.text?.toLowerCase().includes('error')) {
+                        console.warn('[useSocialDownloader] SaveNow error:', pollData.text);
+                        break;
+                      }
+                    }
+                  } catch (pErr) {
+                    console.warn('[useSocialDownloader] SaveNow poll tick error:', pErr);
+                  }
                 }
               }
-            } catch (cobaltSimpleErr) {
-              console.warn('[useSocialDownloader] Client Cobalt minimal attempt failed:', cobaltSimpleErr);
             }
+          } catch (savenowErr) {
+            console.warn('[useSocialDownloader] SaveNow init attempt failed:', savenowErr);
           }
 
-          // Tier 3: Server Stream Resolver fallback (Innertube multi-client + Cobalt server tunnel)
+          // Tier 2: Server Stream Resolver fallback (Innertube with Range Probe verification)
           if (!directUrl) {
             try {
               const resolveUrl = getApiUrl(`/api/social/extract?action=resolve&videoId=${result.videoId}`);
@@ -213,8 +198,6 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
                   directUrl = streamData.audioUrl;
                 } else if (streamData.preMuxedUrl) {
                   directUrl = streamData.preMuxedUrl;
-                } else if (streamData.videoUrl) {
-                  directUrl = streamData.videoUrl;
                 }
               }
             } catch (innerErr) {
@@ -222,14 +205,14 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             }
           }
 
-          // Tier 4: Use pre-extracted stream options from result if available, or original mediaUrl
+          // Tier 3: Use pre-extracted stream options from result if available, or original mediaUrl
           if (!directUrl) {
             if (isAudio && result.audioUrl) {
               directUrl = result.audioUrl;
-            } else if (result.videoSd) {
-              directUrl = result.videoSd;
             } else if (result.videoHd) {
               directUrl = result.videoHd;
+            } else if (result.videoSd) {
+              directUrl = result.videoSd;
             } else if (mediaUrl) {
               directUrl = mediaUrl;
             }
@@ -241,13 +224,13 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         }
 
         // Phase 2: Dedicated YouTube Residential Direct Download Bypass:
-        // YouTube (Cobalt tunnels / googlevideo streams) blocks Vercel datacenter IPs with HTTP 403.
-        // We trigger native download directly on the client using the user's residential IP.
+        // YouTube CDN streams block Vercel datacenter IPs with HTTP 403.
+        // We trigger native download directly on the client using the user's residential connection.
         const isYouTube =
           optionId?.startsWith('youtube_') ||
           result?.platform === 'youtube' ||
           directUrl.includes('googlevideo.com') ||
-          directUrl.includes('cobalt');
+          directUrl.includes('savenow.to');
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
@@ -276,19 +259,19 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
               );
             });
           } else {
-            // Web environment: Hidden Iframe Injection.
-            // Bypasses Sec-Fetch-Dest: empty CORS restrictions and prevents tab jumps!
-            const iframe = document.createElement('iframe');
-            iframe.style.display = 'none';
-            iframe.src = directUrl;
-            document.body.appendChild(iframe);
-
-            // Clean up iframe after 15 seconds once the download has triggered
+            // Web environment: Trigger direct browser download
+            // Since SaveNow and YouTube CDNs provide Content-Disposition: attachment headers,
+            // an <a> click directly triggers the file download to disk without redirecting the page.
+            const a = document.createElement('a');
+            a.href = directUrl;
+            a.download = targetFileName;
+            document.body.appendChild(a);
+            a.click();
             setTimeout(() => {
-              if (document.body.contains(iframe)) {
-                document.body.removeChild(iframe);
+              if (document.body.contains(a)) {
+                document.body.removeChild(a);
               }
-            }, 15000);
+            }, 3000);
           }
 
           if (stageTimer) clearTimeout(stageTimer);
