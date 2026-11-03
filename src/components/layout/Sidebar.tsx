@@ -5,6 +5,7 @@ import {
   DownloadCloud,
   Repeat,
   ImageOff,
+  Eraser,
   Sparkles,
   CheckCircle2,
   Loader2,
@@ -50,6 +51,13 @@ const NAV_ITEMS: NavItem[] = [
     name: 'Xóa nền AI HD',
     path: '/remove-bg',
     icon: ImageOff,
+    isAvailable: true,
+  },
+  {
+    id: 'watermark-remover',
+    name: 'Xóa Watermark',
+    path: '/watermark-remover',
+    icon: Eraser,
     isAvailable: true,
   },
   {

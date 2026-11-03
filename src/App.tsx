@@ -7,6 +7,7 @@ import { HomePage } from './pages/HomePage';
 import { SocialDownloaderPage } from './pages/SocialDownloaderPage';
 import { RemoveBgPage } from './pages/RemoveBgPage';
 import { ConverterHubPage } from './pages/ConverterHubPage';
+import { WatermarkRemoverPage } from './pages/WatermarkRemoverPage';
 import { HallOfFamePage } from './pages/HallOfFamePage';
 import { ExtensionPopupView } from './components/extension/ExtensionPopupView';
 
@@ -41,6 +42,9 @@ export const App: React.FC = () => {
               <Route path="/downloader" element={<Navigate to="/social-downloader" replace />} />
               <Route path="/video-downloader" element={<Navigate to="/social-downloader" replace />} />
               <Route path="/remove-bg" element={<RemoveBgPage />} />
+              <Route path="/watermark-remover" element={<WatermarkRemoverPage />} />
+              <Route path="/xoa-watermark" element={<Navigate to="/watermark-remover" replace />} />
+              <Route path="/remove-watermark" element={<Navigate to="/watermark-remover" replace />} />
               <Route path="/converter" element={<ConverterHubPage />} />
               <Route path="/converter-hub" element={<Navigate to="/converter" replace />} />
               <Route path="/media-converter" element={<Navigate to="/converter" replace />} />
