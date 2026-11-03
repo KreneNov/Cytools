@@ -276,14 +276,42 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
               );
             });
           } else {
-            // Web environment direct native download (bypasses CORS and Vercel 403 IP block)
-            const a = document.createElement('a');
-            a.href = directUrl;
-            a.target = '_blank';
-            a.download = targetFileName || '';
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
+            // Web environment: Fetch-to-Blob download in background.
+            // NEVER use target = '_blank' (prevents tab jump and 0-byte downloads)!
+            setDownloadProgress((prev) => ({
+              ...prev,
+              percentage: 95,
+              stage: 'muxing',
+              status: 'downloading',
+            }));
+
+            try {
+              const response = await fetch(directUrl, { signal: AbortSignal.timeout(60000) });
+              if (!response.ok) throw new Error(`HTTP ${response.status}`);
+              const blob = await response.blob();
+              if (!blob || blob.size === 0) throw new Error('Dữ liệu tải về từ máy chủ rỗng.');
+
+              const blobUrl = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = blobUrl;
+              a.download = targetFileName || 'video.mp4';
+              // STRICT RULE: DO NOT set a.target = '_blank'!
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              setTimeout(() => {
+                URL.revokeObjectURL(blobUrl);
+              }, 2000);
+            } catch (err) {
+              console.warn('[useSocialDownloader] YouTube Fetch-to-Blob failed, falling back to direct anchor:', err);
+              const fallbackAnchor = document.createElement('a');
+              fallbackAnchor.href = directUrl;
+              fallbackAnchor.download = targetFileName || 'video.mp4';
+              // STRICT RULE: DO NOT set fallbackAnchor.target = '_blank'!
+              document.body.appendChild(fallbackAnchor);
+              fallbackAnchor.click();
+              document.body.removeChild(fallbackAnchor);
+            }
           }
 
           if (stageTimer) clearTimeout(stageTimer);
