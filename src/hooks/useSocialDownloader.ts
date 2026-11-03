@@ -127,11 +127,19 @@ async function decryptSaveTubeData(encryptedBase64: string): Promise<any> {
   return JSON.parse(decodedText);
 }
 
+const COBALT_FALLBACK_INSTANCES = [
+  'https://cobalt.q0.wtf/api/json',
+  'https://co.wuk.sh/api/json',
+  'https://api.cobalt.tools/api/json',
+  'https://rue-cobalt.xenon.zone/',
+];
+
 /**
  * Resolves a direct YouTube download URL 100% client-side (completely bypassing Vercel /api/download):
- * 1. Cobalt API v10 (https://api.cobalt.tools/api/json)
- * 2. Working CORS Instance: SaveTube VIP CDN v2 (https://media.savetube.vip/api/random-cdn)
- * 3. Chrome Extension Direct Innertube ANDROID_VR fallback
+ * 1. Provider 1 (Primary): SaveTube VIP CDN v2 (https://media.savetube.vip/api/random-cdn)
+ *    - Explicitly detects HTTP 429 Too Many Requests and immediately falls back without hammering.
+ * 2. Provider 2 (Fallback): Client-side Cobalt v10 Round-Robin across public instances with loose CORS.
+ * 3. Provider 3 (Extension Fallback): Chrome Extension Direct Innertube ANDROID_VR.
  */
 async function resolveYouTubeClientSide(
   videoId: string,
@@ -140,111 +148,130 @@ async function resolveYouTubeClientSide(
 ): Promise<string | null> {
   const targetYouTubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
-  // Step 1: Direct Client-Side Cobalt v10 API Call
+  // Provider 1 (Primary): SaveTube VIP CDN v2 (supports 1080p, 720p, and MP3 with Content-Disposition: attachment)
   try {
-    const response = await fetch('https://api.cobalt.tools/api/json', {
+    const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!cdnRes.ok || cdnRes.status === 429) {
+      throw new Error(`Savetube random-cdn failed with status ${cdnRes.status}`);
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const cdnData: any = await cdnRes.json();
+    const cdnHost = cdnData?.cdn || 'cdn405.savetube.vip';
+
+    const infoRes = await fetch(`https://${cdnHost}/v2/info`, {
       method: 'POST',
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        url: targetYouTubeUrl,
-        videoQuality: quality === '1080p' ? '1080' : '720',
-        isAudioOnly: type === 'audio',
-        downloadMode: 'auto',
-        filenameStyle: 'basic',
-      }),
-      signal: AbortSignal.timeout(5000),
+      body: JSON.stringify({ url: targetYouTubeUrl }),
+      signal: AbortSignal.timeout(8000),
     });
 
-    if (response.ok) {
+    if (!infoRes.ok || infoRes.status === 429) {
+      throw new Error(`Savetube v2/info failed with status ${infoRes.status}`);
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const infoJson: any = await infoRes.json();
+    if (infoJson?.status && typeof infoJson.data === 'string') {
+      const decrypted = await decryptSaveTubeData(infoJson.data);
+      if (decrypted?.key) {
+        const downloadType = type === 'audio' ? 'audio' : 'video';
+        const targetQualities =
+          type === 'audio'
+            ? ['128']
+            : quality === '1080p'
+              ? ['1080', '720', '360']
+              : ['720', '360'];
+
+        for (const q of targetQualities) {
+          const dlRes = await fetch(`https://${cdnHost}/download`, {
+            method: 'POST',
+            headers: {
+              Accept: 'application/json',
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              downloadType,
+              quality: q,
+              key: decrypted.key,
+              title: cleanDownloadFilename(decrypted?.title || 'video'),
+            }),
+            signal: AbortSignal.timeout(10000),
+          });
+
+          // Immediately abort Savetube loop and fail over to Provider 2 if rate-limited (HTTP 429)
+          if (dlRes.status === 429) {
+            throw new Error('SAVETUBE_RATE_LIMITED_429');
+          }
+
+          if (!dlRes.ok) {
+            continue;
+          }
+
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const dlJson: any = await dlRes.json();
+          if (dlJson?.status === false && String(dlJson?.message || '').includes('429')) {
+            throw new Error('SAVETUBE_RATE_LIMITED_429');
+          }
+
+          const resolvedLink = dlJson?.data?.downloadUrl;
+          if (
+            resolvedLink &&
+            typeof resolvedLink === 'string' &&
+            resolvedLink.startsWith('http')
+          ) {
+            return resolvedLink;
+          }
+        }
+      }
+    }
+  } catch (saveTubeErr) {
+    console.warn(
+      '[useSocialDownloader] Provider 1 (Savetube) failed or hit 429 rate-limit, switching to Provider 2 (Cobalt Round-Robin):',
+      saveTubeErr
+    );
+  }
+
+  // Provider 2 (Fallback): Client-Side Cobalt v10 Round-Robin
+  for (const endpoint of COBALT_FALLBACK_INSTANCES) {
+    try {
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          url: targetYouTubeUrl,
+          videoQuality: quality === '1080p' ? '1080' : '720',
+          isAudioOnly: type === 'audio',
+          downloadMode: type === 'audio' ? 'audio' : 'auto',
+          filenameStyle: 'basic',
+        }),
+        signal: AbortSignal.timeout(6000),
+      });
+
+      if (!response.ok || response.status === 429) {
+        continue;
+      }
+
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const res: any = await response.json();
       const cobaltUrl = res?.url || res?.picker?.[0]?.url;
       if (cobaltUrl && typeof cobaltUrl === 'string' && cobaltUrl.startsWith('http')) {
         return cobaltUrl;
       }
+    } catch (cobaltErr) {
+      console.warn(`[useSocialDownloader] Provider 2 Cobalt instance (${endpoint}) failed:`, cobaltErr);
     }
-  } catch (cobaltErr) {
-    console.warn('[useSocialDownloader] Cobalt v10 primary request fallback:', cobaltErr);
   }
 
-  // Step 2: Known Working CORS Instance — SaveTube VIP CDN v2 (supports 1080p, 720p, and MP3 with Content-Disposition: attachment)
-  try {
-    const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (cdnRes.ok) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const cdnData: any = await cdnRes.json();
-      const cdnHost = cdnData?.cdn || 'cdn405.savetube.vip';
-
-      const infoRes = await fetch(`https://${cdnHost}/v2/info`, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ url: targetYouTubeUrl }),
-        signal: AbortSignal.timeout(8000),
-      });
-
-      if (infoRes.ok) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const infoJson: any = await infoRes.json();
-        if (infoJson?.status && typeof infoJson.data === 'string') {
-          const decrypted = await decryptSaveTubeData(infoJson.data);
-          if (decrypted?.key) {
-            const downloadType = type === 'audio' ? 'audio' : 'video';
-            const targetQualities =
-              type === 'audio'
-                ? ['128']
-                : quality === '1080p'
-                  ? ['1080', '720', '360']
-                  : ['720', '360'];
-
-            for (const q of targetQualities) {
-              try {
-                const dlRes = await fetch(`https://${cdnHost}/download`, {
-                  method: 'POST',
-                  headers: {
-                    Accept: 'application/json',
-                    'Content-Type': 'application/json',
-                  },
-                  body: JSON.stringify({
-                    downloadType,
-                    quality: q,
-                    key: decrypted.key,
-                    title: cleanDownloadFilename(decrypted?.title || 'video'),
-                  }),
-                  signal: AbortSignal.timeout(10000),
-                });
-                if (dlRes.ok) {
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  const dlJson: any = await dlRes.json();
-                  const resolvedLink = dlJson?.data?.downloadUrl;
-                  if (
-                    resolvedLink &&
-                    typeof resolvedLink === 'string' &&
-                    resolvedLink.startsWith('http')
-                  ) {
-                    return resolvedLink;
-                  }
-                }
-              } catch {
-                // Continue to next quality tier
-              }
-            }
-          }
-        }
-      }
-    }
-  } catch (saveTubeErr) {
-    console.warn('[useSocialDownloader] SaveTube VIP CDN client resolution warning:', saveTubeErr);
-  }
-
-  // Step 3: Chrome Extension Direct Innertube ANDROID_VR Fallback
+  // Provider 3 (Extension Fallback): Chrome Extension Direct Innertube ANDROID_VR
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
   if (chromeObj?.downloads?.download) {
@@ -275,7 +302,7 @@ async function resolveYouTubeClientSide(
         signal: AbortSignal.timeout(5000),
       });
 
-      if (vrRes.ok) {
+      if (vrRes.ok && vrRes.status !== 429) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const vrJson: any = await vrRes.json();
         if (vrJson.playabilityStatus?.status === 'OK') {
@@ -348,6 +375,9 @@ export async function triggerDirectDownload(url: string, filename: string): Prom
   const isAttachmentGuaranteed =
     url.includes('/tunnel') ||
     url.includes('api.cobalt.tools') ||
+    url.includes('cobalt.q0.wtf') ||
+    url.includes('co.wuk.sh') ||
+    url.includes('xenon.zone') ||
     url.includes('savenow.to') ||
     url.includes('savetube.vip') ||
     url.includes('savetube.me') ||
@@ -554,10 +584,21 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       });
 
       let stageTimer: ReturnType<typeof setTimeout> | null = null;
+      let isStageTimerStopped = false;
+      const stopStageTimer = () => {
+        isStageTimerStopped = true;
+        if (stageTimer) {
+          clearTimeout(stageTimer);
+          stageTimer = null;
+        }
+      };
+
       const scheduleStageProgression = () => {
+        if (isStageTimerStopped) return;
         stageTimer = setTimeout(() => {
+          if (isStageTimerStopped) return;
           setDownloadProgress((prev) => {
-            if (!prev.isDownloading) return prev;
+            if (!prev.isDownloading || isStageTimerStopped) return prev;
             let nextPercent = prev.percentage + 18;
             if (nextPercent > 90) nextPercent = 90;
             let nextStage: DownloadStage = 'video';
@@ -570,7 +611,9 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
               stage: nextStage,
             };
           });
-          scheduleStageProgression();
+          if (!isStageTimerStopped) {
+            scheduleStageProgression();
+          }
         }, 350);
       };
       scheduleStageProgression();
@@ -609,23 +652,24 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             stage: isAudio ? 'audio' : 'video',
           }));
 
-          // Resolve direct stream URL 100% client-side (Cobalt v10 -> SaveTube VIP CDN -> Extension Innertube)
+          // Resolve direct stream URL 100% client-side (Provider 1: Savetube -> Provider 2: Cobalt Round-Robin -> Provider 3: Extension Innertube)
           let resolvedYtUrl = await resolveYouTubeClientSide(result.videoId, quality, mediaType);
 
-          // Fallback to pre-extracted direct URL if available and not a raw youtube watch URL
+          // Fallback to pre-extracted direct URL if available and not a raw youtube watch URL or IP-bound googlevideo URL
           if (
             !resolvedYtUrl &&
             directUrl &&
             directUrl.startsWith('http') &&
             !directUrl.includes('youtube.com/watch') &&
-            !directUrl.includes('youtu.be/')
+            !directUrl.includes('youtu.be/') &&
+            !directUrl.includes('googlevideo.com')
           ) {
             resolvedYtUrl = directUrl;
           }
 
           if (!resolvedYtUrl) {
             throw new Error(
-              'Không thể phân giải luồng tải YouTube trực tiếp. Vui lòng thử lại sau giây lát.'
+              'Hệ thống máy chủ xử lý đang quá tải (Error 429). Vui lòng thử lại sau ít phút hoặc sử dụng Extension.'
             );
           }
 
@@ -638,9 +682,10 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           // Trigger direct download (chrome.downloads on Extension, Hidden Iframe on Web App)
           await triggerDirectDownload(resolvedYtUrl, cleanTargetFileName);
 
-          if (stageTimer) clearTimeout(stageTimer);
+          stopStageTimer();
           setDownloadProgress((prev) => ({
             ...prev,
+            isDownloading: false,
             percentage: 100,
             stage: 'done',
             status: 'completed',
@@ -772,9 +817,10 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             triggerBlobSave(rawBlob, cleanTargetFileName);
           }
 
-          if (stageTimer) clearTimeout(stageTimer);
+          stopStageTimer();
           setDownloadProgress((prev) => ({
             ...prev,
+            isDownloading: false,
             percentage: 100,
             stage: 'done',
             status: 'completed',
@@ -811,10 +857,11 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             );
           });
 
-          if (stageTimer) clearTimeout(stageTimer);
+          stopStageTimer();
 
           setDownloadProgress((prev) => ({
             ...prev,
+            isDownloading: false,
             percentage: 100,
             stage: 'done',
             status: 'completed',
@@ -888,10 +935,11 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         // Trigger local file save via Blob URL
         triggerBlobSave(downloadedBlob, cleanTargetFileName);
 
-        if (stageTimer) clearTimeout(stageTimer);
+        stopStageTimer();
 
         setDownloadProgress((prev) => ({
           ...prev,
+          isDownloading: false,
           loadedBytes: downloadedBlob!.size,
           totalBytes: downloadedBlob!.size,
           percentage: 100,
@@ -903,11 +951,16 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           setDownloadProgress(INITIAL_PROGRESS);
         }, 3500);
       } catch (err) {
-        if (stageTimer) clearTimeout(stageTimer);
-        const msg = err instanceof Error ? err.message : 'Lỗi khi tải tệp về máy tính.';
+        stopStageTimer();
+        const msg =
+          err instanceof Error
+            ? err.message
+            : 'Hệ thống máy chủ xử lý đang quá tải (Error 429). Vui lòng thử lại sau ít phút hoặc sử dụng Extension.';
         console.error('Download stream error:', err);
         setDownloadProgress((prev) => ({
           ...prev,
+          isDownloading: false,
+          percentage: 0,
           status: 'error',
           errorMessage: msg,
         }));
@@ -999,6 +1052,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
         setDownloadProgress((prev) => ({
           ...prev,
+          isDownloading: false,
           percentage: 100,
           stage: 'done',
           status: 'completed',
@@ -1011,6 +1065,8 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         const msg = err instanceof Error ? err.message : 'Lỗi khi tạo file nén ZIP.';
         setDownloadProgress((prev) => ({
           ...prev,
+          isDownloading: false,
+          percentage: 0,
           status: 'error',
           errorMessage: msg,
         }));
