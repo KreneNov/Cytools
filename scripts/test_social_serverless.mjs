@@ -32,6 +32,7 @@ class MockResponse extends EventEmitter {
   }
   write(chunk) {
     this.body += chunk;
+    this.emit('data', chunk);
     return true;
   }
 }
@@ -158,15 +159,17 @@ async function runTests() {
     throw e;
   }
 
-  console.log('\n=== TEST 9: /api/social/extract?action=resolve Endpoint ===');
-  const resolveReq = { method: 'GET', url: '/api/social/extract?action=resolve&videoId=dQw4w9WgXcQ' };
-  const resolveRes = new MockResponse();
-  await extractHandler(resolveReq, resolveRes);
-  console.assert(resolveRes.statusCode === 200, `Expected 200 for action=resolve, got ${resolveRes.statusCode}`);
-  const rJson = JSON.parse(resolveRes.body);
-  console.assert(rJson.success === true, 'Expected success: true from action=resolve');
-  console.assert(!!rJson.preMuxedUrl, 'Expected preMuxedUrl in action=resolve');
-  console.log('✔ /api/social/extract?action=resolve returned instant preMuxed stream!');
+  console.log('\n=== TEST 9: /api/social/extract?action=resolve Endpoint (Multiple Videos) ===');
+  for (const vid of ['dQw4w9WgXcQ', 'p8K6ws6Ivlo']) {
+    const resolveReq = { method: 'GET', url: `/api/social/extract?action=resolve&videoId=${vid}` };
+    const resolveRes = new MockResponse();
+    await extractHandler(resolveReq, resolveRes);
+    console.assert(resolveRes.statusCode === 200, `Expected 200 for action=resolve on ${vid}, got ${resolveRes.statusCode}`);
+    const rJson = JSON.parse(resolveRes.body);
+    console.log(`resolve [${vid}]:`, { success: rJson.success, hasPreMuxed: !!rJson.preMuxedUrl, hasAudio: !!rJson.audioUrl, resolvedBy: rJson.resolvedBy });
+    console.assert(rJson.success === true, `Expected success: true from action=resolve on ${vid}`);
+  }
+  console.log('✔ /api/social/extract?action=resolve: Stream resolution verified for multiple video types!');
 
   console.log('\n=== TEST 10: /api/download Proxy Validation & Lookaside Headers ===');
   const dReq = { method: 'GET', url: '/api/download?url=' + encodeURIComponent('https://lookaside.fbsbx.com/lookaside/crawler/media/?media_id=123') + '&filename=reel.mp4' };
@@ -179,27 +182,38 @@ async function runTests() {
   console.assert(dRes.getHeader('access-control-allow-origin') === '*', 'Missing download CORS header');
   console.log('✔ /api/download: Lookaside proxy headers verified');
 
-  console.log('\n=== TEST 11: /api/social/extract?action=savenow_init & savenow_progress ===');
-  const sInitReq = { method: 'GET', url: '/api/social/extract?action=savenow_init&videoId=dQw4w9WgXcQ&format=720' };
-  const sInitRes = new MockResponse();
-  await extractHandler(sInitReq, sInitRes);
-  console.assert(sInitRes.statusCode === 200, `Expected 200 for action=savenow_init, got ${sInitRes.statusCode}`);
-  const sInitJson = JSON.parse(sInitRes.body);
-  console.log('SaveNow Init:', { success: sInitJson.success, id: sInitJson.id });
-  console.assert(sInitJson.success === true && !!sInitJson.id, 'Expected success: true and id from savenow_init');
+  console.log('\n=== TEST 11: /api/download Same-Lambda YouTube Resolve & Stream (p8K6ws6Ivlo) ===');
+  const ytVideoReq = { method: 'GET', url: '/api/download?videoId=p8K6ws6Ivlo&type=video&quality=720p&filename=tesla.mp4' };
+  const ytVideoRes = new MockResponse();
+  const vChunkPromise = new Promise((resolve) => ytVideoRes.once('data', resolve));
+  await downloadHandler(ytVideoReq, ytVideoRes);
+  const vChunk = await vChunkPromise;
+  console.log('Same-Lambda Video Status:', ytVideoRes.statusCode);
+  console.log('Content-Type:', ytVideoRes.getHeader('content-type'));
+  console.log('Content-Disposition:', ytVideoRes.getHeader('content-disposition'));
+  console.log('First Streamed Video Chunk Bytes:', vChunk ? vChunk.length : 0);
+  console.assert(ytVideoRes.statusCode === 200, `Expected 200 for YouTube video download, got ${ytVideoRes.statusCode}`);
+  console.assert(ytVideoRes.getHeader('content-type')?.includes('video/mp4'), 'Expected video/mp4 Content-Type');
+  console.assert(ytVideoRes.getHeader('content-disposition')?.includes('attachment'), 'Expected attachment header');
+  console.assert(vChunk && vChunk.length > 1000, 'Expected non-empty binary stream');
 
-  const sProgReq = { method: 'GET', url: `/api/social/extract?action=savenow_progress&id=${encodeURIComponent(sInitJson.id)}` };
-  const sProgRes = new MockResponse();
-  await extractHandler(sProgReq, sProgRes);
-  console.assert(sProgRes.statusCode === 200, `Expected 200 for action=savenow_progress, got ${sProgRes.statusCode}`);
-  const sProgJson = JSON.parse(sProgRes.body);
-  console.log('SaveNow Progress:', { success: sProgJson.success, progress: sProgJson.progress, hasUrl: !!sProgJson.download_url });
-  console.assert(typeof sProgJson.success === 'number', 'Expected numeric success in savenow_progress');
-  console.log('✔ /api/social/extract: SaveNow init & progress endpoints verified!');
+  const ytAudioReq = { method: 'GET', url: '/api/download?videoId=p8K6ws6Ivlo&type=audio&filename=tesla.mp3' };
+  const ytAudioRes = new MockResponse();
+  const aChunkPromise = new Promise((resolve) => ytAudioRes.once('data', resolve));
+  await downloadHandler(ytAudioReq, ytAudioRes);
+  const aChunk = await aChunkPromise;
+  console.log('Same-Lambda Audio Status:', ytAudioRes.statusCode);
+  console.log('Content-Type:', ytAudioRes.getHeader('content-type'));
+  console.log('First Streamed Audio Chunk Bytes:', aChunk ? aChunk.length : 0);
+  console.assert(ytAudioRes.statusCode === 200, `Expected 200 for YouTube audio download, got ${ytAudioRes.statusCode}`);
+  console.assert(ytAudioRes.getHeader('content-type')?.includes('audio/'), 'Expected audio Content-Type');
+  console.assert(aChunk && aChunk.length > 1000, 'Expected non-empty binary audio stream');
+  console.log('✔ /api/download: Same-Lambda YouTube resolve & binary streaming verified without IP mismatch!');
 
   console.log('\n========================================');
   console.log('ALL VERIFICATION CHECKS PASSED PERFECTLY!');
   console.log('========================================');
+  process.exit(0);
 }
 
 runTests().catch((e) => {

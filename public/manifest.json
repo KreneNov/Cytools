@@ -20,6 +20,8 @@
   "host_permissions": [
     "https://cytools.vercel.app/*",
     "*://*.vercel.app/*",
+    "*://*.youtube.com/*",
+    "*://*.googlevideo.com/*",
     "<all_urls>"
   ],
   "background": {

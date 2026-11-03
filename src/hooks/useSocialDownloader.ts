@@ -128,119 +128,133 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       try {
         let directUrl = mediaUrl;
 
-        // Phase 1: If YouTube and URL not yet resolved (or empty), resolve stream via SaveNow or Probed Innertube
-        if ((!directUrl || optionId?.startsWith('youtube_') || result?.platform === 'youtube') && result?.videoId) {
-          const isAudio = optionId === 'youtube_audio';
-          const requestedFormat = isAudio ? 'mp3' : optionId === 'youtube_1080p' ? '1080' : '720';
-
-          // Tier 1: SaveNow Converter & CDN Stream via backend proxy
-          try {
-            const initUrl = getApiUrl(
-              `/api/social/extract?action=savenow_init&videoId=${encodeURIComponent(
-                result.videoId
-              )}&format=${requestedFormat}`
-            );
-            const initRes = await fetch(initUrl, { signal: AbortSignal.timeout(6000) });
-            if (initRes.ok) {
-              const initData = await initRes.json();
-              if (initData.success && initData.id) {
-                const jobId = initData.id;
-                const pollStart = Date.now();
-                while (Date.now() - pollStart < 16000) {
-                  await new Promise((resolve) => setTimeout(resolve, 1500));
-                  try {
-                    const pollUrl = getApiUrl(
-                      `/api/social/extract?action=savenow_progress&id=${encodeURIComponent(jobId)}`
-                    );
-                    const pollRes = await fetch(pollUrl, { signal: AbortSignal.timeout(5000) });
-                    if (pollRes.ok) {
-                      const pollData = await pollRes.json();
-                      if (typeof pollData.progress === 'number') {
-                        const mappedPercent = Math.min(
-                          85,
-                          Math.max(30, Math.round(pollData.progress / 10))
-                        );
-                        setDownloadProgress((prev) => ({
-                          ...prev,
-                          percentage: mappedPercent,
-                          stage: mappedPercent >= 65 ? 'muxing' : 'video',
-                        }));
-                      }
-
-                      if (pollData.success === 1 && pollData.download_url) {
-                        directUrl = pollData.download_url;
-                        break;
-                      }
-
-                      if (pollData.success === 0 && pollData.text?.toLowerCase().includes('error')) {
-                        console.warn('[useSocialDownloader] SaveNow error:', pollData.text);
-                        break;
-                      }
-                    }
-                  } catch (pErr) {
-                    console.warn('[useSocialDownloader] SaveNow poll tick error:', pErr);
-                  }
-                }
-              }
-            }
-          } catch (savenowErr) {
-            console.warn('[useSocialDownloader] SaveNow init attempt failed:', savenowErr);
-          }
-
-          // Tier 2: Server Stream Resolver fallback (Innertube with Range Probe verification)
-          if (!directUrl) {
-            try {
-              const resolveUrl = getApiUrl(`/api/social/extract?action=resolve&videoId=${result.videoId}`);
-              const resStream = await fetch(resolveUrl, { signal: AbortSignal.timeout(6000) });
-              if (resStream.ok) {
-                const streamData = await resStream.json();
-                if (isAudio && streamData.audioUrl) {
-                  directUrl = streamData.audioUrl;
-                } else if (streamData.preMuxedUrl) {
-                  directUrl = streamData.preMuxedUrl;
-                }
-              }
-            } catch (innerErr) {
-              console.warn('[useSocialDownloader] Stream resolution fallback failed:', innerErr);
-            }
-          }
-
-          // Tier 3: Use pre-extracted stream options from result if available, or original mediaUrl
-          if (!directUrl) {
-            if (isAudio && result.audioUrl) {
-              directUrl = result.audioUrl;
-            } else if (result.videoHd) {
-              directUrl = result.videoHd;
-            } else if (result.videoSd) {
-              directUrl = result.videoSd;
-            } else if (mediaUrl) {
-              directUrl = mediaUrl;
-            }
-          }
-        }
-
-        if (!directUrl) {
-          throw new Error('Không thể phân giải đường dẫn tải xuống phương tiện. Vui lòng thử lại sau giây lát.');
-        }
-
-        // Phase 2: Dedicated YouTube Residential Direct Download Bypass:
-        // YouTube CDN streams block Vercel datacenter IPs with HTTP 403.
-        // We trigger native download directly on the client using the user's residential connection.
+        // Phase 1 & 2: Dedicated YouTube Resolution & Direct Download
         const isYouTube =
           optionId?.startsWith('youtube_') ||
           result?.platform === 'youtube' ||
-          directUrl.includes('googlevideo.com') ||
-          directUrl.includes('savenow.to');
+          (mediaUrl &&
+            (mediaUrl.includes('youtube.com') ||
+              mediaUrl.includes('youtu.be') ||
+              mediaUrl.includes('googlevideo.com')));
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
 
-        if (isYouTube) {
+        if (isYouTube && result?.videoId) {
+          const isAudio = optionId === 'youtube_audio';
+          const quality = optionId === 'youtube_1080p' ? '1080p' : '720p';
+
+          // Branch A: Chrome Extension (Client-side Direct Innertube using User's Residential IP)
           if (chromeObj?.downloads?.download) {
+            let extStreamUrl: string | null = null;
+            try {
+              // Call Innertube player directly from client with user's residential IP
+              const vrBody = {
+                videoId: result.videoId,
+                context: {
+                  client: {
+                    clientName: 'ANDROID_VR',
+                    clientVersion: '1.60.19',
+                    deviceMake: 'Oculus',
+                    deviceModel: 'Quest 3',
+                    osName: 'Android',
+                    osVersion: '12L',
+                    androidSdkVersion: 32,
+                    hl: 'vi',
+                    gl: 'VN',
+                  },
+                },
+              };
+              const vrRes = await fetch(
+                'https://www.youtube.com/youtubei/v1/player?prettyPrint=false',
+                {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent':
+                      'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+                  },
+                  body: JSON.stringify(vrBody),
+                  signal: AbortSignal.timeout(5000),
+                }
+              );
+              if (vrRes.ok) {
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                const vrJson: any = await vrRes.json();
+                if (vrJson.playabilityStatus?.status === 'OK') {
+                  const formats = vrJson.streamingData?.formats || [];
+                  const adaptive = vrJson.streamingData?.adaptiveFormats || [];
+                  if (isAudio) {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const aFmt =
+                      adaptive.find((f: any) => f.url && f.itag === 140) ||
+                      adaptive.find((f: any) => f.url && f.mimeType?.includes('audio/mp4'));
+                    if (aFmt?.url) extStreamUrl = aFmt.url;
+                  } else {
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const preMuxed =
+                      formats.find((f: any) => f.url && f.mimeType?.includes('video/mp4')) ||
+                      formats.find((f: any) => f.url);
+                    if (preMuxed?.url) extStreamUrl = preMuxed.url;
+                  }
+                }
+              }
+            } catch (extErr) {
+              console.warn(
+                '[useSocialDownloader] Extension direct innertube attempt failed:',
+                extErr
+              );
+            }
+
+            // If direct stream URL resolved on extension, download directly with user's residential IP
+            if (extStreamUrl) {
+              await new Promise<void>((resolve, reject) => {
+                chromeObj.downloads.download(
+                  {
+                    url: extStreamUrl,
+                    filename: targetFileName,
+                    saveAs: false,
+                  },
+                  (downloadId?: number) => {
+                    if (chromeObj.runtime?.lastError || !downloadId) {
+                      reject(
+                        new Error(
+                          chromeObj.runtime?.lastError?.message ||
+                            'Không thể khởi động tải xuống qua trình quản lý tiện ích.'
+                        )
+                      );
+                    } else {
+                      resolve();
+                    }
+                  }
+                );
+              });
+
+              if (stageTimer) clearTimeout(stageTimer);
+              setDownloadProgress((prev) => ({
+                ...prev,
+                percentage: 100,
+                stage: 'done',
+                status: 'completed',
+              }));
+              setTimeout(() => {
+                setDownloadProgress(INITIAL_PROGRESS);
+              }, 3500);
+              return;
+            }
+
+            // Fallback for extension: pass /api/download endpoint to chrome.downloads
+            const apiDownloadUrl = getApiUrl(
+              `/api/download?videoId=${encodeURIComponent(result.videoId)}&type=${
+                isAudio ? 'audio' : 'video'
+              }&quality=${encodeURIComponent(quality)}&filename=${encodeURIComponent(
+                targetFileName
+              )}`
+            );
             await new Promise<void>((resolve, reject) => {
               chromeObj.downloads.download(
                 {
-                  url: directUrl,
+                  url: apiDownloadUrl,
                   filename: targetFileName,
                   saveAs: false,
                 },
@@ -258,31 +272,78 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
                 }
               );
             });
-          } else {
-            // Web environment: Trigger direct browser download
-            // Since SaveNow and YouTube CDNs provide Content-Disposition: attachment headers,
-            // an <a> click directly triggers the file download to disk without redirecting the page.
-            const a = document.createElement('a');
-            a.href = directUrl;
-            a.download = targetFileName;
-            document.body.appendChild(a);
-            a.click();
+
+            if (stageTimer) clearTimeout(stageTimer);
+            setDownloadProgress((prev) => ({
+              ...prev,
+              percentage: 100,
+              stage: 'done',
+              status: 'completed',
+            }));
             setTimeout(() => {
-              if (document.body.contains(a)) {
-                document.body.removeChild(a);
-              }
-            }, 3000);
+              setDownloadProgress(INITIAL_PROGRESS);
+            }, 3500);
+            return;
           }
 
-          if (stageTimer) clearTimeout(stageTimer);
+          // Branch B: Web App (Same-Lambda Resolve + Stream Pipe via /api/download)
+          const downloadEndpoint = getApiUrl(
+            `/api/download?videoId=${encodeURIComponent(result.videoId)}&type=${
+              isAudio ? 'audio' : 'video'
+            }&quality=${encodeURIComponent(quality)}&filename=${encodeURIComponent(
+              targetFileName
+            )}`
+          );
 
+          setDownloadProgress((prev) => ({
+            ...prev,
+            percentage: 45,
+            stage: 'video',
+          }));
+
+          const response = await fetch(downloadEndpoint, { signal: AbortSignal.timeout(60000) });
+          const contentType = response.headers.get('content-type') || '';
+
+          if (
+            !response.ok ||
+            contentType.includes('application/json') ||
+            contentType.includes('text/html')
+          ) {
+            let errorMsg = 'Không thể tải video YouTube từ máy chủ.';
+            try {
+              const errJson = await response.json();
+              if (errJson.error) errorMsg = errJson.error;
+            } catch {
+              // Continue with default error
+            }
+            throw new Error(errorMsg);
+          }
+
+          setDownloadProgress((prev) => ({
+            ...prev,
+            percentage: 85,
+            stage: 'muxing',
+          }));
+
+          const blob = await response.blob();
+          const objectUrl = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = objectUrl;
+          a.download = targetFileName;
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => {
+            if (document.body.contains(a)) document.body.removeChild(a);
+            URL.revokeObjectURL(objectUrl);
+          }, 3000);
+
+          if (stageTimer) clearTimeout(stageTimer);
           setDownloadProgress((prev) => ({
             ...prev,
             percentage: 100,
             stage: 'done',
             status: 'completed',
           }));
-
           setTimeout(() => {
             setDownloadProgress(INITIAL_PROGRESS);
           }, 3500);

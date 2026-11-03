@@ -2,8 +2,6 @@ import type { IncomingMessage, ServerResponse } from 'http';
 import {
   extractSocialMedia,
   resolveInnertubeStreams,
-  initSaveNow,
-  checkSaveNowProgress,
 } from '../_social_extractor.js';
 
 interface ExtendedRequest extends IncomingMessage {
@@ -95,22 +93,6 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
       }
     }
 
-    // Handle SaveNow init action for YouTube
-    if (action === 'savenow_init' && videoId) {
-      const format =
-        (req.url && new URL(req.url, 'http://127.0.0.1').searchParams.get('format')) || '720';
-      const result = await initSaveNow(videoId, format);
-      return sendJson(res, 200, result);
-    }
-
-    // Handle SaveNow progress polling action for YouTube
-    if (action === 'savenow_progress') {
-      const id = req.url && new URL(req.url, 'http://127.0.0.1').searchParams.get('id');
-      if (!id) return sendJson(res, 400, { success: 0, error: 'Thiếu id tiến trình' });
-      const result = await checkSaveNowProgress(id);
-      return sendJson(res, 200, result);
-    }
-
     // Handle instant stream resolution action for YouTube
     if (action === 'resolve' && videoId) {
       const streams = await resolveInnertubeStreams(videoId);
@@ -130,16 +112,6 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
       targetUrl = body.url || null;
       if (!action && body.action) action = body.action;
       if (!videoId && body.videoId) videoId = body.videoId;
-
-      if (action === 'savenow_init' && videoId) {
-        const result = await initSaveNow(videoId, body.format || '720');
-        return sendJson(res, 200, result);
-      }
-
-      if (action === 'savenow_progress' && body.id) {
-        const result = await checkSaveNowProgress(body.id);
-        return sendJson(res, 200, result);
-      }
 
       if (action === 'resolve' && videoId) {
         const streams = await resolveInnertubeStreams(videoId);

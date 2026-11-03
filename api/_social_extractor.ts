@@ -1010,93 +1010,8 @@ export function extractYouTubeVideoId(url: string): string | null {
  * Returns pre-muxed itag 18 MP4 (video+audio) and high-bitrate itag 140 M4A audio.
  */
 /**
- * Fast stream probe verifying that a resolved media stream actually returns valid bytes (> 500 bytes)
- * rather than an empty 0-byte stream or 403 Forbidden page.
- */
-export async function probeStream(streamUrl: string): Promise<boolean> {
-  try {
-    const probe = await fetch(streamUrl, {
-      method: 'GET',
-      headers: {
-        Range: 'bytes=0-1024',
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      },
-      signal: AbortSignal.timeout(3500),
-    });
-    if (probe.status === 200 || probe.status === 206) {
-      const buf = await probe.arrayBuffer();
-      return buf.byteLength > 500;
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Initiates a SaveNow / Loader.to conversion job.
- */
-export async function initSaveNow(
-  videoId: string,
-  format: string
-): Promise<{ success: boolean; id?: string; error?: string }> {
-  try {
-    const url = encodeURIComponent('https://www.youtube.com/watch?v=' + videoId);
-    const apiUrl = `https://p.savenow.to/ajax/download.php?copyright=0&format=${encodeURIComponent(
-      format
-    )}&url=${url}&api=dfcb6d76f2f6a9894gjkege8a4ab232222`;
-    const res = await fetch(apiUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        Origin: 'https://loader.to',
-        Referer: 'https://loader.to/',
-      },
-      signal: AbortSignal.timeout(6000),
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const json: any = await res.json();
-    if (json && json.success && json.id) {
-      return { success: true, id: json.id };
-    }
-    return { success: false, error: json?.message || 'Không thể khởi tạo tiến trình tải SaveNow.' };
-  } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : 'Lỗi kết nối SaveNow API.' };
-  }
-}
-
-/**
- * Polls a SaveNow / Loader.to conversion job progress.
- */
-export async function checkSaveNowProgress(
-  id: string
-): Promise<{ success: number; progress?: number; download_url?: string; text?: string; error?: string }> {
-  try {
-    const res = await fetch(`https://p.savenow.to/api/progress?id=${encodeURIComponent(id)}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        Origin: 'https://loader.to',
-        Referer: 'https://loader.to/',
-      },
-      signal: AbortSignal.timeout(6000),
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const json: any = await res.json();
-    return {
-      success: json.success ?? 0,
-      progress: json.progress ?? 0,
-      download_url: json.download_url || undefined,
-      text: json.text || undefined,
-    };
-  } catch (err) {
-    return { success: 0, error: err instanceof Error ? err.message : 'Lỗi kiểm tra tiến trình SaveNow.' };
-  }
-}
-
-/**
- * Direct YouTube Innertube player API query using ANDROID_VR client with Range Probe verification.
- * Returns pre-muxed itag 18 MP4 (video+audio) and high-bitrate itag 140 M4A audio.
+ * Direct YouTube Innertube player API query using ANDROID_VR and Ytdl clients.
+ * Returns itag 18 / itag 22 MP4 (pre-muxed or video stream) and high-bitrate itag 140 M4A audio.
  */
 export async function resolveInnertubeStreams(videoId: string): Promise<{
   preMuxedUrl: string | null;
@@ -1104,7 +1019,7 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
   resolvedBy?: string;
   debugReason?: string;
 }> {
-  // 1. Try Innertube player API with ANDROID_VR client
+  // Strategy 1: Try Innertube player API with ANDROID_VR client
   try {
     const body = {
       videoId,
@@ -1128,7 +1043,7 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
       headers: {
         'Content-Type': 'application/json',
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(5000),
@@ -1153,24 +1068,14 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
           adaptive.find((f: any) => f.url && f.itag === 140) ||
           adaptive.find((f: any) => f.url && f.mimeType?.includes('audio/mp4'));
 
-        let validPreMuxedUrl: string | null = null;
-        let validAudioUrl: string | null = null;
-
-        if (preMuxed?.url) {
-          const isOk = await probeStream(preMuxed.url);
-          if (isOk) validPreMuxedUrl = preMuxed.url;
-        }
-
-        if (audio?.url) {
-          const isOk = await probeStream(audio.url);
-          if (isOk) validAudioUrl = audio.url;
-        }
+        const validPreMuxedUrl = preMuxed?.url || null;
+        const validAudioUrl = audio?.url || null;
 
         if (validPreMuxedUrl || validAudioUrl) {
           return {
             preMuxedUrl: validPreMuxedUrl,
             audioUrl: validAudioUrl,
-            resolvedBy: 'innertube_android_vr_probed',
+            resolvedBy: 'innertube_android_vr',
             debugReason: 'OK',
           };
         }
@@ -1180,7 +1085,38 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
     console.warn('[Innertube Stream Warning]:', err instanceof Error ? err.message : err);
   }
 
-  return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No valid probed stream found' };
+  // Strategy 2: Try @distube/ytdl-core (visionos, tv, web_embedded, mweb clients)
+  try {
+    const { Ytdl } = await import('@distube/ytdl-core');
+    const ytdl = new Ytdl();
+    const info = await ytdl.getInfo(videoId);
+    if (info && Array.isArray(info.formats) && info.formats.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const preMuxed = info.formats.find((f: any) => f.url && f.hasVideo && f.hasAudio) ||
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        info.formats.find((f: any) => f.url && f.hasVideo && (f.qualityLabel?.includes('720') || f.itag === 22 || f.itag === 18)) ||
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        info.formats.find((f: any) => f.url && f.hasVideo);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const audio = info.formats.find((f: any) => f.url && f.hasAudio && (f.itag === 140 || f.mimeType?.includes('audio/mp4'))) ||
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        info.formats.find((f: any) => f.url && f.hasAudio);
+
+      if (preMuxed?.url || audio?.url) {
+        return {
+          preMuxedUrl: preMuxed?.url || null,
+          audioUrl: audio?.url || null,
+          resolvedBy: 'ytdl_multi_client',
+          debugReason: 'OK',
+        };
+      }
+    }
+  } catch (ytdlErr) {
+    console.warn('[Ytdl Stream Resolution Warning]:', ytdlErr instanceof Error ? ytdlErr.message : ytdlErr);
+  }
+
+  return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No stream available' };
 }
 
 /**
@@ -1258,7 +1194,7 @@ export async function extractYouTube(url: string): Promise<ExtractionResult> {
       {
         id: 'youtube_1080p',
         label: 'Tải Video MP4 1080p (Full HD)',
-        description: 'Chất lượng 1080p sắc nét qua bộ giải mã SaveNow CDN',
+        description: 'Chất lượng 1080p sắc nét qua bộ giải mã trực tiếp',
         format: 'mp4',
         quality: '1080p / HD',
         url: '',

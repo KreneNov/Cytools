@@ -1178,93 +1178,8 @@ export async function extractSocialMedia(url: string): Promise<ExtractionResult>
 }
 
 /**
- * Fast stream probe verifying that a resolved media stream actually returns valid bytes (> 500 bytes)
- * rather than an empty 0-byte stream or 403 Forbidden page.
- */
-export async function probeStream(streamUrl: string): Promise<boolean> {
-  try {
-    const probe = await fetch(streamUrl, {
-      method: 'GET',
-      headers: {
-        Range: 'bytes=0-1024',
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      },
-      signal: AbortSignal.timeout(3500),
-    });
-    if (probe.status === 200 || probe.status === 206) {
-      const buf = await probe.arrayBuffer();
-      return buf.byteLength > 500;
-    }
-    return false;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Initiates a SaveNow / Loader.to conversion job.
- */
-export async function initSaveNow(
-  videoId: string,
-  format: string
-): Promise<{ success: boolean; id?: string; error?: string }> {
-  try {
-    const url = encodeURIComponent('https://www.youtube.com/watch?v=' + videoId);
-    const apiUrl = `https://p.savenow.to/ajax/download.php?copyright=0&format=${encodeURIComponent(
-      format
-    )}&url=${url}&api=dfcb6d76f2f6a9894gjkege8a4ab232222`;
-    const res = await fetch(apiUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        Origin: 'https://loader.to',
-        Referer: 'https://loader.to/',
-      },
-      signal: AbortSignal.timeout(6000),
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const json: any = await res.json();
-    if (json && json.success && json.id) {
-      return { success: true, id: json.id };
-    }
-    return { success: false, error: json?.message || 'Không thể khởi tạo tiến trình tải SaveNow.' };
-  } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : 'Lỗi kết nối SaveNow API.' };
-  }
-}
-
-/**
- * Polls a SaveNow / Loader.to conversion job progress.
- */
-export async function checkSaveNowProgress(
-  id: string
-): Promise<{ success: number; progress?: number; download_url?: string; text?: string; error?: string }> {
-  try {
-    const res = await fetch(`https://p.savenow.to/api/progress?id=${encodeURIComponent(id)}`, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        Origin: 'https://loader.to',
-        Referer: 'https://loader.to/',
-      },
-      signal: AbortSignal.timeout(6000),
-    });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const json: any = await res.json();
-    return {
-      success: json.success ?? 0,
-      progress: json.progress ?? 0,
-      download_url: json.download_url || undefined,
-      text: json.text || undefined,
-    };
-  } catch (err) {
-    return { success: 0, error: err instanceof Error ? err.message : 'Lỗi kiểm tra tiến trình SaveNow.' };
-  }
-}
-
-/**
- * Direct YouTube Innertube player API query using ANDROID_VR client with Range Probe verification.
- * Returns pre-muxed itag 18 MP4 (video+audio) and high-bitrate itag 140 M4A audio.
+ * Direct YouTube Innertube player API query using ANDROID_VR and Ytdl clients.
+ * Returns itag 18 / itag 22 MP4 (pre-muxed or video stream) and high-bitrate itag 140 M4A audio.
  */
 export async function resolveInnertubeStreams(videoId: string): Promise<{
   preMuxedUrl: string | null;
@@ -1272,7 +1187,7 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
   resolvedBy?: string;
   debugReason?: string;
 }> {
-  // 1. Try Innertube player API with ANDROID_VR client
+  // Strategy 1: Try Innertube player API with ANDROID_VR client
   try {
     const body = {
       videoId,
@@ -1296,7 +1211,7 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
       headers: {
         'Content-Type': 'application/json',
         'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
       },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(5000),
@@ -1321,24 +1236,14 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
           adaptive.find((f: any) => f.url && f.itag === 140) ||
           adaptive.find((f: any) => f.url && f.mimeType?.includes('audio/mp4'));
 
-        let validPreMuxedUrl: string | null = null;
-        let validAudioUrl: string | null = null;
-
-        if (preMuxed?.url) {
-          const isOk = await probeStream(preMuxed.url);
-          if (isOk) validPreMuxedUrl = preMuxed.url;
-        }
-
-        if (audio?.url) {
-          const isOk = await probeStream(audio.url);
-          if (isOk) validAudioUrl = audio.url;
-        }
+        const validPreMuxedUrl = preMuxed?.url || null;
+        const validAudioUrl = audio?.url || null;
 
         if (validPreMuxedUrl || validAudioUrl) {
           return {
             preMuxedUrl: validPreMuxedUrl,
             audioUrl: validAudioUrl,
-            resolvedBy: 'innertube_android_vr_probed',
+            resolvedBy: 'innertube_android_vr',
             debugReason: 'OK',
           };
         }
@@ -1348,7 +1253,40 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
     console.warn('[Innertube Stream Warning]:', err instanceof Error ? err.message : err);
   }
 
-  return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No valid probed stream found' };
+  // Strategy 2: Try @distube/ytdl-core (visionos, tv, web_embedded, mweb clients)
+  try {
+    const { Ytdl } = await import('@distube/ytdl-core');
+    const ytdl = new Ytdl();
+    const info = await ytdl.getInfo(videoId);
+    if (info && Array.isArray(info.formats) && info.formats.length > 0) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const preMuxed =
+        info.formats.find((f: any) => f.url && f.hasVideo && f.hasAudio) ||
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        info.formats.find((f: any) => f.url && f.hasVideo && (f.qualityLabel?.includes('720') || f.itag === 22 || f.itag === 18)) ||
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        info.formats.find((f: any) => f.url && f.hasVideo);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const audio =
+        info.formats.find((f: any) => f.url && f.hasAudio && (f.itag === 140 || f.mimeType?.includes('audio/mp4'))) ||
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        info.formats.find((f: any) => f.url && f.hasAudio);
+
+      if (preMuxed?.url || audio?.url) {
+        return {
+          preMuxedUrl: preMuxed?.url || null,
+          audioUrl: audio?.url || null,
+          resolvedBy: 'ytdl_multi_client',
+          debugReason: 'OK',
+        };
+      }
+    }
+  } catch (ytdlErr) {
+    console.warn('[Ytdl Stream Resolution Warning]:', ytdlErr instanceof Error ? ytdlErr.message : ytdlErr);
+  }
+
+  return { preMuxedUrl: null, audioUrl: null, resolvedBy: 'none', debugReason: 'No stream available' };
 }
 
 /**
@@ -1405,27 +1343,6 @@ export function socialDownloadProxyPlugin(): Plugin {
             const action = urlObj.searchParams.get('action');
             const videoId = urlObj.searchParams.get('videoId');
 
-            if (action === 'savenow_init' && videoId) {
-              const format = urlObj.searchParams.get('format') || '720';
-              const result = await initSaveNow(videoId, format);
-              res.statusCode = 200;
-              res.end(JSON.stringify(result));
-              return;
-            }
-
-            if (action === 'savenow_progress') {
-              const id = urlObj.searchParams.get('id');
-              if (!id) {
-                res.statusCode = 400;
-                res.end(JSON.stringify({ success: 0, error: 'Thiếu id tiến trình' }));
-                return;
-              }
-              const result = await checkSaveNowProgress(id);
-              res.statusCode = 200;
-              res.end(JSON.stringify(result));
-              return;
-            }
-
             if (action === 'resolve' && videoId) {
               const streams = await resolveInnertubeStreams(videoId);
               res.statusCode = 200;
@@ -1454,20 +1371,6 @@ export function socialDownloadProxyPlugin(): Plugin {
               try {
                 const bodyJson = JSON.parse(bodyStr);
                 targetUrl = bodyJson.url;
-
-                if (bodyJson.action === 'savenow_init' && bodyJson.videoId) {
-                  const result = await initSaveNow(bodyJson.videoId, bodyJson.format || '720');
-                  res.statusCode = 200;
-                  res.end(JSON.stringify(result));
-                  return;
-                }
-
-                if (bodyJson.action === 'savenow_progress' && bodyJson.id) {
-                  const result = await checkSaveNowProgress(bodyJson.id);
-                  res.statusCode = 200;
-                  res.end(JSON.stringify(result));
-                  return;
-                }
 
                 if (bodyJson.action === 'resolve' && bodyJson.videoId) {
                   const streams = await resolveInnertubeStreams(bodyJson.videoId);
@@ -1506,15 +1409,247 @@ export function socialDownloadProxyPlugin(): Plugin {
           return;
         }
 
-        // 2. Direct Proxy Download Streamer: /api/social/proxy-download
-        if (urlObj.pathname === '/api/social/proxy-download') {
+        // 2. Direct Proxy Download Streamer: /api/social/proxy-download and /api/download
+        if (urlObj.pathname === '/api/social/proxy-download' || urlObj.pathname === '/api/download') {
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+          res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition, Content-Length, Content-Type');
+
+          const videoId = urlObj.searchParams.get('videoId');
           const mediaUrl = urlObj.searchParams.get('url');
-          const fileName = urlObj.searchParams.get('filename') || 'download_media.mp4';
+          const customFileName = urlObj.searchParams.get('filename');
+          const downloadType = urlObj.searchParams.get('type');
+          const quality = urlObj.searchParams.get('quality') || '720p';
+
+          // Handle YouTube Same-Process Streaming (Fixes IP Mismatch)
+          if (videoId) {
+            const isAudio = downloadType === 'audio' || quality === 'audio';
+            const fallbackExt = isAudio ? 'mp3' : 'mp4';
+            const targetFileName = customFileName || `youtube_${videoId}.${fallbackExt}`;
+
+            let streamUrl: string | null = null;
+            let streamUa =
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+            let resolvedMimeType = isAudio ? 'audio/mp4' : 'video/mp4';
+
+            // Strategy A1: Try @distube/ytdl-core in same process
+            try {
+              const { Ytdl } = await import('@distube/ytdl-core');
+              const ytdl = new Ytdl();
+              const info = await ytdl.getInfo(videoId);
+              if (info && Array.isArray(info.formats) && info.formats.length > 0) {
+                if (isAudio) {
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const aFmt =
+                    info.formats.find(
+                      (f: any) =>
+                        f.url && f.hasAudio && (f.itag === 140 || f.mimeType?.includes('audio/mp4'))
+                    ) || info.formats.find((f: any) => f.url && f.hasAudio);
+                  if (aFmt?.url) {
+                    streamUrl = aFmt.url;
+                    resolvedMimeType = aFmt.mimeType || 'audio/mp4';
+                  }
+                } else {
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const preMuxed = info.formats.find((f: any) => f.url && f.hasVideo && f.hasAudio);
+                  if (preMuxed?.url) {
+                    streamUrl = preMuxed.url;
+                    resolvedMimeType = preMuxed.mimeType || 'video/mp4';
+                  } else {
+                    const targetQ = quality?.replace('p', '') || '720';
+                    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                    const vFmt =
+                      info.formats.find(
+                        (f: any) =>
+                          f.url && f.hasVideo && f.qualityLabel?.includes(targetQ) && f.container === 'mp4'
+                      ) ||
+                      info.formats.find((f: any) => f.url && f.hasVideo && f.container === 'mp4') ||
+                      info.formats.find((f: any) => f.url && f.hasVideo);
+                    if (vFmt?.url) {
+                      streamUrl = vFmt.url;
+                      resolvedMimeType = vFmt.mimeType || 'video/mp4';
+                    }
+                  }
+                }
+              }
+            } catch (ytdlErr) {
+              console.warn('[proxy] ytdl-core resolution error:', ytdlErr);
+            }
+
+            // Strategy A2: Try Raw Innertube ANDROID_VR
+            if (!streamUrl) {
+              try {
+                const vrBody = {
+                  videoId,
+                  context: {
+                    client: {
+                      clientName: 'ANDROID_VR',
+                      clientVersion: '1.60.19',
+                      deviceMake: 'Oculus',
+                      deviceModel: 'Quest 3',
+                      osName: 'Android',
+                      osVersion: '12L',
+                      androidSdkVersion: 32,
+                      hl: 'vi',
+                      gl: 'VN',
+                    },
+                  },
+                };
+                const vrUa =
+                  'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
+                const vrRes = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': vrUa,
+                  },
+                  body: JSON.stringify(vrBody),
+                  signal: AbortSignal.timeout(5000),
+                });
+                if (vrRes.ok) {
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const vrJson: any = await vrRes.json();
+                  if (vrJson.playabilityStatus?.status === 'OK') {
+                    const formats = vrJson.streamingData?.formats || [];
+                    const adaptive = vrJson.streamingData?.adaptiveFormats || [];
+                    if (isAudio) {
+                      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                      const aFmt =
+                        adaptive.find((f: any) => f.url && f.itag === 140) ||
+                        adaptive.find((f: any) => f.url && f.mimeType?.includes('audio/mp4'));
+                      if (aFmt?.url) {
+                        streamUrl = aFmt.url;
+                        streamUa = vrUa;
+                        resolvedMimeType = aFmt.mimeType || 'audio/mp4';
+                      }
+                    } else {
+                      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                      const preMuxed =
+                        formats.find((f: any) => f.url && f.mimeType?.includes('video/mp4')) ||
+                        formats.find((f: any) => f.url);
+                      if (preMuxed?.url) {
+                        streamUrl = preMuxed.url;
+                        streamUa = vrUa;
+                        resolvedMimeType = preMuxed.mimeType || 'video/mp4';
+                      }
+                    }
+                  }
+                }
+              } catch (vrErr) {
+                console.warn('[proxy] ANDROID_VR error:', vrErr);
+              }
+            }
+
+            if (streamUrl) {
+              try {
+                const remoteRes = await fetch(streamUrl, {
+                  method: 'GET',
+                  headers: {
+                    'User-Agent': streamUa,
+                    Accept: '*/*',
+                  },
+                  redirect: 'follow',
+                  signal: AbortSignal.timeout(30000),
+                });
+
+                const contentType = remoteRes.headers.get('content-type') || '';
+                if (
+                  remoteRes.ok &&
+                  !contentType.includes('application/json') &&
+                  !contentType.includes('text/html') &&
+                  remoteRes.body
+                ) {
+                  res.setHeader(
+                    'Content-Disposition',
+                    `attachment; filename="${encodeURIComponent(targetFileName)}"`
+                  );
+                  res.setHeader('Content-Type', contentType || resolvedMimeType);
+
+                  const exactContentLength = remoteRes.headers.get('content-length');
+                  if (exactContentLength) {
+                    res.setHeader('Content-Length', exactContentLength);
+                  }
+
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const nodeStream = Readable.fromWeb(remoteRes.body as any);
+                  nodeStream.pipe(res);
+                  return;
+                }
+              } catch (pipeErr) {
+                console.warn('[proxy] Stream fetch error:', pipeErr);
+              }
+            }
+
+            // Strategy B: Invidious Proxy Stream Fallback
+            const itag = isAudio ? '140' : quality === '1080p' ? '22' : '18';
+            const invidiousInstances = [
+              'https://inv.nadeko.net',
+              'https://invidious.nerdvpn.de',
+              'https://yewtu.be',
+              'https://invidious.privacyredirect.com',
+            ];
+
+            for (const inst of invidiousInstances) {
+              try {
+                const invUrl = `${inst}/latest_version?id=${encodeURIComponent(videoId)}&itag=${itag}&local=true`;
+                const invRes = await fetch(invUrl, {
+                  method: 'GET',
+                  headers: {
+                    'User-Agent':
+                      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                    Accept: '*/*',
+                  },
+                  redirect: 'follow',
+                  signal: AbortSignal.timeout(6000),
+                });
+
+                const contentType = invRes.headers.get('content-type') || '';
+                if (
+                  invRes.ok &&
+                  !contentType.includes('text/html') &&
+                  !contentType.includes('application/json') &&
+                  invRes.body
+                ) {
+                  res.setHeader(
+                    'Content-Disposition',
+                    `attachment; filename="${encodeURIComponent(targetFileName)}"`
+                  );
+                  res.setHeader('Content-Type', contentType || resolvedMimeType);
+
+                  const exactContentLength = invRes.headers.get('content-length');
+                  if (exactContentLength) {
+                    res.setHeader('Content-Length', exactContentLength);
+                  }
+
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const nodeStream = Readable.fromWeb(invRes.body as any);
+                  nodeStream.pipe(res);
+                  return;
+                }
+              } catch {
+                // Continue
+              }
+            }
+
+            res.statusCode = 502;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(
+              JSON.stringify({
+                success: false,
+                error:
+                  'Không thể phân giải luồng tải YouTube. Vui lòng thử lại sau giây lát hoặc dùng tiện ích mở rộng Cytools.',
+              })
+            );
+            return;
+          }
+
+          const fileName = customFileName || 'download_media.mp4';
 
           if (!mediaUrl) {
             res.statusCode = 400;
             res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ success: false, error: 'Thiếu tham số url để tải xuống.' }));
+            res.end(JSON.stringify({ success: false, error: 'Thiếu tham số url hoặc videoId để tải xuống.' }));
             return;
           }
 
