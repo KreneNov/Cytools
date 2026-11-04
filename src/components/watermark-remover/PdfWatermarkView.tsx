@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   FileText,
   CheckCircle2,
@@ -8,9 +8,11 @@ import {
   Download,
   AlertCircle,
   FileCheck,
+  ShieldAlert,
+  X,
 } from 'lucide-react';
 import { cleanPdfWatermarks } from '../../utils/pdfWatermarkCleaner';
-import type { PdfCleanResult } from '../../types/watermarkRemover';
+import type { PdfStripSuccess, PdfStripFailure } from '../../types/watermarkRemover';
 
 interface PdfWatermarkViewProps {
   isCompact?: boolean;
@@ -31,8 +33,21 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
   const [stripOverlayForms, setStripOverlayForms] = useState<boolean>(true);
 
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
-  const [result, setResult] = useState<PdfCleanResult | null>(null);
+  const [result, setResult] = useState<PdfStripSuccess | null>(null);
+  const [unsupportedModal, setUnsupportedModal] = useState<PdfStripFailure | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Close modal on Escape key
+  useEffect(() => {
+    if (!unsupportedModal) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setUnsupportedModal(null);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [unsupportedModal]);
 
   const handleFileDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -41,6 +56,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
       if (file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf') {
         setPdfFile(file);
         setResult(null);
+        setUnsupportedModal(null);
         setErrorMsg(null);
       }
     }
@@ -62,6 +78,8 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
     if (!pdfFile) return;
     setIsProcessing(true);
     setErrorMsg(null);
+    setResult(null);
+    setUnsupportedModal(null);
 
     try {
       const arrayBuffer = await pdfFile.arrayBuffer();
@@ -71,7 +89,14 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
         stripPieceInfo,
         stripOverlayForms,
       });
-      setResult(res);
+
+      if (res.success) {
+        setResult(res);
+      } else if (res.reason === 'SUBSET_FONT_UNSUPPORTED') {
+        setUnsupportedModal(res);
+      } else {
+        setErrorMsg(res.message);
+      }
     } catch (err) {
       console.error('[PDF Cleaner Error]:', err);
       setErrorMsg(
@@ -86,7 +111,9 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
 
   const handleDownload = () => {
     if (!result || !pdfFile) return;
-    const blob = new Blob([result.cleanedPdfBytes as unknown as BlobPart], { type: 'application/pdf' });
+    const blob = new Blob([result.cleanedPdfBytes as unknown as BlobPart], {
+      type: 'application/pdf',
+    });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     const nameWithoutExt = pdfFile.name.replace(/\.[^/.]+$/, '');
@@ -96,6 +123,11 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+
+    // Reset state after download so dropzone is ready for the next PDF
+    setPdfFile(null);
+    setResult(null);
+    setErrorMsg(null);
   };
 
   const formatFileSize = (bytes: number): string => {
@@ -106,6 +138,86 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
 
   return (
     <div className={`space-y-6 ${isCompact ? 'p-1' : ''}`}>
+      {/* Defensive Guardrail Modal for SUBSET_FONT_UNSUPPORTED */}
+      {unsupportedModal && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="subset-font-modal-title"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-xs"
+        >
+          <div className="w-full max-w-lg rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl p-6 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-500 shrink-0">
+                  <ShieldAlert className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3
+                    id="subset-font-modal-title"
+                    className="text-sm sm:text-base font-bold text-slate-900 dark:text-white"
+                  >
+                    Không thể gỡ Watermark Vector trên Font Subset
+                  </h3>
+                  <p className="text-xs text-amber-600 dark:text-amber-400 font-mono">
+                    Mã bảo vệ: SUBSET_FONT_UNSUPPORTED
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setUnsupportedModal(null)}
+                aria-label="Đóng hộp thoại"
+                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+              {unsupportedModal.message}
+            </p>
+
+            {unsupportedModal.details.length > 0 && (
+              <div className="rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 p-3 max-h-40 overflow-y-auto space-y-1.5">
+                <p className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
+                  Font Subset / CID phát hiện trong tài liệu:
+                </p>
+                {unsupportedModal.details.slice(0, 8).map((item, idx) => (
+                  <div
+                    key={`${item.pageIndex}-${item.fontName}-${idx}`}
+                    className="flex items-center justify-between text-xs font-mono text-slate-700 dark:text-slate-300"
+                  >
+                    <span className="truncate">
+                      Trang {item.pageIndex}: {item.fontName}
+                    </span>
+                    <span className="text-[11px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 shrink-0 ml-2">
+                      {item.fontKind}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div className="p-3 rounded-xl bg-pink-500/10 border border-pink-500/20 text-xs text-slate-700 dark:text-slate-300">
+              <strong className="text-pink-600 dark:text-pink-400">Giải pháp an toàn:</strong> Để giữ
+              nguyên vẹn 100% bố cục mà không làm lỗi font chữ, hãy xuất trang PDF sang định dạng ảnh
+              (PNG/JPG) rồi sử dụng tab <strong>Xóa Watermark Ảnh (ONNX AI)</strong>.
+            </div>
+
+            <div className="flex justify-end pt-1">
+              <button
+                type="button"
+                onClick={() => setUnsupportedModal(null)}
+                className="px-5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 dark:bg-white dark:hover:bg-slate-200 text-white dark:text-slate-900 text-xs font-bold transition-colors cursor-pointer"
+              >
+                Đã hiểu
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* File Upload Dropzone */}
       {!pdfFile ? (
         <div
@@ -121,6 +233,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
               if (file) {
                 setPdfFile(file);
                 setResult(null);
+                setUnsupportedModal(null);
                 setErrorMsg(null);
               }
             };
@@ -134,7 +247,8 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
             Kéo thả tài liệu PDF vào đây
           </h3>
           <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mb-4 max-w-md mx-auto">
-            Hỗ trợ bóc tách dấu chìm CamScanner, chữ đóng dấu bảo mật, stamp chú thích và watermark dạng text stream lặp lại.
+            Hỗ trợ gỡ bỏ Annotations (/Watermark, /Stamp), khối Marked-Content Artifact của MS Word và
+            lọc an toàn toán tử văn bản kèm cơ chế bảo vệ cấu trúc Font Subset.
           </p>
           <button
             type="button"
@@ -167,6 +281,8 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
               onClick={() => {
                 setPdfFile(null);
                 setResult(null);
+                setUnsupportedModal(null);
+                setErrorMsg(null);
               }}
               className="px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 text-xs font-medium transition-colors cursor-pointer"
             >
@@ -177,7 +293,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
           {/* Options & Keywords Configuration */}
           <div className="p-6 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm space-y-5">
             <h4 className="text-sm font-bold text-slate-900 dark:text-white">
-              Cấu hình bộ lọc Watermark PDF
+              Cấu hình bộ lọc Watermark PDF An Toàn
             </h4>
 
             {/* Checkbox Options */}
@@ -235,7 +351,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
                       handleAddKeyword();
                     }
                   }}
-                  placeholder="Nhập từ khóa (vd: CamScanner, Không sao chép, tên miền web...)"
+                  placeholder="Nhập từ khóa (vd: CamScanner, CONFIDENTIAL, DRAFT...)"
                   className="flex-1 px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:border-pink-500"
                 />
                 <button
@@ -279,7 +395,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
                 {isProcessing ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Đang bóc tách và làm sạch PDF...</span>
+                    <span>Đang kiểm tra Font & làm sạch PDF...</span>
                   </>
                 ) : (
                   <>
@@ -302,10 +418,10 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
           {/* Success Result Card */}
           {result && (
             <div className="p-6 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 space-y-4">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between flex-wrap gap-3">
                 <div className="flex items-center gap-2 text-emerald-700 dark:text-emerald-400 font-bold text-sm">
                   <CheckCircle2 className="w-5 h-5" />
-                  <span>Đã làm sạch file PDF thành công!</span>
+                  <span>Đã làm sạch file PDF an toàn!</span>
                 </div>
                 <button
                   type="button"
@@ -331,9 +447,9 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
                   </span>
                 </div>
                 <div className="p-3 rounded-xl bg-white/60 dark:bg-slate-900/60 border border-emerald-500/20">
-                  <span className="text-slate-500 block">Khối từ khóa đã lọc:</span>
+                  <span className="text-slate-500 block">Artifact / Text Ops gỡ:</span>
                   <span className="font-semibold text-slate-800 dark:text-slate-200">
-                    {result.strippedKeywordsCount} khối văn bản
+                    {result.strippedArtifactBlocks + result.strippedTextOps} khối
                   </span>
                 </div>
                 <div className="p-3 rounded-xl bg-white/60 dark:bg-slate-900/60 border border-emerald-500/20">

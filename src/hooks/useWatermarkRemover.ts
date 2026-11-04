@@ -1,72 +1,164 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
-import {
-  inpaintTelea,
-  loadCachedOnnxModel,
-  ONNX_MODEL_CACHE_NAME,
-  DEFAULT_ONNX_INPAINT_MODEL_URL,
-} from '../workers/inpaintWorker';
-import type { InpaintWorkerResponse } from '../types/watermarkRemover';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type {
+  ExecutionBackend,
+  InpaintModelSpec,
+  InpaintWorkerRequest,
+  InpaintWorkerResponse,
+} from '../types/watermarkRemover';
+import { DEFAULT_INPAINT_MODEL, MODEL_CACHE_NAME } from '../workers/inpaintModels';
+
+export type ModelStatus = 'idle' | 'downloading' | 'ready' | 'error';
+
+export interface WatermarkRemoverNotice {
+  id: number;
+  tone: 'info' | 'error';
+  message: string;
+}
 
 export interface UseWatermarkRemoverReturn {
-  isProcessing: boolean;
-  processProgress: number;
+  model: InpaintModelSpec;
+  modelStatus: ModelStatus;
   aiModelProgress: number;
   isAiModelCached: boolean;
-  isAiModelLoading: boolean;
-  preloadAiModel: (modelUrl?: string) => Promise<void>;
-  executeInpaint: (
-    baseImageData: ImageData,
-    maskImageData: ImageData,
-    radius?: number
-  ) => Promise<ImageData>;
+  backend: ExecutionBackend | null;
+  inferenceProgress: number;
+  notice: WatermarkRemoverNotice | null;
+  dismissNotice: () => void;
+  preloadModel: () => void;
+  runInpaint: (image: ImageData, mask: ImageData) => Promise<ImageData>;
+}
+
+interface PendingJob {
+  resolve: (data: ImageData) => void;
+  reject: (err: Error) => void;
 }
 
 /**
- * Hook managing the Image Watermark Inpainting Web Worker and the 30MB ONNX
- * model Cache API lifecycle (`aiModelProgress`: 0-100).
+ * Manages the ONNX inpainting Web Worker lifecycle, model Cache API status,
+ * and inference jobs (`jobId`-correlated so stale responses are ignored).
  */
-export function useWatermarkRemover(): UseWatermarkRemoverReturn {
-  const [isProcessing, setIsProcessing] = useState<boolean>(false);
-  const [processProgress, setProcessProgress] = useState<number>(0);
+export function useWatermarkRemover(model: InpaintModelSpec = DEFAULT_INPAINT_MODEL): UseWatermarkRemoverReturn {
+  const [modelStatus, setModelStatus] = useState<ModelStatus>('idle');
   const [aiModelProgress, setAiModelProgress] = useState<number>(0);
   const [isAiModelCached, setIsAiModelCached] = useState<boolean>(false);
-  const [isAiModelLoading, setIsAiModelLoading] = useState<boolean>(false);
+  const [backend, setBackend] = useState<ExecutionBackend | null>(null);
+  const [inferenceProgress, setInferenceProgress] = useState<number>(0);
+  const [notice, setNotice] = useState<WatermarkRemoverNotice | null>(null);
 
   const workerRef = useRef<Worker | null>(null);
+  const jobsRef = useRef<Map<number, PendingJob>>(new Map());
+  const jobCounterRef = useRef<number>(0);
+  const noticeCounterRef = useRef<number>(0);
+  const modelStatusRef = useRef<ModelStatus>('idle');
 
-  const getOrCreateWorker = useCallback((): Worker | null => {
-    if (typeof Worker === 'undefined') return null;
-    if (!workerRef.current) {
-      workerRef.current = new Worker(
-        new URL('../workers/inpaintWorker.ts', import.meta.url),
-        { type: 'module' }
-      );
-    }
-    return workerRef.current;
+  const updateModelStatus = useCallback((status: ModelStatus) => {
+    modelStatusRef.current = status;
+    setModelStatus(status);
   }, []);
 
-  // Check if the 30MB ONNX model is already stored in browser Cache API on mount
-  useEffect(() => {
-    let isMounted = true;
+  const pushNotice = useCallback((tone: 'info' | 'error', message: string) => {
+    noticeCounterRef.current += 1;
+    setNotice({ id: noticeCounterRef.current, tone, message });
+  }, []);
 
-    const inspectCacheStorage = async () => {
+  const handleMessage = useCallback(
+    (event: MessageEvent<InpaintWorkerResponse>) => {
+      const msg = event.data;
+      switch (msg.type) {
+        case 'MODEL_PROGRESS':
+          setAiModelProgress(msg.progress);
+          if (msg.cached) setIsAiModelCached(true);
+          if (msg.progress < 100 && modelStatusRef.current !== 'ready') updateModelStatus('downloading');
+          break;
+        case 'MODEL_READY':
+          setAiModelProgress(100);
+          setIsAiModelCached(true);
+          setBackend(msg.backend);
+          updateModelStatus('ready');
+          break;
+        case 'INFERENCE_PROGRESS':
+          setInferenceProgress(msg.progress);
+          break;
+        case 'INFERENCE_SUCCESS': {
+          const job = jobsRef.current.get(msg.jobId);
+          if (!job) return;
+          jobsRef.current.delete(msg.jobId);
+          setBackend(msg.backend);
+          setInferenceProgress(100);
+          job.resolve(new ImageData(new Uint8ClampedArray(msg.output), msg.width, msg.height));
+          break;
+        }
+        case 'WORKER_ERROR': {
+          if (msg.code === 'WEBGPU_FAILED' && !msg.fatal) {
+            setBackend('wasm');
+            pushNotice('info', msg.message);
+            return;
+          }
+          if (msg.code === 'MODEL_DOWNLOAD_FAILED') {
+            updateModelStatus('error');
+            setAiModelProgress(0);
+          }
+          pushNotice('error', msg.message);
+          if (msg.jobId !== undefined) {
+            const job = jobsRef.current.get(msg.jobId);
+            if (job) {
+              jobsRef.current.delete(msg.jobId);
+              job.reject(new Error(msg.message));
+            }
+          }
+          break;
+        }
+      }
+    },
+    [pushNotice, updateModelStatus]
+  );
+
+  const getWorker = useCallback((): Worker => {
+    if (!workerRef.current) {
+      const worker = new Worker(new URL('../workers/inpaintWorker.ts', import.meta.url), {
+        type: 'module',
+      });
+      worker.addEventListener('message', handleMessage);
+      worker.addEventListener('error', (ev: ErrorEvent) => {
+        pushNotice('error', `Web Worker gặp lỗi: ${ev.message || 'không xác định'}`);
+        jobsRef.current.forEach((job) => job.reject(new Error('Web Worker crashed')));
+        jobsRef.current.clear();
+        updateModelStatus('error');
+        worker.terminate();
+        workerRef.current = null;
+      });
+      workerRef.current = worker;
+    }
+    return workerRef.current;
+  }, [handleMessage, pushNotice, updateModelStatus]);
+
+  // Inspect Cache Storage on mount to reflect cached status immediately.
+  useEffect(() => {
+    let active = true;
+    const inspect = async () => {
       if (typeof caches === 'undefined') return;
       try {
-        const cache = await caches.open(ONNX_MODEL_CACHE_NAME);
-        const match = await cache.match(DEFAULT_ONNX_INPAINT_MODEL_URL);
-        if (isMounted && match && match.ok) {
+        const cache = await caches.open(MODEL_CACHE_NAME);
+        const hit = await cache.match(model.url);
+        if (active && hit) {
           setIsAiModelCached(true);
-          setAiModelProgress(100);
         }
       } catch {
-        // Ignore Cache API permission errors in restricted contexts
+        // Cache API unavailable
       }
     };
-
-    inspectCacheStorage();
-
+    inspect();
     return () => {
-      isMounted = false;
+      active = false;
+    };
+  }, [model.url]);
+
+  // Terminate worker and reject outstanding jobs on unmount.
+  useEffect(() => {
+    const jobs = jobsRef.current;
+    return () => {
+      jobs.forEach((job) => job.reject(new Error('Component unmounted')));
+      jobs.clear();
       if (workerRef.current) {
         workerRef.current.terminate();
         workerRef.current = null;
@@ -74,151 +166,56 @@ export function useWatermarkRemover(): UseWatermarkRemoverReturn {
     };
   }, []);
 
-  /**
-   * Fetches and caches a ~30MB `.onnx` model binary in the browser's Cache API (`caches.open`)
-   * via the Web Worker so the 30MB payload is only downloaded once per user.
-   */
-  const preloadAiModel = useCallback(
-    async (modelUrl: string = DEFAULT_ONNX_INPAINT_MODEL_URL): Promise<void> => {
-      setIsAiModelLoading(true);
-      setAiModelProgress(0);
+  const preloadModel = useCallback(() => {
+    if (modelStatusRef.current === 'ready' || modelStatusRef.current === 'downloading') return;
+    updateModelStatus('downloading');
+    const request: InpaintWorkerRequest = { type: 'LOAD_MODEL', model };
+    getWorker().postMessage(request);
+  }, [getWorker, model, updateModelStatus]);
 
-      const worker = getOrCreateWorker();
-      if (!worker) {
-        try {
-          await loadCachedOnnxModel(modelUrl, (pct, cached) => {
-            setAiModelProgress(pct);
-            if (cached) setIsAiModelCached(true);
-          });
-          setIsAiModelCached(true);
-          setAiModelProgress(100);
-        } catch {
-          // Graceful fallback when model binary is not yet hosted on static server
-          setAiModelProgress(100);
-        } finally {
-          setIsAiModelLoading(false);
-        }
-        return;
-      }
+  const runInpaint = useCallback(
+    (image: ImageData, mask: ImageData): Promise<ImageData> => {
+      jobCounterRef.current += 1;
+      const jobId = jobCounterRef.current;
+      setInferenceProgress(0);
+      if (modelStatusRef.current !== 'ready') updateModelStatus('downloading');
 
-      return new Promise<void>((resolve) => {
-        const handleMessage = (e: MessageEvent<InpaintWorkerResponse>) => {
-          const resp = e.data;
-          if (resp.type === 'AI_MODEL_PROGRESS') {
-            setAiModelProgress(resp.progress);
-            if (resp.cached) setIsAiModelCached(true);
-          } else if (resp.type === 'AI_MODEL_READY') {
-            setAiModelProgress(100);
-            setIsAiModelCached(true);
-            setIsAiModelLoading(false);
-            worker.removeEventListener('message', handleMessage);
-            resolve();
-          } else if (resp.type === 'INPAINT_ERROR') {
-            setAiModelProgress(100);
-            setIsAiModelLoading(false);
-            worker.removeEventListener('message', handleMessage);
-            resolve();
-          }
+      return new Promise<ImageData>((resolve, reject) => {
+        jobsRef.current.set(jobId, { resolve, reject });
+        const imageCopy = new Uint8ClampedArray(image.data);
+        const maskCopy = new Uint8ClampedArray(mask.data);
+        const request: InpaintWorkerRequest = {
+          type: 'RUN_INPAINT',
+          jobId,
+          model,
+          image: imageCopy,
+          mask: maskCopy,
+          width: image.width,
+          height: image.height,
         };
-
-        worker.addEventListener('message', handleMessage);
-        worker.postMessage({
-          type: 'PRELOAD_AI_MODEL',
-          modelUrl,
-        });
-      });
-    },
-    [getOrCreateWorker]
-  );
-
-  /**
-   * Executes watermark inpainting inside the Web Worker (with main-thread Telea fallback).
-   */
-  const executeInpaint = useCallback(
-    async (
-      baseImageData: ImageData,
-      maskImageData: ImageData,
-      radius: number = 6
-    ): Promise<ImageData> => {
-      setIsProcessing(true);
-      setProcessProgress(0);
-      if (aiModelProgress < 100) {
-        setAiModelProgress(100);
-      }
-
-      return new Promise<ImageData>((resolve) => {
         try {
-          const worker = getOrCreateWorker();
-          if (worker) {
-            const handleMessage = (e: MessageEvent<InpaintWorkerResponse>) => {
-              const resp = e.data;
-              if (resp.type === 'AI_MODEL_PROGRESS') {
-                setAiModelProgress(resp.progress);
-                if (resp.cached) setIsAiModelCached(true);
-              } else if (resp.type === 'INPAINT_PROGRESS') {
-                setProcessProgress(resp.progress);
-              } else if (resp.type === 'INPAINT_SUCCESS') {
-                setProcessProgress(100);
-                setIsProcessing(false);
-                worker.removeEventListener('message', handleMessage);
-                resolve(resp.resultData);
-              } else if (resp.type === 'INPAINT_ERROR') {
-                console.warn('[InpaintWorker Error]:', resp.error);
-                worker.removeEventListener('message', handleMessage);
-                const direct = inpaintTelea(
-                  baseImageData,
-                  maskImageData,
-                  radius,
-                  setProcessProgress
-                );
-                setProcessProgress(100);
-                setIsProcessing(false);
-                resolve(direct);
-              }
-            };
-
-            worker.addEventListener('message', handleMessage);
-            worker.postMessage({
-              type: 'INPAINT_REQUEST',
-              imageData: baseImageData,
-              maskData: maskImageData,
-              radius,
-            });
-          } else {
-            const direct = inpaintTelea(
-              baseImageData,
-              maskImageData,
-              radius,
-              setProcessProgress
-            );
-            setProcessProgress(100);
-            setIsProcessing(false);
-            resolve(direct);
-          }
+          getWorker().postMessage(request, [imageCopy.buffer, maskCopy.buffer]);
         } catch (err) {
-          console.warn('Worker instantiation failed, running direct fallback:', err);
-          const direct = inpaintTelea(
-            baseImageData,
-            maskImageData,
-            radius,
-            setProcessProgress
-          );
-          setProcessProgress(100);
-          setIsProcessing(false);
-          resolve(direct);
+          jobsRef.current.delete(jobId);
+          reject(err instanceof Error ? err : new Error('Không thể gửi dữ liệu tới Web Worker.'));
         }
       });
     },
-    [aiModelProgress, getOrCreateWorker]
+    [getWorker, model, updateModelStatus]
   );
+
+  const dismissNotice = useCallback(() => setNotice(null), []);
 
   return {
-    isProcessing,
-    processProgress,
+    model,
+    modelStatus,
     aiModelProgress,
     isAiModelCached,
-    isAiModelLoading,
-    preloadAiModel,
-    executeInpaint,
+    backend,
+    inferenceProgress,
+    notice,
+    dismissNotice,
+    preloadModel,
+    runInpaint,
   };
 }

@@ -7,563 +7,389 @@ import {
   PDFRawStream,
   decodePDFRawStream,
 } from 'pdf-lib';
+import type { PdfUnsupportedDetail } from '../types/watermarkRemover';
+import {
+  tokenizePdfContentStream,
+  extractSafeAsciiFromOperand,
+  spliceOutByteRanges,
+  type PdfContentToken,
+} from './pdfContentTokenizer';
 
-export interface FontCMap {
-  byteLength: 1 | 2;
-  map: Map<number, string>;
+export interface FontSafetyInfo {
+  fontKey: string;
+  baseFont: string;
+  fontKind: string;
+  safe: boolean;
+}
+
+export interface StreamStripSummary {
+  strippedArtifactBlocks: number;
+  strippedTextOps: number;
+  unsupportedDetails: PdfUnsupportedDetail[];
 }
 
 /**
- * Converts a Uint8Array to a 1:1 Latin-1 string so raw byte values (0x00-0xFF)
- * are preserved losslessly during string regex manipulation.
+ * Inspects `/Resources -> /Font` on a page and classifies each font as `safe`
+ * (standard uncompressed ASCII with explicit identity/WinAnsi encoding and no subset prefix)
+ * vs `unsafe` (subsetted font `ABCDEF+Name`, Type0/CID `Identity-H`, or custom `ToUnicode` CMap).
  */
-export function uint8ToLatin1(bytes: Uint8Array): string {
-  const chunkSize = 0x8000;
-  const chunks: string[] = [];
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const slice = bytes.subarray(i, i + chunkSize);
-    chunks.push(String.fromCharCode(...slice));
-  }
-  return chunks.join('');
-}
-
-/**
- * Converts a 1:1 Latin-1 string back into a Uint8Array.
- */
-export function latin1ToUint8(str: string): Uint8Array {
-  const bytes = new Uint8Array(str.length);
-  for (let i = 0; i < str.length; i++) {
-    bytes[i] = str.charCodeAt(i) & 0xff;
-  }
-  return bytes;
-}
-
-/**
- * Parses a decoded PDF /ToUnicode CMap stream into a glyphId -> Unicode string lookup map.
- */
-export function parseToUnicodeCMap(cmapText: string): FontCMap {
-  const map = new Map<number, string>();
-  let detectedByteLength: 1 | 2 = 1;
-
-  const decodeUtf16Hex = (hex: string): string => {
-    const clean = hex.replace(/[^0-9a-fA-F]/g, '');
-    if (clean.length === 0) return '';
-    if (clean.length === 2) {
-      return String.fromCharCode(parseInt(clean, 16));
-    }
-    let out = '';
-    for (let i = 0; i < clean.length; i += 4) {
-      const unit = parseInt(clean.slice(i, i + 4), 16);
-      if (!Number.isNaN(unit)) {
-        out += String.fromCharCode(unit);
-      }
-    }
-    return out;
-  };
-
-  // 1. Parse beginbfchar ... endbfchar blocks
-  const bfCharRegex = /beginbfchar([\s\S]*?)endbfchar/g;
-  let bfCharMatch: RegExpExecArray | null;
-  while ((bfCharMatch = bfCharRegex.exec(cmapText)) !== null) {
-    const body = bfCharMatch[1];
-    const pairRegex = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g;
-    let pair: RegExpExecArray | null;
-    while ((pair = pairRegex.exec(body)) !== null) {
-      const srcHex = pair[1];
-      const dstHex = pair[2];
-      if (srcHex.length > 2) detectedByteLength = 2;
-      const srcCode = parseInt(srcHex, 16);
-      const dstStr = decodeUtf16Hex(dstHex);
-      if (!Number.isNaN(srcCode) && dstStr) {
-        map.set(srcCode, dstStr);
-      }
-    }
-  }
-
-  // 2. Parse beginbfrange ... endbfrange blocks
-  const bfRangeRegex = /beginbfrange([\s\S]*?)endbfrange/g;
-  let bfRangeMatch: RegExpExecArray | null;
-  while ((bfRangeMatch = bfRangeRegex.exec(cmapText)) !== null) {
-    const body = bfRangeMatch[1];
-    // Form A: <startHex> <endHex> <dstStartHex>
-    const directRangeRegex = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g;
-    let range: RegExpExecArray | null;
-    while ((range = directRangeRegex.exec(body)) !== null) {
-      const startHex = range[1];
-      const endHex = range[2];
-      const dstHex = range[3];
-      if (startHex.length > 2) detectedByteLength = 2;
-      const startCode = parseInt(startHex, 16);
-      const endCode = parseInt(endHex, 16);
-      const dstStart = parseInt(dstHex, 16);
-      if (!Number.isNaN(startCode) && !Number.isNaN(endCode) && !Number.isNaN(dstStart)) {
-        const count = Math.min(endCode - startCode, 2048);
-        for (let offset = 0; offset <= count; offset++) {
-          map.set(startCode + offset, String.fromCharCode(dstStart + offset));
-        }
-      }
-    }
-
-    // Form B: <startHex> <endHex> [ <dst1> <dst2> ... ]
-    const arrayRangeRegex = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*\[([\s\S]*?)\]/g;
-    let arrRange: RegExpExecArray | null;
-    while ((arrRange = arrayRangeRegex.exec(body)) !== null) {
-      const startHex = arrRange[1];
-      if (startHex.length > 2) detectedByteLength = 2;
-      const startCode = parseInt(startHex, 16);
-      const arrayBody = arrRange[3];
-      const itemRegex = /<([0-9a-fA-F]+)>/g;
-      let item: RegExpExecArray | null;
-      let offset = 0;
-      while ((item = itemRegex.exec(arrayBody)) !== null) {
-        const dstStr = decodeUtf16Hex(item[1]);
-        if (dstStr) {
-          map.set(startCode + offset, dstStr);
-        }
-        offset++;
-      }
-    }
-  }
-
-  return { byteLength: detectedByteLength, map };
-}
-
-/**
- * Extracts all Font /ToUnicode CMaps from a PDF Resources dictionary.
- */
-export function extractResourcesFontCMaps(
+export function classifyPageFonts(
   pdfDoc: PDFDocument,
-  resources: PDFDict | undefined,
-  existingMap: Map<string, FontCMap> = new Map()
-): Map<string, FontCMap> {
-  if (!(resources instanceof PDFDict)) return existingMap;
+  resources: PDFDict | undefined
+): Map<string, FontSafetyInfo> {
+  const result = new Map<string, FontSafetyInfo>();
+  if (!(resources instanceof PDFDict)) return result;
 
   const fontEntry = resources.get(PDFName.of('Font'));
   const fontDict = pdfDoc.context.lookup(fontEntry);
-  if (!(fontDict instanceof PDFDict)) return existingMap;
+  if (!(fontDict instanceof PDFDict)) return result;
 
-  for (const fontKey of fontDict.keys()) {
-    const fontName = fontKey.asString(); // e.g. "/F1"
-    const fontObj = pdfDoc.context.lookup(fontDict.get(fontKey));
+  for (const key of fontDict.keys()) {
+    const fontKey = key.asString(); // e.g. "/F1"
+    const fontObj = pdfDoc.context.lookup(fontDict.get(key));
     if (!(fontObj instanceof PDFDict)) continue;
 
-    const toUnicodeRef = fontObj.get(PDFName.of('ToUnicode'));
-    const toUnicodeObj = pdfDoc.context.lookup(toUnicodeRef);
-    if (toUnicodeObj instanceof PDFRawStream) {
-      try {
-        const decodedBytes = decodePDFRawStream(toUnicodeObj).decode();
-        const cmapText = uint8ToLatin1(decodedBytes);
-        const parsed = parseToUnicodeCMap(cmapText);
-        if (parsed.map.size > 0) {
-          existingMap.set(fontName, parsed);
-        }
-      } catch {
-        // Ignore malformed CMap streams
-      }
-    }
+    const subtypeObj = fontObj.get(PDFName.of('Subtype'));
+    const subtype = subtypeObj instanceof PDFName ? subtypeObj.asString() : '/Unknown';
+
+    const baseFontObj = fontObj.get(PDFName.of('BaseFont'));
+    const rawBaseFont = baseFontObj instanceof PDFName ? baseFontObj.asString().replace(/^\//, '') : 'UnknownFont';
+
+    const encodingObj = fontObj.get(PDFName.of('Encoding'));
+    const encodingName =
+      encodingObj instanceof PDFName
+        ? encodingObj.asString()
+        : encodingObj instanceof PDFDict
+        ? 'CustomEncodingDict'
+        : 'Default';
+
+    const hasToUnicode = Boolean(fontObj.get(PDFName.of('ToUnicode')));
+    const hasSubsetPrefix = /^[A-Z]{6}\+/.test(rawBaseFont);
+    const isCompositeOrType3 =
+      subtype === '/Type0' ||
+      subtype === '/CIDFontType0' ||
+      subtype === '/CIDFontType2' ||
+      subtype === '/Type3';
+    const isIdentityEncoding =
+      encodingName === '/Identity-H' ||
+      encodingName === '/Identity-V' ||
+      encodingName === 'CustomEncodingDict';
+
+    const safe =
+      !hasSubsetPrefix &&
+      !isCompositeOrType3 &&
+      !isIdentityEncoding &&
+      !hasToUnicode &&
+      (subtype === '/Type1' || subtype === '/TrueType');
+
+    const reasons: string[] = [];
+    if (hasSubsetPrefix) reasons.push('Font Subset');
+    if (isCompositeOrType3) reasons.push(`Composite ${subtype.replace('/', '')}`);
+    if (isIdentityEncoding) reasons.push(encodingName.replace('/', ''));
+    if (hasToUnicode) reasons.push('ToUnicode CMap');
+
+    result.set(fontKey, {
+      fontKey,
+      baseFont: rawBaseFont,
+      fontKind: reasons.length > 0 ? reasons.join(' · ') : `${subtype.replace('/', '')} (${encodingName.replace('/', '')})`,
+      safe,
+    });
   }
 
-  return existingMap;
+  return result;
 }
 
-/**
- * Unescapes a PDF literal string `(...)` into raw byte values.
- */
-function unescapePdfLiteralBytes(rawContent: string): number[] {
-  const bytes: number[] = [];
-  for (let i = 0; i < rawContent.length; i++) {
-    const ch = rawContent[i];
-    if (ch === '\\' && i + 1 < rawContent.length) {
-      const next = rawContent[i + 1];
-      if (next >= '0' && next <= '7') {
-        let octal = next;
-        i++;
-        if (i + 1 < rawContent.length && rawContent[i + 1] >= '0' && rawContent[i + 1] <= '7') {
-          octal += rawContent[++i];
-          if (i + 1 < rawContent.length && rawContent[i + 1] >= '0' && rawContent[i + 1] <= '7') {
-            octal += rawContent[++i];
-          }
-        }
-        bytes.push(parseInt(octal, 8) & 0xff);
-      } else if (next === 'n') {
-        bytes.push(10);
-        i++;
-      } else if (next === 'r') {
-        bytes.push(13);
-        i++;
-      } else if (next === 't') {
-        bytes.push(9);
-        i++;
-      } else if (next === 'b') {
-        bytes.push(8);
-        i++;
-      } else if (next === 'f') {
-        bytes.push(12);
-        i++;
-      } else if (next === '\r' || next === '\n') {
-        // Line continuation backslash
-        i++;
-        if (next === '\r' && i + 1 < rawContent.length && rawContent[i + 1] === '\n') {
-          i++;
-        }
-      } else {
-        bytes.push(next.charCodeAt(0) & 0xff);
-        i++;
-      }
-    } else {
-      bytes.push(ch.charCodeAt(0) & 0xff);
-    }
+function matchesKeyword(text: string, keywords: string[]): boolean {
+  const lower = text.toLowerCase();
+  const compact = lower.replace(/\s+/g, ' ').trim();
+  const spaceless = lower.replace(/\s+/g, '');
+  if (!spaceless) return false;
+
+  for (const kw of keywords) {
+    if (lower.includes(kw) || compact.includes(kw)) return true;
+    const kwSpaceless = kw.replace(/\s+/g, '');
+    if (kwSpaceless.length >= 4 && spaceless.includes(kwSpaceless)) return true;
   }
-  return bytes;
+  return false;
 }
 
-/**
- * Converts a sequence of raw bytes from a PDF string or hex string into candidate readable strings
- * using direct ASCII/UTF-16BE decoding as well as any available Font ToUnicode CMaps.
- */
-function decodePdfBytesCandidates(
-  bytes: number[],
-  activeFontName: string | null,
-  fontCMaps: Map<string, FontCMap>
-): string[] {
-  if (bytes.length === 0) return [];
-  const candidates: string[] = [];
-
-  // 1. Direct ASCII / Latin-1 (stripping NUL bytes used in UTF-16BE / 2-byte big-endian ASCII)
-  const ascii = bytes
-    .filter((b) => b !== 0)
-    .map((b) => String.fromCharCode(b))
-    .join('');
-  if (ascii) candidates.push(ascii);
-
-  // 2. UTF-16BE decoding when even length
-  if (bytes.length >= 2 && bytes.length % 2 === 0) {
-    let utf16 = '';
-    const startIdx = bytes[0] === 0xfe && bytes[1] === 0xff ? 2 : 0;
-    for (let i = startIdx; i < bytes.length; i += 2) {
-      const code = (bytes[i] << 8) | bytes[i + 1];
-      if (code > 0) utf16 += String.fromCharCode(code);
-    }
-    if (utf16) candidates.push(utf16);
-  }
-
-  // 3. Decode using active font CMap or any page font CMap
-  const cmapsToTry: FontCMap[] = [];
-  if (activeFontName && fontCMaps.has(activeFontName)) {
-    cmapsToTry.push(fontCMaps.get(activeFontName)!);
-  }
-  for (const [k, cmap] of fontCMaps.entries()) {
-    if (k !== activeFontName) cmapsToTry.push(cmap);
-  }
-
-  for (const cmap of cmapsToTry) {
-    // Try 2-byte big-endian lookup if even length
-    if (bytes.length >= 2 && bytes.length % 2 === 0) {
-      let mapped2 = '';
-      for (let i = 0; i < bytes.length; i += 2) {
-        const code = (bytes[i] << 8) | bytes[i + 1];
-        mapped2 += cmap.map.get(code) ?? (code > 31 && code < 127 ? String.fromCharCode(code) : '');
-      }
-      if (mapped2) candidates.push(mapped2);
-    }
-
-    // Try 1-byte lookup
-    let mapped1 = '';
-    for (let i = 0; i < bytes.length; i++) {
-      const code = bytes[i];
-      mapped1 += cmap.map.get(code) ?? (code > 31 && code < 127 ? String.fromCharCode(code) : '');
-    }
-    if (mapped1) candidates.push(mapped1);
-  }
-
-  return candidates;
-}
-
-/**
- * Extracts all candidate decoded strings from a PDF text operator operand (`(...)`, `<...>`, or `[...]`).
- */
-export function extractTextCandidatesFromOperand(
-  operandText: string,
-  activeFontName: string | null,
-  fontCMaps: Map<string, FontCMap>
-): string[] {
-  const allBytes: number[] = [];
-
-  // Scan operandText in order for (...) literal strings and <...> hex strings
-  let i = 0;
-  const len = operandText.length;
-
-  while (i < len) {
-    const ch = operandText[i];
-
-    if (ch === '(') {
-      // Parse balanced parentheses literal string (...)
-      let depth = 1;
-      let start = i + 1;
-      i++;
-      while (i < len && depth > 0) {
-        if (operandText[i] === '\\') {
-          i += 2;
-          continue;
-        }
-        if (operandText[i] === '(') depth++;
-        else if (operandText[i] === ')') depth--;
-        i++;
-      }
-      const rawLiteral = operandText.slice(start, Math.max(start, i - 1));
-      allBytes.push(...unescapePdfLiteralBytes(rawLiteral));
-    } else if (ch === '<' && operandText[i + 1] !== '<') {
-      // Parse hex string <...>
-      const end = operandText.indexOf('>', i + 1);
-      if (end === -1) break;
-      const hex = operandText.slice(i + 1, end).replace(/\s+/g, '');
-      const padded = hex.length % 2 === 1 ? `${hex}0` : hex;
-      for (let h = 0; h < padded.length; h += 2) {
-        const byteVal = parseInt(padded.slice(h, h + 2), 16);
-        if (!Number.isNaN(byteVal)) {
-          allBytes.push(byteVal);
-        }
-      }
-      i = end + 1;
-    } else {
-      i++;
-    }
-  }
-
-  return decodePdfBytesCandidates(allBytes, activeFontName, fontCMaps);
-}
-
-/**
- * Strips balanced Marked Content `/Artifact << ... /Subtype /Watermark ... >> BDC ... EMC`
- * and `/Watermark ... BDC/BMC ... EMC` blocks generated by MS Word and Adobe Acrobat.
- */
-export function stripMarkedContentWatermarkBlocks(streamText: string): {
-  cleanedText: string;
-  removedCount: number;
-} {
-  let removedCount = 0;
-  let result = '';
-  let cursor = 0;
-
-  // Match /Artifact <<...>> BDC or /Watermark BDC/BMC
-  const headerRegex =
-    /(?:\/Artifact\s*<<[\s\S]*?>>\s*BDC|\/Watermark(?:\s*<<[\s\S]*?>>)?\s*(?:BDC|BMC))/gi;
-  let match: RegExpExecArray | null;
-
-  while ((match = headerRegex.exec(streamText)) !== null) {
-    const headerStr = match[0];
-    const matchStart = match.index;
-    const matchEnd = matchStart + headerStr.length;
-
-    // If /Artifact, verify it is a Watermark or Background artifact
-    const isWatermarkHeader =
-      /^\/Watermark/i.test(headerStr.trim()) ||
-      /\/Subtype\s*\/Watermark/i.test(headerStr) ||
-      /\/Subtype\s*\/Background/i.test(headerStr);
-
-    if (!isWatermarkHeader) {
-      continue;
-    }
-
-    // Find matching balanced EMC
-    const tokenRegex = /\b(BMC|BDC|EMC)\b/g;
-    tokenRegex.lastIndex = matchEnd;
-    let depth = 1;
-    let emcEnd = -1;
-    let tok: RegExpExecArray | null;
-
-    while ((tok = tokenRegex.exec(streamText)) !== null) {
-      const op = tok[1];
-      if (op === 'BMC' || op === 'BDC') {
-        depth++;
-      } else if (op === 'EMC') {
-        depth--;
-        if (depth === 0) {
-          emcEnd = tok.index + tok[0].length;
-          break;
-        }
-      }
-    }
-
-    if (emcEnd !== -1) {
-      result += streamText.slice(cursor, matchStart);
-      cursor = emcEnd;
-      headerRegex.lastIndex = emcEnd;
-      removedCount++;
-    }
-  }
-
-  if (removedCount === 0) {
-    return { cleanedText: streamText, removedCount: 0 };
-  }
-
-  result += streamText.slice(cursor);
-  return { cleanedText: result, removedCount };
-}
-
-/**
- * Checks whether any candidate string contains one of the normalized target keywords.
- */
-function matchesAnyKeyword(candidates: string[], targetKeywords: string[]): boolean {
-  for (const cand of candidates) {
-    const lower = cand.toLowerCase();
-    const compact = lower.replace(/\s+/g, ' ').trim();
-    const spaceless = lower.replace(/\s+/g, '');
-    for (const kw of targetKeywords) {
-      if (lower.includes(kw) || compact.includes(kw)) {
-        return true;
-      }
-      const kwSpaceless = kw.replace(/\s+/g, '');
-      if (kwSpaceless.length >= 4 && spaceless.includes(kwSpaceless)) {
-        return true;
-      }
-    }
+function isRangeInsideAny(
+  start: number,
+  end: number,
+  ranges: Array<{ start: number; end: number }>
+): boolean {
+  for (const r of ranges) {
+    if (start >= r.start && end <= r.end) return true;
   }
   return false;
 }
 
 /**
- * Deep cleans a single decoded PDF content stream string:
- * 1. Strips MS Word `/Artifact <</Subtype /Watermark>> BDC ... EMC` blocks.
- * 2. Inspects every `BT ... ET` text object, decoding `Tj`, `TJ`, `'`, `"` operands
- *    (including split kerning arrays `[(C)-2(O)...] TJ`, hex strings, and ToUnicode CMaps)
- *    and strips matching watermark text-drawing commands or entire watermark `BT ... ET` blocks.
- * 3. Strips any standalone `(...) Tj` or `[...] TJ` operators matching target keywords.
+ * Analyzes a single decompressed content stream using the byte-accurate tokenizer:
+ * - Tier A: Removes balanced `/Artifact << ... /Subtype /Watermark ... >> BDC ... EMC` and `/Watermark BMC/BDC ... EMC` blocks.
+ * - Tier B: Removes `Tj`/`TJ` text operators drawn with verified `safe` fonts (along with enclosing `BT...ET` and `q...Q` if empty).
+ * - Guardrail: Records `unsupportedDetails` when subsetted/hex-encoded fonts are encountered in text blocks.
  */
-export function stripWatermarkFromStreamText(
-  streamText: string,
+export function analyzeAndStripContentStream(
+  streamBytes: Uint8Array,
   targetKeywords: string[],
-  fontCMaps: Map<string, FontCMap> = new Map()
-): { cleanedText: string; removedCount: number } {
-  let totalRemoved = 0;
+  pageFonts: Map<string, FontSafetyInfo>,
+  pageIndex: number
+): {
+  cleanedBytes: Uint8Array | null;
+  strippedArtifactBlocks: number;
+  strippedTextOps: number;
+  unsupportedDetails: PdfUnsupportedDetail[];
+} {
+  const tokens: PdfContentToken[] = tokenizePdfContentStream(streamBytes);
+  const rangesToDelete: Array<{ start: number; end: number }> = [];
+  const unsupportedMap = new Map<string, PdfUnsupportedDetail>();
 
-  // Pass 1: Strip Marked-Content Watermark Artifacts (/Artifact <</Subtype/Watermark>> BDC ... EMC)
-  const markedPass = stripMarkedContentWatermarkBlocks(streamText);
-  let workingText = markedPass.cleanedText;
-  totalRemoved += markedPass.removedCount;
+  let strippedArtifactBlocks = 0;
+  let strippedTextOps = 0;
 
-  // Pass 2: Inspect BT ... ET text blocks and strip matching Tj / TJ operators or entire BT ... ET block
-  const btBlockRegex = /\bBT\b([\s\S]*?)\bET\b/g;
+  // ------------------------------------------------------------------
+  // Tier A: Marked-Content Watermark Artifacts (`BDC` / `BMC` ... `EMC`)
+  // ------------------------------------------------------------------
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok.kind !== 'operator' || (tok.raw !== 'BDC' && tok.raw !== 'BMC')) continue;
 
-  // Regex matching individual text-showing commands inside BT ... ET:
-  // - (...) Tj or (...) '
-  // - <...> Tj
-  // - [...] TJ
-  const textOpRegex =
-    /(\[(?:[^[\]\\]|\\.|(?:\((?:[^()\\]|\\.)*\)))*\]\s*TJ|\((?:[^()\\]|\\.)*\)\s*(?:Tj|'|")|<[0-9a-fA-F\s]+>\s*Tj)/g;
+    let tagIdx = -1;
+    let isWatermarkMarkedBlock = false;
 
-  workingText = workingText.replace(btBlockRegex, (fullBtBlock, innerContent: string) => {
-    // Detect active font inside this BT ... ET block (e.g. "/F1 48 Tf")
-    const fontMatch = innerContent.match(/(\/[A-Za-z0-9_.+-]+)\s+[-0-9.]+\s+Tf/);
-    const activeFont = fontMatch ? fontMatch[1] : null;
-
-    let opRemovedInBlock = 0;
-    let remainingOpsInBlock = 0;
-
-    // Check individual Tj / TJ operations first
-    const cleanedInner = innerContent.replace(textOpRegex, (opMatch) => {
-      const candidates = extractTextCandidatesFromOperand(opMatch, activeFont, fontCMaps);
-      if (matchesAnyKeyword(candidates, targetKeywords)) {
-        opRemovedInBlock++;
-        totalRemoved++;
-        return '';
+    if (tok.raw === 'BMC' && i >= 1 && tokens[i - 1].kind === 'name') {
+      tagIdx = i - 1;
+      if (/^\/Watermark$/i.test(tokens[tagIdx].raw)) {
+        isWatermarkMarkedBlock = true;
       }
-      remainingOpsInBlock++;
-      return opMatch;
-    });
-
-    if (opRemovedInBlock > 0) {
-      // If all text-drawing operators in this BT...ET block were watermarks, drop the entire BT...ET block
-      if (remainingOpsInBlock === 0) {
-        return '';
+    } else if (tok.raw === 'BDC' && i >= 2 && tokens[i - 2].kind === 'name') {
+      tagIdx = i - 2;
+      const tagName = tokens[tagIdx].raw;
+      const propTok = tokens[i - 1];
+      if (/^\/Watermark$/i.test(tagName)) {
+        isWatermarkMarkedBlock = true;
+      } else if (
+        /^\/Artifact$/i.test(tagName) &&
+        propTok.kind === 'dict' &&
+        /\/Subtype\s*\/Watermark/i.test(propTok.raw)
+      ) {
+        isWatermarkMarkedBlock = true;
       }
-      return `BT${cleanedInner}ET`;
     }
 
-    // What if MS Word positioned each character with separate Tj commands (e.g. (C) Tj ... (O) Tj ...)?
-    // Concatenate all text operands inside the BT ... ET block and check against target keywords.
-    const allBlockCandidates = extractTextCandidatesFromOperand(innerContent, activeFont, fontCMaps);
-    if (matchesAnyKeyword(allBlockCandidates, targetKeywords)) {
-      totalRemoved++;
-      return '';
+    if (!isWatermarkMarkedBlock || tagIdx < 0) continue;
+
+    // Find matching balanced `EMC`
+    let depth = 1;
+    let emcIdx = -1;
+    for (let j = i + 1; j < tokens.length; j++) {
+      if (tokens[j].kind === 'operator') {
+        if (tokens[j].raw === 'BMC' || tokens[j].raw === 'BDC') depth++;
+        else if (tokens[j].raw === 'EMC') {
+          depth--;
+          if (depth === 0) {
+            emcIdx = j;
+            break;
+          }
+        }
+      }
     }
 
-    return fullBtBlock;
-  });
-
-  // Pass 3: Standalone operator-level pass (in case BT/ET spans across multiple stream chunks in a PDFArray)
-  workingText = workingText.replace(textOpRegex, (opMatch) => {
-    const candidates = extractTextCandidatesFromOperand(opMatch, null, fontCMaps);
-    if (matchesAnyKeyword(candidates, targetKeywords)) {
-      totalRemoved++;
-      return '';
+    if (emcIdx !== -1) {
+      rangesToDelete.push({
+        start: tokens[tagIdx].start,
+        end: tokens[emcIdx].end,
+      });
+      strippedArtifactBlocks++;
+      i = emcIdx;
     }
-    return opMatch;
-  });
+  }
 
-  return {
-    cleanedText: workingText,
-    removedCount: totalRemoved,
-  };
-}
+  // ------------------------------------------------------------------
+  // Tier B: Inspect `BT ... ET` blocks and `q ... Q` state wrappers
+  // ------------------------------------------------------------------
+  let activeFontKey: string | null = null;
+  const qStack: number[] = [];
 
-/**
- * Decodes, strips watermark text/operators, re-encodes with FlateDecode, and updates a single PDFRawStream.
- */
-function processSingleRawStream(
-  pdfDoc: PDFDocument,
-  rawStream: PDFRawStream,
-  streamRef: PDFRef | undefined,
-  targetKeywords: string[],
-  fontCMaps: Map<string, FontCMap>
-): { updatedStream: PDFRawStream | null; removedCount: number } {
-  try {
-    const decodedBytes = decodePDFRawStream(rawStream).decode();
-    const streamText = uint8ToLatin1(decodedBytes);
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (isRangeInsideAny(tok.start, tok.end, rangesToDelete)) continue;
 
-    const { cleanedText, removedCount } = stripWatermarkFromStreamText(
-      streamText,
-      targetKeywords,
-      fontCMaps
-    );
+    if (tok.kind === 'operator') {
+      if (tok.raw === 'q') {
+        qStack.push(i);
+        continue;
+      }
+      if (tok.raw === 'Q') {
+        qStack.pop();
+        continue;
+      }
+      if (tok.raw === 'Tf' && i >= 2 && tokens[i - 2].kind === 'name') {
+        activeFontKey = tokens[i - 2].raw;
+        continue;
+      }
+    }
 
-    if (removedCount > 0) {
-      const cleanedBytes = latin1ToUint8(cleanedText);
-      const newStream = pdfDoc.context.flateStream(cleanedBytes);
+    if (tok.kind === 'operator' && tok.raw === 'BT') {
+      // Find matching ET
+      let etIdx = -1;
+      for (let j = i + 1; j < tokens.length; j++) {
+        if (tokens[j].kind === 'operator' && tokens[j].raw === 'ET') {
+          etIdx = j;
+          break;
+        }
+      }
+      if (etIdx === -1) continue;
 
-      // Preserve Form XObject dictionary keys (such as /Type, /Subtype, /BBox, /Matrix, /Resources)
-      for (const key of rawStream.dict.keys()) {
-        const keyStr = key.asString();
-        if (keyStr !== '/Length' && keyStr !== '/Filter' && keyStr !== '/DecodeParms') {
-          const existingVal = rawStream.dict.get(key);
-          if (existingVal) {
-            newStream.dict.set(key, existingVal);
+      let blockFontKey: string | null = activeFontKey;
+      let totalTextOpsInBlock = 0;
+      let matchedSafeTextOpsInBlock = 0;
+      const opDeleteRanges: Array<{ start: number; end: number }> = [];
+      let concatenatedSafeText = '';
+      let blockUsesUnsafeFont = false;
+
+      for (let k = i + 1; k < etIdx; k++) {
+        const inner = tokens[k];
+        if (inner.kind === 'operator' && inner.raw === 'Tf' && k >= 2 && tokens[k - 2].kind === 'name') {
+          blockFontKey = tokens[k - 2].raw;
+          activeFontKey = blockFontKey;
+          continue;
+        }
+
+        if (
+          inner.kind === 'operator' &&
+          (inner.raw === 'Tj' || inner.raw === 'TJ' || inner.raw === "'" || inner.raw === '"')
+        ) {
+          const operandIdx = k - 1;
+          if (operandIdx <= i) continue;
+          const operandTok = tokens[operandIdx];
+          if (
+            operandTok.kind !== 'string' &&
+            operandTok.kind !== 'hexstring' &&
+            operandTok.kind !== 'array'
+          ) {
+            continue;
+          }
+
+          totalTextOpsInBlock++;
+          const fontInfo = blockFontKey ? pageFonts.get(blockFontKey) : undefined;
+          const isFontSafe = fontInfo ? fontInfo.safe : true;
+          const { text, hasHexOrBinary } = extractSafeAsciiFromOperand(operandTok);
+
+          if (!isFontSafe || hasHexOrBinary) {
+            blockUsesUnsafeFont = true;
+            const detailKey = `${pageIndex}:${fontInfo?.baseFont || blockFontKey || 'HexEncodedStream'}`;
+            if (!unsupportedMap.has(detailKey)) {
+              unsupportedMap.set(detailKey, {
+                pageIndex: pageIndex + 1,
+                fontName: fontInfo?.baseFont || (blockFontKey ? blockFontKey.replace('/', '') : 'CID/Hex Font'),
+                fontKind: fontInfo?.fontKind || 'Hex-Encoded Glyph Stream',
+              });
+            }
+            continue;
+          }
+
+          concatenatedSafeText += text;
+          if (matchesKeyword(text, targetKeywords)) {
+            matchedSafeTextOpsInBlock++;
+            const opStart =
+              inner.raw === '"' && k >= 3 ? tokens[k - 3].start : operandTok.start;
+            opDeleteRanges.push({ start: opStart, end: inner.end });
           }
         }
       }
 
-      if (streamRef instanceof PDFRef) {
-        pdfDoc.context.assign(streamRef, newStream);
+      // Check if individual safe operators matched, or if single-char positioned Tj calls form a keyword
+      const wholeBlockMatchedSafe =
+        !blockUsesUnsafeFont &&
+        totalTextOpsInBlock > 0 &&
+        (matchedSafeTextOpsInBlock === totalTextOpsInBlock ||
+          (matchedSafeTextOpsInBlock === 0 && matchesKeyword(concatenatedSafeText, targetKeywords)));
+
+      if (wholeBlockMatchedSafe) {
+        let delStart = tokens[i].start;
+        let delEnd = tokens[etIdx].end;
+
+        // Check if this BT...ET is wrapped in a dedicated graphics state `q ... Q` pair
+        // that only contains transformation matrices (`cm`) / graphics state (`gs`, `g`, `rg`, `G`, `RG`)
+        const enclosingQIdx = qStack.length > 0 ? qStack[qStack.length - 1] : -1;
+        if (enclosingQIdx !== -1) {
+          let matchingQEndIdx = -1;
+          let qDepth = 1;
+          for (let m = enclosingQIdx + 1; m < tokens.length; m++) {
+            if (tokens[m].kind === 'operator') {
+              if (tokens[m].raw === 'q') qDepth++;
+              else if (tokens[m].raw === 'Q') {
+                qDepth--;
+                if (qDepth === 0) {
+                  matchingQEndIdx = m;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (matchingQEndIdx > etIdx) {
+            let hasOtherDrawingOps = false;
+            for (let m = enclosingQIdx + 1; m < matchingQEndIdx; m++) {
+              if (m >= i && m <= etIdx) continue;
+              const t = tokens[m];
+              if (
+                t.kind === 'operator' &&
+                !['cm', 'gs', 'g', 'G', 'rg', 'RG', 'k', 'K', 'cs', 'CS', 'sc', 'SC', 'scn', 'SCN', 'w', 'J', 'j', 'M', 'd', 'ri', 'i'].includes(
+                  t.raw
+                )
+              ) {
+                hasOtherDrawingOps = true;
+                break;
+              }
+            }
+            if (!hasOtherDrawingOps) {
+              delStart = tokens[enclosingQIdx].start;
+              delEnd = tokens[matchingQEndIdx].end;
+            }
+          }
+        }
+
+        rangesToDelete.push({ start: delStart, end: delEnd });
+        strippedTextOps += Math.max(1, matchedSafeTextOpsInBlock);
+      } else if (matchedSafeTextOpsInBlock > 0) {
+        rangesToDelete.push(...opDeleteRanges);
+        strippedTextOps += matchedSafeTextOpsInBlock;
       }
 
-      return { updatedStream: newStream, removedCount };
+      i = etIdx;
     }
-  } catch {
-    // Ignore unreadable or non-standard binary streams
   }
 
-  return { updatedStream: null, removedCount: 0 };
+  if (rangesToDelete.length === 0) {
+    return {
+      cleanedBytes: null,
+      strippedArtifactBlocks: 0,
+      strippedTextOps: 0,
+      unsupportedDetails: Array.from(unsupportedMap.values()),
+    };
+  }
+
+  const cleanedBytes = spliceOutByteRanges(streamBytes, rangesToDelete);
+  return {
+    cleanedBytes,
+    strippedArtifactBlocks,
+    strippedTextOps,
+    unsupportedDetails: Array.from(unsupportedMap.values()),
+  };
 }
 
 /**
- * Iterates through all pages of `pdfDoc`, extracts raw content streams (`page.node.Contents`)
- * and Form XObject streams, decodes them, strips target watermark text-drawing operators
- * (`Tj`, `TJ`, `BDC...EMC`), and rebuilds/updates the streams in `pdfDoc`.
+ * Iterates through all pages of `pdfDoc`, inspects page content streams (`Contents`),
+ * applies Tier A (Marked-Content Watermark Artifacts) and Tier B (Safe Font Text Operators),
+ * and collects subset-font diagnostics when text cannot be safely parsed without corruption.
  */
 export function stripPdfPageContentStreams(
   pdfDoc: PDFDocument,
   targetKeywords: string[]
-): number {
+): StreamStripSummary {
   const normalizedKeywords = Array.from(
     new Set(
       targetKeywords
@@ -572,86 +398,92 @@ export function stripPdfPageContentStreams(
     )
   );
 
-  if (normalizedKeywords.length === 0) return 0;
+  let strippedArtifactBlocks = 0;
+  let strippedTextOps = 0;
+  const allUnsupported: PdfUnsupportedDetail[] = [];
 
-  let totalStrippedCount = 0;
   const pages = pdfDoc.getPages();
 
-  for (const page of pages) {
-    const pageNode = page.node;
+  for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
+    const pageNode = pages[pageIdx].node;
     const resources = pageNode.Resources();
-    const fontCMaps = extractResourcesFontCMaps(pdfDoc, resources);
+    const pageFonts = classifyPageFonts(pdfDoc, resources);
 
-    // 1. Clean Page Content Streams (page.node.Contents)
     const contentsEntry = pageNode.get(PDFName.of('Contents'));
     const contentsObj = pdfDoc.context.lookup(contentsEntry);
 
+    const streamEntries: Array<{ ref: PDFRef | undefined; stream: PDFRawStream; arrayIdx?: number }> = [];
+
     if (contentsObj instanceof PDFRawStream) {
-      const ref = contentsEntry instanceof PDFRef ? contentsEntry : undefined;
-      const { updatedStream, removedCount } = processSingleRawStream(
-        pdfDoc,
-        contentsObj,
-        ref,
-        normalizedKeywords,
-        fontCMaps
-      );
-      totalStrippedCount += removedCount;
-      if (updatedStream && !ref) {
-        pageNode.set(PDFName.of('Contents'), pdfDoc.context.register(updatedStream));
-      }
+      streamEntries.push({
+        ref: contentsEntry instanceof PDFRef ? contentsEntry : undefined,
+        stream: contentsObj,
+      });
     } else if (contentsObj instanceof PDFArray) {
       for (let i = 0; i < contentsObj.size(); i++) {
         const item = contentsObj.get(i);
-        const streamObj = pdfDoc.context.lookup(item);
-        if (streamObj instanceof PDFRawStream) {
-          const ref = item instanceof PDFRef ? item : undefined;
-          const { updatedStream, removedCount } = processSingleRawStream(
-            pdfDoc,
-            streamObj,
-            ref,
-            normalizedKeywords,
-            fontCMaps
-          );
-          totalStrippedCount += removedCount;
-          if (updatedStream && !ref) {
-            contentsObj.set(i, pdfDoc.context.register(updatedStream));
-          }
+        const lookedUp = pdfDoc.context.lookup(item);
+        if (lookedUp instanceof PDFRawStream) {
+          streamEntries.push({
+            ref: item instanceof PDFRef ? item : undefined,
+            stream: lookedUp,
+            arrayIdx: i,
+          });
         }
       }
     }
 
-    // 2. Also clean any Form XObject content streams (/Subtype /Form) referenced on the page
-    if (resources instanceof PDFDict) {
-      const xObjectsEntry = resources.get(PDFName.of('XObject'));
-      const xObjDict = pdfDoc.context.lookup(xObjectsEntry);
-      if (xObjDict instanceof PDFDict) {
-        for (const key of xObjDict.keys()) {
-          const xObjRef = xObjDict.get(key);
-          const xObj = pdfDoc.context.lookup(xObjRef);
-          if (xObj instanceof PDFRawStream) {
-            const subtype = xObj.dict.get(PDFName.of('Subtype'));
-            if (subtype instanceof PDFName && subtype.asString() === '/Form') {
-              const formResources = pdfDoc.context.lookup(xObj.dict.get(PDFName.of('Resources')));
-              const mergedCMaps = extractResourcesFontCMaps(
-                pdfDoc,
-                formResources instanceof PDFDict ? formResources : undefined,
-                new Map(fontCMaps)
-              );
-              const ref = xObjRef instanceof PDFRef ? xObjRef : undefined;
-              const { removedCount } = processSingleRawStream(
-                pdfDoc,
-                xObj,
-                ref,
-                normalizedKeywords,
-                mergedCMaps
-              );
-              totalStrippedCount += removedCount;
-            }
+    for (const entry of streamEntries) {
+      let decodedBytes: Uint8Array;
+      try {
+        decodedBytes = decodePDFRawStream(entry.stream).decode();
+      } catch {
+        continue;
+      }
+
+      const analysis = analyzeAndStripContentStream(
+        decodedBytes,
+        normalizedKeywords,
+        pageFonts,
+        pageIdx
+      );
+
+      strippedArtifactBlocks += analysis.strippedArtifactBlocks;
+      strippedTextOps += analysis.strippedTextOps;
+      for (const detail of analysis.unsupportedDetails) {
+        if (
+          !allUnsupported.some(
+            (d) => d.pageIndex === detail.pageIndex && d.fontName === detail.fontName
+          )
+        ) {
+          allUnsupported.push(detail);
+        }
+      }
+
+      if (analysis.cleanedBytes) {
+        const newStream = pdfDoc.context.flateStream(analysis.cleanedBytes);
+        for (const key of entry.stream.dict.keys()) {
+          const keyName = key.asString();
+          if (keyName !== '/Length' && keyName !== '/Filter' && keyName !== '/DecodeParms') {
+            const existing = entry.stream.dict.get(key);
+            if (existing) newStream.dict.set(key, existing);
           }
+        }
+
+        if (entry.ref) {
+          pdfDoc.context.assign(entry.ref, newStream);
+        } else if (contentsObj instanceof PDFArray && entry.arrayIdx !== undefined) {
+          contentsObj.set(entry.arrayIdx, pdfDoc.context.register(newStream));
+        } else {
+          pageNode.set(PDFName.of('Contents'), pdfDoc.context.register(newStream));
         }
       }
     }
   }
 
-  return totalStrippedCount;
+  return {
+    strippedArtifactBlocks,
+    strippedTextOps,
+    unsupportedDetails: allUnsupported,
+  };
 }

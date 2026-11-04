@@ -1,9 +1,10 @@
-import React, { useRef, useState, useEffect, useCallback } from 'react';
+import React, { useRef, useState, useEffect, useCallback, useReducer } from 'react';
 import {
   Upload,
   Brush,
   Eraser,
   Undo2,
+  Redo2,
   RotateCcw,
   Sparkles,
   Download,
@@ -11,9 +12,13 @@ import {
   Loader2,
   Sliders,
   Image as ImageIcon,
+  Cpu,
 } from 'lucide-react';
 import { detectWatermarkRegions } from '../../utils/imageWatermarkDetector';
+import { rgbaMaskHasPaint } from '../../utils/inpaintImageOps';
 import { useWatermarkRemover } from '../../hooks/useWatermarkRemover';
+import { editorReducer, deriveEditorUi } from './imageEditorMachine';
+import { WatermarkToast } from './WatermarkToast';
 
 interface ImageWatermarkViewProps {
   isCompact?: boolean;
@@ -23,120 +28,194 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
   const [imageFile, setImageFile] = useState<File | null>(null);
   const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number } | null>(null);
 
-  // Tools state
+  // Explicit Deterministic Finite State Machine: IDLE | PAINTING | PROCESSING | DONE
+  const [editorState, dispatch] = useReducer(editorReducer, 'IDLE');
+  const ui = deriveEditorUi(editorState);
+
+  // Brush / Eraser configuration
   const [toolMode, setToolMode] = useState<'brush' | 'eraser'>('brush');
-  const [brushSize, setBrushSize] = useState<number>(24);
-  const [hasInpainted, setHasInpainted] = useState<boolean>(false);
+  const [brushSize, setBrushSize] = useState<number>(28);
   const [isComparing, setIsComparing] = useState<boolean>(false);
   const [autoDetectedCount, setAutoDetectedCount] = useState<number | null>(null);
-  const [historyCount, setHistoryCount] = useState<number>(0);
+  const [historyState, setHistoryState] = useState<{ canUndo: boolean; canRedo: boolean }>({
+    canUndo: false,
+    canRedo: false,
+  });
 
+  // ONNX Web Worker & Cache API Hook
   const {
-    isProcessing,
-    processProgress,
+    model,
+    modelStatus,
     aiModelProgress,
     isAiModelCached,
-    isAiModelLoading,
-    executeInpaint,
+    backend,
+    inferenceProgress,
+    notice,
+    dismissNotice,
+    preloadModel,
+    runInpaint,
   } = useWatermarkRemover();
 
-  // Canvas refs
+  // Canvas & image buffer refs
   const containerRef = useRef<HTMLDivElement>(null);
   const baseCanvasRef = useRef<HTMLCanvasElement>(null);
   const maskCanvasRef = useRef<HTMLCanvasElement>(null);
-  const originalImageDataRef = useRef<ImageData | null>(null);
-  const inpaintedImageDataRef = useRef<ImageData | null>(null);
+  const firstOriginalImageDataRef = useRef<ImageData | null>(null);
+  const committedBaseImageDataRef = useRef<ImageData | null>(null);
+  const latestResultImageDataRef = useRef<ImageData | null>(null);
 
-  // Undo history stack for mask canvas (stores ImageData snapshots of mask)
-  const maskHistoryRef = useRef<ImageData[]>([]);
+  // Undo & Redo stacks for the mask layer
+  const maskUndoStackRef = useRef<ImageData[]>([]);
+  const maskRedoStackRef = useRef<ImageData[]>([]);
   const isDrawingRef = useRef<boolean>(false);
   const lastPosRef = useRef<{ x: number; y: number } | null>(null);
 
-  // Save current mask state to undo stack
-  const saveMaskSnapshot = useCallback(() => {
+  const syncHistoryFlags = useCallback(() => {
+    setHistoryState({
+      canUndo: maskUndoStackRef.current.length > 1,
+      canRedo: maskRedoStackRef.current.length > 0,
+    });
+  }, []);
+
+  // Inspect current mask canvas and dispatch MASK_CHANGED to the FSM
+  const evaluateMaskAndDispatch = useCallback(() => {
     const maskCanvas = maskCanvasRef.current;
     if (!maskCanvas) return;
-    const ctx = maskCanvas.getContext('2d');
+    const ctx = maskCanvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return;
+    const data = ctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+    const hasMask = rgbaMaskHasPaint(data.data);
+    dispatch({ type: 'MASK_CHANGED', hasMask });
+  }, []);
+
+  // Push current mask snapshot onto Undo stack and clear Redo stack
+  const recordMaskSnapshot = useCallback(() => {
+    const maskCanvas = maskCanvasRef.current;
+    if (!maskCanvas) return;
+    const ctx = maskCanvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
     const snapshot = ctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
-    maskHistoryRef.current.push(snapshot);
-    if (maskHistoryRef.current.length > 20) {
-      maskHistoryRef.current.shift();
+    maskUndoStackRef.current.push(snapshot);
+    if (maskUndoStackRef.current.length > 25) {
+      maskUndoStackRef.current.shift();
     }
-    setHistoryCount(maskHistoryRef.current.length);
-  }, []);
+    maskRedoStackRef.current = [];
+    syncHistoryFlags();
+    const hasMask = rgbaMaskHasPaint(snapshot.data);
+    dispatch({ type: 'MASK_CHANGED', hasMask });
+  }, [syncHistoryFlags]);
 
-  // Handle Undo
+  // Undo mask stroke
   const handleUndo = useCallback(() => {
+    if (!ui.toolsEnabled) return;
     const maskCanvas = maskCanvasRef.current;
-    if (!maskCanvas || maskHistoryRef.current.length <= 1) return;
-    const ctx = maskCanvas.getContext('2d');
+    if (!maskCanvas || maskUndoStackRef.current.length <= 1) return;
+    const ctx = maskCanvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
 
-    // Pop current and restore previous
-    maskHistoryRef.current.pop();
-    const previous = maskHistoryRef.current[maskHistoryRef.current.length - 1];
+    const current = maskUndoStackRef.current.pop();
+    if (current) {
+      maskRedoStackRef.current.push(current);
+    }
+    const previous = maskUndoStackRef.current[maskUndoStackRef.current.length - 1];
     if (previous) {
       ctx.putImageData(previous, 0, 0);
+      const hasMask = rgbaMaskHasPaint(previous.data);
+      dispatch({ type: 'MASK_CHANGED', hasMask });
     }
-    setHistoryCount(maskHistoryRef.current.length);
-  }, []);
+    syncHistoryFlags();
+  }, [syncHistoryFlags, ui.toolsEnabled]);
 
-  // Handle Reset Mask
-  const handleResetMask = useCallback(() => {
+  // Redo mask stroke
+  const handleRedo = useCallback(() => {
+    if (!ui.toolsEnabled) return;
+    const maskCanvas = maskCanvasRef.current;
+    if (!maskCanvas || maskRedoStackRef.current.length === 0) return;
+    const ctx = maskCanvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return;
+
+    const next = maskRedoStackRef.current.pop();
+    if (next) {
+      maskUndoStackRef.current.push(next);
+      ctx.putImageData(next, 0, 0);
+      const hasMask = rgbaMaskHasPaint(next.data);
+      dispatch({ type: 'MASK_CHANGED', hasMask });
+    }
+    syncHistoryFlags();
+  }, [syncHistoryFlags, ui.toolsEnabled]);
+
+  // Clear mask completely -> transitions PAINTING back to IDLE
+  const handleClearMask = useCallback(() => {
+    if (!ui.toolsEnabled) return;
     const maskCanvas = maskCanvasRef.current;
     if (!maskCanvas) return;
-    const ctx = maskCanvas.getContext('2d');
+    const ctx = maskCanvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return;
+
     ctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-    maskHistoryRef.current = [];
-    saveMaskSnapshot();
+    const blank = ctx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+    maskUndoStackRef.current = [blank];
+    maskRedoStackRef.current = [];
+    syncHistoryFlags();
     setAutoDetectedCount(null);
-  }, [saveMaskSnapshot]);
+    dispatch({ type: 'MASK_CHANGED', hasMask: false });
+  }, [syncHistoryFlags, ui.toolsEnabled]);
 
-  // Load new image
-  const loadImage = useCallback((file: File) => {
-    setImageFile(file);
-    setHasInpainted(false);
-    setAutoDetectedCount(null);
-    inpaintedImageDataRef.current = null;
+  // Load new image file and initialize FSM to IDLE
+  const loadImage = useCallback(
+    (file: File) => {
+      setImageFile(file);
+      setIsComparing(false);
+      setAutoDetectedCount(null);
+      latestResultImageDataRef.current = null;
+      dispatch({ type: 'IMAGE_LOADED' });
 
-    const img = new Image();
-    const url = URL.createObjectURL(file);
+      // Start warming up / checking the cached ONNX model in the background
+      preloadModel();
 
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      const width = img.naturalWidth;
-      const height = img.naturalHeight;
-      setImageDimensions({ width, height });
+      const img = new Image();
+      const url = URL.createObjectURL(file);
 
-      const baseCanvas = baseCanvasRef.current;
-      const maskCanvas = maskCanvasRef.current;
-      if (!baseCanvas || !maskCanvas) return;
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const width = img.naturalWidth;
+        const height = img.naturalHeight;
+        setImageDimensions({ width, height });
 
-      baseCanvas.width = width;
-      baseCanvas.height = height;
-      maskCanvas.width = width;
-      maskCanvas.height = height;
+        const baseCanvas = baseCanvasRef.current;
+        const maskCanvas = maskCanvasRef.current;
+        if (!baseCanvas || !maskCanvas) return;
 
-      const baseCtx = baseCanvas.getContext('2d', { willReadFrequently: true });
-      const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
-      if (!baseCtx || !maskCtx) return;
+        baseCanvas.width = width;
+        baseCanvas.height = height;
+        maskCanvas.width = width;
+        maskCanvas.height = height;
 
-      baseCtx.drawImage(img, 0, 0);
-      originalImageDataRef.current = baseCtx.getImageData(0, 0, width, height);
+        const baseCtx = baseCanvas.getContext('2d', { willReadFrequently: true });
+        const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+        if (!baseCtx || !maskCtx) return;
 
-      maskCtx.clearRect(0, 0, width, height);
-      maskHistoryRef.current = [maskCtx.getImageData(0, 0, width, height)];
-      setHistoryCount(1);
-    };
+        baseCtx.drawImage(img, 0, 0);
+        const initialData = baseCtx.getImageData(0, 0, width, height);
+        firstOriginalImageDataRef.current = initialData;
+        committedBaseImageDataRef.current = initialData;
 
-    img.src = url;
-  }, []);
+        maskCtx.clearRect(0, 0, width, height);
+        const blankMask = maskCtx.getImageData(0, 0, width, height);
+        maskUndoStackRef.current = [blankMask];
+        maskRedoStackRef.current = [];
+        syncHistoryFlags();
+      };
 
-  // File drop handler
+      img.src = url;
+    },
+    [preloadModel, syncHistoryFlags]
+  );
+
+  // Dropzone handler
   const handleFileDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
+    if (!ui.toolsEnabled) return;
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const file = e.dataTransfer.files[0];
       if (file.type.startsWith('image/')) {
@@ -145,9 +224,10 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
     }
   };
 
-  // Clipboard paste handler
+  // Clipboard paste handler (disabled during PROCESSING)
   useEffect(() => {
     const handlePaste = (e: ClipboardEvent) => {
+      if (!ui.toolsEnabled) return;
       if (e.clipboardData?.files && e.clipboardData.files.length > 0) {
         const file = e.clipboardData.files[0];
         if (file.type.startsWith('image/')) {
@@ -157,10 +237,12 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
     };
     window.addEventListener('paste', handlePaste);
     return () => window.removeEventListener('paste', handlePaste);
-  }, [loadImage]);
+  }, [loadImage, ui.toolsEnabled]);
 
-  // Coordinate mapping from client mouse event to native canvas coordinates
-  const getCanvasCoordinates = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
+  // Coordinate mapping from mouse / touch to native canvas coordinates
+  const getCanvasCoordinates = (
+    e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>
+  ) => {
     const canvas = maskCanvasRef.current;
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
@@ -187,31 +269,22 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
     };
   };
 
-  // Drawing strokes
-  const startDrawing = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
-    if (isProcessing) return;
-    const pos = getCanvasCoordinates(e);
-    if (!pos) return;
-
-    isDrawingRef.current = true;
-    lastPosRef.current = pos;
-    drawStroke(pos.x, pos.y, pos.x, pos.y);
-  };
-
-  const drawStroke = (x1: number, y1: number, x2: number, y2: number) => {
+  const drawStroke = (x1: number, y1: number, x2: number, y2: number, modeOverride?: 'brush' | 'eraser') => {
     const maskCanvas = maskCanvasRef.current;
     if (!maskCanvas) return;
     const ctx = maskCanvas.getContext('2d');
     if (!ctx) return;
+
+    const activeMode = modeOverride ?? toolMode;
 
     ctx.save();
     ctx.lineWidth = brushSize;
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
 
-    if (toolMode === 'brush') {
+    if (activeMode === 'brush') {
       ctx.globalCompositeOperation = 'source-over';
-      ctx.strokeStyle = 'rgba(236, 72, 153, 0.55)'; // Neon Pink mask
+      ctx.strokeStyle = 'rgba(236, 72, 153, 0.58)';
     } else {
       ctx.globalCompositeOperation = 'destination-out';
       ctx.strokeStyle = 'rgba(0, 0, 0, 1)';
@@ -224,8 +297,63 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
     ctx.restore();
   };
 
-  const moveDrawing = (e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>) => {
-    if (!isDrawingRef.current || isProcessing) return;
+  // Start painting on mask canvas
+  // Crucial FSM requirement: If user paints while in DONE, commit current result as base,
+  // reset mask layer, and immediately transition to PAINTING.
+  const startDrawing = (
+    e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>
+  ) => {
+    if (!ui.canvasInteractive) return;
+    const pos = getCanvasCoordinates(e);
+    if (!pos) return;
+
+    let effectiveMode = toolMode;
+
+    if (editorState === 'DONE') {
+      const baseCanvas = baseCanvasRef.current;
+      const maskCanvas = maskCanvasRef.current;
+      if (baseCanvas && maskCanvas) {
+        const baseCtx = baseCanvas.getContext('2d', { willReadFrequently: true });
+        const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+        if (baseCtx && maskCtx) {
+          if (latestResultImageDataRef.current) {
+            baseCtx.putImageData(latestResultImageDataRef.current, 0, 0);
+            committedBaseImageDataRef.current = latestResultImageDataRef.current;
+          } else {
+            committedBaseImageDataRef.current = baseCtx.getImageData(
+              0,
+              0,
+              baseCanvas.width,
+              baseCanvas.height
+            );
+          }
+          maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+          const freshBlank = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+          maskUndoStackRef.current = [freshBlank];
+          maskRedoStackRef.current = [];
+          syncHistoryFlags();
+        }
+      }
+      // Switch to brush if user was on eraser when starting a new pass from DONE
+      if (toolMode === 'eraser') {
+        setToolMode('brush');
+        effectiveMode = 'brush';
+      }
+    }
+
+    isDrawingRef.current = true;
+    lastPosRef.current = pos;
+    drawStroke(pos.x, pos.y, pos.x, pos.y, effectiveMode);
+
+    if (effectiveMode === 'brush') {
+      dispatch({ type: 'MASK_CHANGED', hasMask: true });
+    }
+  };
+
+  const moveDrawing = (
+    e: React.MouseEvent<HTMLCanvasElement> | React.TouchEvent<HTMLCanvasElement>
+  ) => {
+    if (!isDrawingRef.current || !ui.canvasInteractive) return;
     const pos = getCanvasCoordinates(e);
     if (!pos || !lastPosRef.current) return;
 
@@ -237,82 +365,162 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
     if (isDrawingRef.current) {
       isDrawingRef.current = false;
       lastPosRef.current = null;
-      saveMaskSnapshot();
+      recordMaskSnapshot();
     }
   };
 
-  // Auto-Detect Watermark using Sobel edge density
+  // Auto-Detect Watermark Regions
   const handleAutoDetect = () => {
-    if (!baseCanvasRef.current || !maskCanvasRef.current) return;
-    const baseCtx = baseCanvasRef.current.getContext('2d');
-    const maskCtx = maskCanvasRef.current.getContext('2d');
+    if (!ui.toolsEnabled || !baseCanvasRef.current || !maskCanvasRef.current) return;
+    const baseCanvas = baseCanvasRef.current;
+    const maskCanvas = maskCanvasRef.current;
+    const baseCtx = baseCanvas.getContext('2d', { willReadFrequently: true });
+    const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
     if (!baseCtx || !maskCtx) return;
 
-    const baseData = baseCtx.getImageData(0, 0, baseCanvasRef.current.width, baseCanvasRef.current.height);
+    // If running Auto-Detect from DONE, commit the current result as the new base first
+    if (editorState === 'DONE' && latestResultImageDataRef.current) {
+      baseCtx.putImageData(latestResultImageDataRef.current, 0, 0);
+      committedBaseImageDataRef.current = latestResultImageDataRef.current;
+    }
+
+    const baseData = baseCtx.getImageData(0, 0, baseCanvas.width, baseCanvas.height);
     const { boxes, maskImageData } = detectWatermarkRegions(baseData);
 
     if (boxes.length === 0) {
       setAutoDetectedCount(0);
+      evaluateMaskAndDispatch();
       return;
     }
 
-    // Overlay auto-detected mask onto existing mask canvas
     maskCtx.putImageData(maskImageData, 0, 0);
-    saveMaskSnapshot();
+    recordMaskSnapshot();
     setAutoDetectedCount(boxes.length);
   };
 
-  // Execute Telea / ONNX Inpainting via Web Worker hook (with synchronous fallback)
+  // Execute ONNX AI Inpainting (transitions PAINTING -> PROCESSING -> DONE or back to PAINTING on error)
   const handleExecuteInpaint = async () => {
-    if (!baseCanvasRef.current || !maskCanvasRef.current || !originalImageDataRef.current) return;
+    if (editorState !== 'PAINTING') return;
     const baseCanvas = baseCanvasRef.current;
     const maskCanvas = maskCanvasRef.current;
-    const baseCtx = baseCanvas.getContext('2d');
-    const maskCtx = maskCanvas.getContext('2d');
+    if (!baseCanvas || !maskCanvas) return;
+
+    const baseCtx = baseCanvas.getContext('2d', { willReadFrequently: true });
+    const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
     if (!baseCtx || !maskCtx) return;
 
-    const currentBase = baseCtx.getImageData(0, 0, baseCanvas.width, baseCanvas.height);
+    const currentBase =
+      committedBaseImageDataRef.current ??
+      baseCtx.getImageData(0, 0, baseCanvas.width, baseCanvas.height);
     const currentMask = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
 
-    const cleanedData = await executeInpaint(currentBase, currentMask, 6);
-    baseCtx.putImageData(cleanedData, 0, 0);
-    inpaintedImageDataRef.current = cleanedData;
-    setHasInpainted(true);
-    // Clear mask so user can review output directly
-    maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-    saveMaskSnapshot();
+    dispatch({ type: 'INPAINT_STARTED' });
+
+    try {
+      const resultImageData = await runInpaint(currentBase, currentMask);
+      baseCtx.putImageData(resultImageData, 0, 0);
+      latestResultImageDataRef.current = resultImageData;
+      committedBaseImageDataRef.current = resultImageData;
+
+      // Clear mask layer upon entering DONE
+      maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+      const blankMask = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
+      maskUndoStackRef.current = [blankMask];
+      maskRedoStackRef.current = [];
+      syncHistoryFlags();
+      setAutoDetectedCount(null);
+
+      dispatch({ type: 'INPAINT_SUCCEEDED' });
+    } catch {
+      dispatch({ type: 'INPAINT_FAILED' });
+    }
   };
 
-  // Download cleaned image
+  // Download result matching source image format (PNG, JPEG, or WebP)
   const handleDownloadResult = () => {
-    if (!baseCanvasRef.current || !imageFile) return;
-    const link = document.createElement('a');
+    if (editorState !== 'DONE' || !baseCanvasRef.current || !imageFile) return;
+    const canvas = baseCanvasRef.current;
+
+    const srcType = imageFile.type.toLowerCase();
+    let targetMime = 'image/png';
+    let ext = 'png';
+    if (srcType === 'image/jpeg' || srcType === 'image/jpg') {
+      targetMime = 'image/jpeg';
+      ext = 'jpg';
+    } else if (srcType === 'image/webp') {
+      targetMime = 'image/webp';
+      ext = 'webp';
+    }
+
     const nameWithoutExt = imageFile.name.replace(/\.[^/.]+$/, '');
-    link.download = `${nameWithoutExt}_no_watermark.png`;
-    link.href = baseCanvasRef.current.toDataURL('image/png');
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const filename = `${nameWithoutExt}_no_watermark.${ext}`;
+
+    canvas.toBlob(
+      (blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      },
+      targetMime,
+      0.95
+    );
   };
 
-  // Compare toggle (mouse down / touch start switches to original)
+  // Hold-to-Compare in DONE state (pressing shows original image, releasing shows inpainted result)
   const handleCompareStart = () => {
-    if (!hasInpainted || !originalImageDataRef.current || !baseCanvasRef.current) return;
+    if (editorState !== 'DONE' || !firstOriginalImageDataRef.current || !baseCanvasRef.current) return;
     setIsComparing(true);
     const ctx = baseCanvasRef.current.getContext('2d');
-    if (ctx) ctx.putImageData(originalImageDataRef.current, 0, 0);
+    if (ctx) ctx.putImageData(firstOriginalImageDataRef.current, 0, 0);
   };
 
   const handleCompareEnd = () => {
-    if (!hasInpainted || !inpaintedImageDataRef.current || !baseCanvasRef.current) return;
+    if (editorState !== 'DONE' || !latestResultImageDataRef.current || !baseCanvasRef.current) return;
     setIsComparing(false);
     const ctx = baseCanvasRef.current.getContext('2d');
-    if (ctx) ctx.putImageData(inpaintedImageDataRef.current, 0, 0);
+    if (ctx) ctx.putImageData(latestResultImageDataRef.current, 0, 0);
   };
+
+  const handleResetImage = () => {
+    if (!ui.toolsEnabled) return;
+    setImageFile(null);
+    setImageDimensions(null);
+    setAutoDetectedCount(null);
+    setIsComparing(false);
+    firstOriginalImageDataRef.current = null;
+    committedBaseImageDataRef.current = null;
+    latestResultImageDataRef.current = null;
+    maskUndoStackRef.current = [];
+    maskRedoStackRef.current = [];
+    dispatch({ type: 'RESET' });
+  };
+
+  const displayProgress =
+    modelStatus === 'downloading'
+      ? aiModelProgress
+      : inferenceProgress > 0
+      ? inferenceProgress
+      : aiModelProgress;
 
   return (
     <div className={`space-y-6 ${isCompact ? 'p-1' : ''}`}>
-      {/* Upload Dropzone (if no image loaded) */}
+      {/* Toast Notification for WebGPU->WASM fallback or model download errors */}
+      {notice && (
+        <WatermarkToast
+          id={notice.id}
+          tone={notice.tone}
+          message={notice.message}
+          onDismiss={dismissNotice}
+        />
+      )}
+
+      {/* Upload Dropzone (when no image is loaded) */}
       {!imageFile ? (
         <div
           onDragOver={(e) => e.preventDefault()}
@@ -333,10 +541,14 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
             <Upload className="w-8 h-8" />
           </div>
           <h3 className="text-base sm:text-lg font-bold text-slate-900 dark:text-white mb-1">
-            Kéo thả ảnh cần xóa Watermark vào đây
+            Kéo thả ảnh cần xóa Watermark bằng AI vào đây
           </h3>
           <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mb-4 max-w-md mx-auto">
-            Hỗ trợ PNG, JPG, WebP. Hoặc nhấn phím <kbd className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono text-xs">Ctrl + V</kbd> để dán ảnh trực tiếp từ clipboard.
+            Hỗ trợ PNG, JPG, WebP. Hoặc nhấn phím{' '}
+            <kbd className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 font-mono text-xs">
+              Ctrl + V
+            </kbd>{' '}
+            để dán ảnh trực tiếp từ clipboard.
           </p>
           <button
             type="button"
@@ -346,7 +558,7 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
           </button>
         </div>
       ) : (
-        /* Dual-Canvas Editor Workspace */
+        /* Dual-Canvas Editor Workspace controlled by Strict FSM */
         <div className="space-y-4">
           {/* Top Control Toolbar */}
           <div className="flex flex-wrap items-center justify-between gap-3 p-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm">
@@ -355,8 +567,9 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
               <div className="flex items-center p-1 rounded-xl bg-slate-100 dark:bg-slate-950 border border-slate-200 dark:border-slate-800">
                 <button
                   type="button"
+                  disabled={!ui.toolsEnabled}
                   onClick={() => setToolMode('brush')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                     toolMode === 'brush'
                       ? 'bg-pink-500 text-white shadow-sm'
                       : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
@@ -367,8 +580,9 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
                 </button>
                 <button
                   type="button"
+                  disabled={!ui.toolsEnabled}
                   onClick={() => setToolMode('eraser')}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer ${
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
                     toolMode === 'eraser'
                       ? 'bg-pink-500 text-white shadow-sm'
                       : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
@@ -387,129 +601,157 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
                   type="range"
                   min="5"
                   max="100"
+                  disabled={!ui.toolsEnabled}
                   value={brushSize}
                   onChange={(e) => setBrushSize(parseInt(e.target.value, 10))}
-                  className="w-20 sm:w-28 accent-pink-500 cursor-pointer"
+                  className="w-20 sm:w-28 accent-pink-500 cursor-pointer disabled:opacity-40"
                 />
-                <span className="font-mono text-slate-700 dark:text-slate-300 w-7">{brushSize}px</span>
+                <span className="font-mono text-slate-700 dark:text-slate-300 w-8">{brushSize}px</span>
               </div>
 
-              {/* Auto-Detect Button */}
+              {/* Auto-Detect Watermark Button */}
               <button
                 type="button"
                 onClick={handleAutoDetect}
-                disabled={isProcessing}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-pink-500/10 hover:bg-pink-500/20 text-pink-600 dark:text-pink-400 border border-pink-500/20 text-xs font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                disabled={!ui.toolsEnabled}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-pink-500/10 hover:bg-pink-500/20 text-pink-600 dark:text-pink-400 border border-pink-500/20 text-xs font-semibold transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <Sparkles className="w-3.5 h-3.5" />
                 <span>Tự động dò Watermark</span>
               </button>
 
-              {/* Undo Button */}
-              <button
-                type="button"
-                onClick={handleUndo}
-                disabled={isProcessing || historyCount <= 1}
-                className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 transition-colors disabled:opacity-40 cursor-pointer"
-                title="Hoàn tác (Undo)"
-              >
-                <Undo2 className="w-4 h-4" />
-              </button>
-
-              {/* Reset Mask Button */}
-              <button
-                type="button"
-                onClick={handleResetMask}
-                disabled={isProcessing}
-                className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 transition-colors disabled:opacity-40 cursor-pointer"
-                title="Đặt lại nét vẽ"
-              >
-                <RotateCcw className="w-4 h-4" />
-              </button>
-            </div>
-
-            {/* Action Buttons: Compare, Inpaint & Download */}
-            <div className="flex items-center gap-2">
-              {(isAiModelLoading || aiModelProgress > 0) && (
-                <div
-                  className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-[11px] font-mono text-slate-600 dark:text-slate-400"
-                  title="Trạng thái bộ nhớ đệm mô hình AI ONNX (Browser Cache API)"
-                >
-                  <Sparkles className="w-3 h-3 text-pink-500" />
-                  <span>
-                    {isAiModelCached
-                      ? `AI Cache: Sẵn sàng (${aiModelProgress}%)`
-                      : `AI Model: ${aiModelProgress}%`}
-                  </span>
+              {/* Undo / Redo / Clear Mask Controls (Shown in PAINTING state) */}
+              {ui.showHistoryControls && (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleUndo}
+                    disabled={!ui.toolsEnabled || !historyState.canUndo}
+                    className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 transition-colors disabled:opacity-40 cursor-pointer"
+                    title="Hoàn tác (Undo)"
+                  >
+                    <Undo2 className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleRedo}
+                    disabled={!ui.toolsEnabled || !historyState.canRedo}
+                    className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 transition-colors disabled:opacity-40 cursor-pointer"
+                    title="Làm lại (Redo)"
+                  >
+                    <Redo2 className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleClearMask}
+                    disabled={!ui.toolsEnabled}
+                    className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-600 dark:text-slate-300 transition-colors disabled:opacity-40 cursor-pointer"
+                    title="Xóa toàn bộ vùng chọn (Clear Mask)"
+                  >
+                    <RotateCcw className="w-4 h-4" />
+                  </button>
                 </div>
               )}
+            </div>
 
-              {hasInpainted && (
-                <button
-                  type="button"
-                  onMouseDown={handleCompareStart}
-                  onMouseUp={handleCompareEnd}
-                  onMouseLeave={handleCompareEnd}
-                  onTouchStart={handleCompareStart}
-                  onTouchEnd={handleCompareEnd}
-                  className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-colors select-none cursor-pointer ${
-                    isComparing
-                      ? 'bg-amber-500 text-white'
-                      : 'bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300'
-                  }`}
-                >
-                  <Eye className="w-3.5 h-3.5" />
-                  <span>{isComparing ? 'Đang xem ảnh gốc' : 'Giữ để so sánh'}</span>
-                </button>
-              )}
+            {/* Right Action Area: Strictly governed by FSM state (IDLE | PAINTING | PROCESSING | DONE) */}
+            <div className="flex items-center gap-2">
+              {/* ONNX AI Model Cache Status Badge */}
+              <div
+                className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-[11px] font-mono text-slate-600 dark:text-slate-400"
+                title={`Mô hình ${model.label} • Bộ nhớ đệm Cache API`}
+              >
+                <Cpu className="w-3.5 h-3.5 text-pink-500" />
+                <span>
+                  {modelStatus === 'ready'
+                    ? `AI sẵn sàng · ${(backend || 'wasm').toUpperCase()}`
+                    : modelStatus === 'downloading'
+                    ? `Tải AI: ${aiModelProgress}%`
+                    : isAiModelCached
+                    ? 'AI Cache: Sẵn sàng'
+                    : model.label}
+                </span>
+              </div>
 
-              {hasInpainted ? (
-                <button
-                  type="button"
-                  onClick={handleDownloadResult}
-                  className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold shadow-md shadow-emerald-500/20 transition-all active:scale-95 cursor-pointer"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Tải ảnh đã xóa</span>
-                </button>
-              ) : (
+              {/* IDLE or PAINTING: Show "Xóa Watermark" (Disabled in IDLE, Enabled in PAINTING) */}
+              {ui.showInpaintButton && (
                 <button
                   type="button"
                   onClick={handleExecuteInpaint}
-                  disabled={isProcessing}
-                  className="flex items-center gap-2 px-5 py-2 rounded-xl bg-pink-500 hover:bg-pink-600 text-white text-xs font-bold shadow-md shadow-pink-500/20 transition-all active:scale-95 cursor-pointer disabled:opacity-50"
+                  disabled={!ui.inpaintEnabled}
+                  className={`flex items-center gap-2 px-5 py-2 rounded-xl text-xs font-bold transition-all ${
+                    ui.inpaintEnabled
+                      ? 'bg-pink-500 hover:bg-pink-600 text-white shadow-md shadow-pink-500/20 active:scale-95 cursor-pointer'
+                      : 'bg-slate-200 dark:bg-slate-800 text-slate-400 dark:text-slate-500 cursor-not-allowed opacity-70'
+                  }`}
                 >
-                  {isProcessing ? (
-                    <>
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      <span>Đang xử lý ({processProgress}%)...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Eraser className="w-3.5 h-3.5" />
-                      <span>Xóa Watermark</span>
-                    </>
-                  )}
+                  <Eraser className="w-3.5 h-3.5" />
+                  <span>Xóa Watermark</span>
                 </button>
               )}
 
+              {/* PROCESSING: Replace action button with loading spinner */}
+              {ui.showProcessing && (
+                <button
+                  type="button"
+                  disabled
+                  className="flex items-center gap-2 px-5 py-2 rounded-xl bg-pink-500/80 text-white text-xs font-bold opacity-90 cursor-wait"
+                >
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  <span>Đang xóa Watermark... ({displayProgress}%)</span>
+                </button>
+              )}
+
+              {/* DONE: Reveal ONLY "Giữ để so sánh" and "Tải ảnh đã xóa" */}
+              {ui.showResultActions && (
+                <>
+                  <button
+                    type="button"
+                    onMouseDown={handleCompareStart}
+                    onMouseUp={handleCompareEnd}
+                    onMouseLeave={handleCompareEnd}
+                    onTouchStart={handleCompareStart}
+                    onTouchEnd={handleCompareEnd}
+                    className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold transition-colors select-none cursor-pointer ${
+                      isComparing
+                        ? 'bg-amber-500 text-white'
+                        : 'bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300'
+                    }`}
+                  >
+                    <Eye className="w-3.5 h-3.5" />
+                    <span>{isComparing ? 'Đang xem ảnh gốc' : 'Giữ để so sánh'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleDownloadResult}
+                    className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-600 text-white text-xs font-bold shadow-md shadow-emerald-500/20 transition-all active:scale-95 cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Tải ảnh đã xóa</span>
+                  </button>
+                </>
+              )}
+
+              {/* Change Image Button */}
               <button
                 type="button"
-                onClick={() => setImageFile(null)}
-                className="px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 text-xs font-medium transition-colors cursor-pointer"
+                disabled={!ui.toolsEnabled}
+                onClick={handleResetImage}
+                className="px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 text-xs font-medium transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 Đổi ảnh
               </button>
             </div>
           </div>
 
-          {/* Auto-detect Notification Badge */}
+          {/* Auto-detect Notification Banner */}
           {autoDetectedCount !== null && (
             <div className="flex items-center justify-between px-4 py-2 rounded-xl bg-pink-500/10 border border-pink-500/20 text-pink-600 dark:text-pink-400 text-xs">
               <span>
                 {autoDetectedCount > 0
-                  ? `Đã tự động khoanh vùng ${autoDetectedCount} vị trí watermark tiềm năng. Bạn có thể dùng cọ vẽ/tẩy để điều chỉnh thêm nếu cần.`
-                  : 'Không tìm thấy vùng watermark rõ ràng ở 4 góc hoặc trung tâm. Hãy dùng Cọ vẽ để tô thủ công lên vùng cần xóa.'}
+                  ? `Đã tự động khoanh vùng ${autoDetectedCount} vị trí watermark tiềm năng. Nhấn "Xóa Watermark" hoặc dùng cọ vẽ/tẩy để tinh chỉnh thêm.`
+                  : 'Không tìm thấy vùng watermark tự động. Hãy dùng Cọ vẽ tô lên vùng chữ/logo cần xóa.'}
               </span>
               <button
                 type="button"
@@ -521,7 +763,7 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
             </div>
           )}
 
-          {/* Dual-Canvas Visual Surface */}
+          {/* Dual-Canvas Surface */}
           <div
             ref={containerRef}
             className="relative w-full overflow-hidden rounded-2xl border border-slate-200 dark:border-slate-800 bg-slate-950/90 flex items-center justify-center min-h-[380px] sm:min-h-[500px]"
@@ -532,7 +774,7 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
               className="max-w-full max-h-[70vh] object-contain block select-none pointer-events-none"
             />
 
-            {/* Selection Mask Overlay Canvas */}
+            {/* Mask Overlay Canvas */}
             <canvas
               ref={maskCanvasRef}
               onMouseDown={startDrawing}
@@ -543,16 +785,39 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
               onTouchMove={moveDrawing}
               onTouchEnd={endDrawing}
               className={`absolute max-w-full max-h-[70vh] object-contain block touch-none ${
-                toolMode === 'eraser' ? 'cursor-crosshair' : 'cursor-crosshair'
+                ui.canvasInteractive ? 'cursor-crosshair' : 'pointer-events-none'
               }`}
             />
 
-            {/* Canvas Hint Badge */}
+            {/* Processing Overlay during ONNX Inference */}
+            {ui.showProcessing && (
+              <div className="absolute inset-0 bg-slate-950/60 backdrop-blur-xs flex flex-col items-center justify-center gap-3 text-white z-10">
+                <Loader2 className="w-9 h-9 text-pink-500 animate-spin" />
+                <div className="text-center space-y-1">
+                  <p className="text-sm font-bold">
+                    {modelStatus === 'downloading'
+                      ? `Đang tải mô hình AI vào bộ nhớ đệm (${aiModelProgress}%)...`
+                      : `Đang phục hồi vùng ảnh bằng ONNX AI (${inferenceProgress}%)...`}
+                  </p>
+                  <p className="text-xs text-slate-300">
+                    Xử lý 100% trên trình duyệt qua WebGPU / WebAssembly
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* State & Resolution Hint Pill */}
             <div className="absolute bottom-3 left-3 px-3 py-1 rounded-lg bg-black/60 backdrop-blur-md text-white/80 text-[11px] font-medium pointer-events-none flex items-center gap-2">
               <ImageIcon className="w-3.5 h-3.5 text-pink-400" />
               <span>
                 {imageDimensions
-                  ? `${imageDimensions.width} × ${imageDimensions.height} px • Tô hồng lên vùng cần xóa`
+                  ? `${imageDimensions.width} × ${imageDimensions.height} px • ${
+                      editorState === 'DONE'
+                        ? 'Đã xóa xong (Tô tiếp lên ảnh nếu muốn xóa thêm vùng khác)'
+                        : editorState === 'PAINTING'
+                        ? 'Đã chọn vùng mask • Nhấn "Xóa Watermark" để chạy AI'
+                        : 'Tô cọ hồng lên vùng watermark để kích hoạt nút xóa'
+                    }`
                   : 'Tô cọ lên vùng logo / chữ cần xóa'}
               </span>
             </div>

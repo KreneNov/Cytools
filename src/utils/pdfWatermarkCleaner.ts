@@ -3,9 +3,10 @@ import {
   PDFName,
   PDFArray,
   PDFDict,
+  PDFObject,
   PDFRawStream,
 } from 'pdf-lib';
-import type { PdfCleanOptions, PdfCleanResult } from '../types/watermarkRemover';
+import type { PdfCleanOptions, PdfStripResult } from '../types/watermarkRemover';
 import { stripPdfPageContentStreams } from './pdfWatermarkStripper';
 
 const DEFAULT_WATERMARK_KEYWORDS = [
@@ -22,16 +23,30 @@ const DEFAULT_WATERMARK_KEYWORDS = [
 ];
 
 /**
- * 100% Client-Side PDF Watermark & Stamp Cleaner
- * Powered by pdf-lib: removes watermark annotations, PieceInfo dictionaries,
- * overlay form XObjects, and deep-cleans compressed Page Content Streams (Tj/TJ/BDC).
+ * Safe Client-Side PDF Watermark & Stamp Stripper
+ * - Strips `/Watermark`, `/Stamp`, `/FreeText` annotations, `PieceInfo` metadata, and watermark Form XObject overlays.
+ * - Uses a byte-accurate content-stream tokenizer to remove Marked-Content watermark artifacts
+ *   and standard ASCII text operators (`Tj`, `TJ`) on non-subsetted fonts.
+ * - Defensive Guardrail: Returns `{ success: false, reason: 'SUBSET_FONT_UNSUPPORTED' }` instead of
+ *   corrupting subsetted/CID-encoded fonts when vector-baked text watermarks cannot be safely removed.
  */
 export async function cleanPdfWatermarks(
   pdfBuffer: ArrayBuffer,
   options: PdfCleanOptions = {}
-): Promise<PdfCleanResult> {
+): Promise<PdfStripResult> {
   const originalSize = pdfBuffer.byteLength;
-  const pdfDoc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+  let pdfDoc: PDFDocument;
+
+  try {
+    pdfDoc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+  } catch {
+    return {
+      success: false,
+      reason: 'PARSE_FAILED',
+      message: 'Không thể đọc cấu trúc tệp PDF. Tệp có thể bị mã hóa mật khẩu hoặc bị hỏng.',
+      details: [],
+    };
+  }
 
   const customKeywords = (options.customKeywords || [])
     .map((k) => k.trim().toLowerCase())
@@ -53,7 +68,7 @@ export async function cleanPdfWatermarks(
     if (options.stripAnnotations !== false) {
       const annots = pageNode.Annots();
       if (annots instanceof PDFArray) {
-        const remainingAnnots: any[] = [];
+        const remainingAnnots: PDFObject[] = [];
         const size = annots.size();
 
         for (let i = 0; i < size; i++) {
@@ -64,7 +79,6 @@ export async function cleanPdfWatermarks(
             const subtype = annotDict.get(PDFName.of('Subtype'));
             const subtypeName = subtype instanceof PDFName ? subtype.asString() : '';
 
-            // Check if annotation is Watermark, Stamp, or FreeText with watermark text
             const isWatermarkType =
               subtypeName === '/Watermark' ||
               subtypeName === '/Stamp' ||
@@ -81,13 +95,12 @@ export async function cleanPdfWatermarks(
 
             if (isWatermarkType || hasWatermarkContent) {
               strippedAnnotsCount++;
-              continue; // Drop this annotation
+              continue;
             }
           }
           remainingAnnots.push(annotRef);
         }
 
-        // Rebuild Annots array
         if (remainingAnnots.length < size) {
           pageNode.set(PDFName.of('Annots'), pdfDoc.context.obj(remainingAnnots));
         }
@@ -101,7 +114,7 @@ export async function cleanPdfWatermarks(
       }
     }
 
-    // 3. Strip Repeated Overlay Form XObjects
+    // 3. Strip Explicit Watermark Overlay Form XObjects
     if (options.stripOverlayForms !== false) {
       const resources = pageNode.Resources();
       if (resources instanceof PDFDict) {
@@ -145,10 +158,28 @@ export async function cleanPdfWatermarks(
     }
   }
 
-  // 4. Deep-Clean Raw Page & Form XObject Content Streams (Tj, TJ, BDC...EMC, ToUnicode CMaps)
-  const strippedKeywordsCount = stripPdfPageContentStreams(pdfDoc, allTargetKeywords);
+  // 4. Tokenize & Strip Page Content Streams with Font-Safety Guardrail
+  const streamSummary = stripPdfPageContentStreams(pdfDoc, allTargetKeywords);
 
-  // Also remove PieceInfo and Watermark metadata from document Catalog
+  const totalRemovedItems =
+    strippedAnnotsCount +
+    strippedXObjectsCount +
+    streamSummary.strippedArtifactBlocks +
+    streamSummary.strippedTextOps;
+
+  // Defensive Guardrail: If nothing could be safely stripped AND the document uses subsetted / CID fonts,
+  // do NOT apply blind regex that would corrupt glyph indices or binary layout.
+  if (totalRemovedItems === 0 && streamSummary.unsupportedDetails.length > 0) {
+    return {
+      success: false,
+      reason: 'SUBSET_FONT_UNSUPPORTED',
+      message:
+        'Tệp PDF này sử dụng bảng mã Font Subset (hoặc mã hóa Glyph ToUnicode/CID) khiến watermark đã bị nướng cứng vào luồng vector. Việc can thiệp trực tiếp vào luồng byte sẽ làm hỏng font chữ và bố cục tài liệu.',
+      details: streamSummary.unsupportedDetails,
+    };
+  }
+
+  // Remove PieceInfo from document Catalog
   const catalog = pdfDoc.catalog;
   if (catalog.has(PDFName.of('PieceInfo'))) {
     catalog.delete(PDFName.of('PieceInfo'));
@@ -156,12 +187,34 @@ export async function cleanPdfWatermarks(
 
   const cleanedPdfBytes = await pdfDoc.save();
 
+  // 5. Post-save structural integrity verification
+  try {
+    const verifyDoc = await PDFDocument.load(cleanedPdfBytes, { ignoreEncryption: true });
+    if (verifyDoc.getPageCount() !== pages.length) {
+      return {
+        success: false,
+        reason: 'PARSE_FAILED',
+        message: 'Kiểm tra toàn vẹn cấu trúc PDF không thành công. Đã hủy thay đổi để bảo vệ tệp gốc.',
+        details: [],
+      };
+    }
+  } catch {
+    return {
+      success: false,
+      reason: 'PARSE_FAILED',
+      message: 'Kiểm tra toàn vẹn cấu trúc PDF không thành công. Đã hủy thay đổi để bảo vệ tệp gốc.',
+      details: [],
+    };
+  }
+
   return {
+    success: true,
     cleanedPdfBytes,
     originalSize,
     cleanedSize: cleanedPdfBytes.byteLength,
     strippedAnnotsCount,
-    strippedKeywordsCount,
+    strippedArtifactBlocks: streamSummary.strippedArtifactBlocks,
+    strippedTextOps: streamSummary.strippedTextOps,
     strippedXObjectsCount,
   };
 }

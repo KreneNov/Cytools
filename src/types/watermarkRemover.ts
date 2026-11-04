@@ -9,56 +9,89 @@ export interface ImageDetectionBox {
   confidence: number;
 }
 
-export interface InpaintWorkerInpaintRequest {
-  type: 'INPAINT_REQUEST';
-  imageData: ImageData;
-  maskData: ImageData;
-  radius: number;
-  modelUrl?: string;
+/* ------------------------------------------------------------------ */
+/* Image editor finite state machine                                   */
+/* ------------------------------------------------------------------ */
+
+export type ImageEditorState = 'IDLE' | 'PAINTING' | 'PROCESSING' | 'DONE';
+
+/* ------------------------------------------------------------------ */
+/* ONNX AI inpainting                                                  */
+/* ------------------------------------------------------------------ */
+
+export type InpaintModelId = 'migan' | 'lama';
+
+export interface InpaintModelSpec {
+  id: InpaintModelId;
+  label: string;
+  url: string;
+  /** Square model input resolution (both models operate at 512x512). */
+  inputSize: number;
+  tensorType: 'uint8' | 'float32';
+  /** Mask value meaning "fill / inpaint this pixel". */
+  maskFillValue: number;
+  /** Mask value meaning "keep original pixel". */
+  maskKeepValue: number;
+  /** How the model output must be interpreted. */
+  outputScale: 'uint8' | '0-255' | '0-1';
+  /** Expected approximate size, used to detect truncated downloads. */
+  approxBytes: number;
 }
 
-export interface InpaintWorkerModelPreloadRequest {
-  type: 'PRELOAD_AI_MODEL';
-  modelUrl: string;
+export type ExecutionBackend = 'webgpu' | 'wasm';
+
+export interface LoadModelRequest {
+  type: 'LOAD_MODEL';
+  model: InpaintModelSpec;
 }
 
-export type InpaintWorkerRequest =
-  | InpaintWorkerInpaintRequest
-  | InpaintWorkerModelPreloadRequest;
-
-export interface InpaintWorkerProgress {
-  type: 'INPAINT_PROGRESS';
-  progress: number;
+export interface RunInpaintRequest {
+  type: 'RUN_INPAINT';
+  jobId: number;
+  model: InpaintModelSpec;
+  /** RGBA pixels, length = width * height * 4. */
+  image: Uint8ClampedArray;
+  /** RGBA mask pixels (alpha > threshold means painted), length = width * height * 4. */
+  mask: Uint8ClampedArray;
+  width: number;
+  height: number;
 }
 
-export interface InpaintWorkerSuccess {
-  type: 'INPAINT_SUCCESS';
-  resultData: ImageData;
-}
+export type InpaintWorkerRequest = LoadModelRequest | RunInpaintRequest;
 
-export interface InpaintWorkerError {
-  type: 'INPAINT_ERROR';
-  error: string;
-}
-
-export interface InpaintWorkerModelProgress {
-  type: 'AI_MODEL_PROGRESS';
-  progress: number;
-  cached: boolean;
-}
-
-export interface InpaintWorkerModelReady {
-  type: 'AI_MODEL_READY';
-  cached: boolean;
-  byteLength: number;
-}
+export type InpaintErrorCode =
+  | 'MODEL_DOWNLOAD_FAILED'
+  | 'WEBGPU_FAILED'
+  | 'INFERENCE_FAILED';
 
 export type InpaintWorkerResponse =
-  | InpaintWorkerProgress
-  | InpaintWorkerSuccess
-  | InpaintWorkerError
-  | InpaintWorkerModelProgress
-  | InpaintWorkerModelReady;
+  | { type: 'MODEL_PROGRESS'; progress: number; cached: boolean }
+  | { type: 'MODEL_READY'; backend: ExecutionBackend; cached: boolean }
+  | {
+      type: 'INFERENCE_PROGRESS';
+      jobId: number;
+      stage: 'preprocess' | 'inference' | 'postprocess';
+      progress: number;
+    }
+  | {
+      type: 'INFERENCE_SUCCESS';
+      jobId: number;
+      output: Uint8ClampedArray;
+      width: number;
+      height: number;
+      backend: ExecutionBackend;
+    }
+  | {
+      type: 'WORKER_ERROR';
+      jobId?: number;
+      code: InpaintErrorCode;
+      message: string;
+      fatal: boolean;
+    };
+
+/* ------------------------------------------------------------------ */
+/* PDF                                                                 */
+/* ------------------------------------------------------------------ */
 
 export interface PdfCleanOptions {
   customKeywords?: string[];
@@ -67,14 +100,35 @@ export interface PdfCleanOptions {
   stripOverlayForms?: boolean;
 }
 
-export interface PdfCleanResult {
+export interface PdfUnsupportedDetail {
+  pageIndex: number;
+  fontName: string;
+  fontKind: string;
+}
+
+export interface PdfStripSuccess {
+  success: true;
   cleanedPdfBytes: Uint8Array;
   originalSize: number;
   cleanedSize: number;
   strippedAnnotsCount: number;
-  strippedKeywordsCount: number;
+  strippedArtifactBlocks: number;
+  strippedTextOps: number;
   strippedXObjectsCount: number;
 }
+
+export interface PdfStripFailure {
+  success: false;
+  reason: 'SUBSET_FONT_UNSUPPORTED' | 'ENCRYPTED' | 'PARSE_FAILED';
+  message: string;
+  details: PdfUnsupportedDetail[];
+}
+
+export type PdfStripResult = PdfStripSuccess | PdfStripFailure;
+
+/* ------------------------------------------------------------------ */
+/* PPTX                                                                */
+/* ------------------------------------------------------------------ */
 
 export interface PptxDetectedItem {
   id: string;

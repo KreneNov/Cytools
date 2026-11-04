@@ -1,486 +1,393 @@
+import * as ort from 'onnxruntime-web/webgpu';
 import type {
+  ExecutionBackend,
+  InpaintModelSpec,
   InpaintWorkerRequest,
   InpaintWorkerResponse,
+  RunInpaintRequest,
 } from '../types/watermarkRemover';
+import { MODEL_CACHE_NAME } from './inpaintModels';
+import {
+  computeCropRegion,
+  computeLetterbox,
+  computeMaskBBox,
+  cropMask,
+  cropRGBA,
+  dilateMask,
+  featherBlendBack,
+  fromModelOutput,
+  letterboxMask,
+  letterboxRGBA,
+  rgbaMaskToBinary,
+  toModelTensors,
+  unletterboxRGBA,
+} from '../utils/inpaintImageOps';
 
-export const ONNX_MODEL_CACHE_NAME = 'cytools-onnx-models-v1';
-export const DEFAULT_ONNX_INPAINT_MODEL_URL = '/models/inpaint-lama-fp16.onnx';
+/* ------------------------------------------------------------------ */
+/* ONNX Runtime environment                                            */
+/* ------------------------------------------------------------------ */
 
-// In-memory cached buffer inside the Worker thread to avoid repeated CacheStorage reads
-let workerCachedOnnxBuffer: ArrayBuffer | null = null;
-let workerCachedOnnxUrl: string | null = null;
+const ORT_VERSION = '1.22.0';
+const MASK_DILATION_RADIUS = 4;
+const FEATHER_PX = 4;
 
-/**
- * Fetches an ONNX binary payload (~30MB) and caches it permanently in the browser's Cache API
- * so the 30MB payload is only downloaded once per user device.
- * Reports streaming download progress (0-100) via `onProgress`.
- */
-export async function loadCachedOnnxModel(
-  modelUrl: string = DEFAULT_ONNX_INPAINT_MODEL_URL,
-  onProgress?: (progress: number, cached: boolean) => void
-): Promise<ArrayBuffer> {
-  if (workerCachedOnnxBuffer && workerCachedOnnxUrl === modelUrl) {
-    if (onProgress) onProgress(100, true);
-    return workerCachedOnnxBuffer;
-  }
+interface WorkerScope {
+  crossOriginIsolated?: boolean;
+  navigator: Navigator & { gpu?: { requestAdapter(): Promise<unknown | null> } };
+  postMessage(message: InpaintWorkerResponse, transfer?: Transferable[]): void;
+  addEventListener(type: 'message', listener: (ev: MessageEvent<InpaintWorkerRequest>) => void): void;
+}
 
+const scope = self as unknown as WorkerScope;
+
+const hardwareThreads = scope.navigator?.hardwareConcurrency || 2;
+ort.env.wasm.numThreads = scope.crossOriginIsolated
+  ? Math.max(1, Math.min(4, hardwareThreads - 1))
+  : 1;
+ort.env.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
+
+function post(message: InpaintWorkerResponse, transfer: Transferable[] = []): void {
+  scope.postMessage(message, transfer);
+}
+
+/* ------------------------------------------------------------------ */
+/* Model download + Cache API                                          */
+/* ------------------------------------------------------------------ */
+
+async function loadModelBytes(spec: InpaintModelSpec): Promise<{ bytes: Uint8Array; cached: boolean }> {
   const hasCacheApi = typeof caches !== 'undefined';
 
-  // 1. Check browser Cache Storage first
   if (hasCacheApi) {
     try {
-      const cache = await caches.open(ONNX_MODEL_CACHE_NAME);
-      const cachedResponse = await cache.match(modelUrl);
-      if (cachedResponse && cachedResponse.ok) {
-        if (onProgress) onProgress(50, true);
-        const buffer = await cachedResponse.arrayBuffer();
-        workerCachedOnnxBuffer = buffer;
-        workerCachedOnnxUrl = modelUrl;
-        if (onProgress) onProgress(100, true);
-        return buffer;
+      const cache = await caches.open(MODEL_CACHE_NAME);
+      const hit = await cache.match(spec.url);
+      if (hit && hit.ok) {
+        const buffer = await hit.arrayBuffer();
+        if (buffer.byteLength >= spec.approxBytes * 0.8) {
+          post({ type: 'MODEL_PROGRESS', progress: 100, cached: true });
+          return { bytes: new Uint8Array(buffer), cached: true };
+        }
+        // Corrupted / truncated cache entry: purge and re-download
+        await cache.delete(spec.url);
       }
-    } catch (cacheReadErr) {
-      console.warn('[ONNX Cache API] Không thể đọc bộ nhớ đệm CacheStorage:', cacheReadErr);
+    } catch {
+      // Cache API unavailable (private mode, quota) -> continue with network download
     }
   }
 
-  // 2. Cache miss -> Stream download with live 0-100% progress reporting
-  if (onProgress) onProgress(0, false);
-  const response = await fetch(modelUrl, { credentials: 'same-origin' });
+  post({ type: 'MODEL_PROGRESS', progress: 0, cached: false });
+  const response = await fetch(spec.url, { mode: 'cors', credentials: 'omit' });
   if (!response.ok) {
-    throw new Error(`Không thể tải mô hình AI (${response.status} ${response.statusText})`);
+    throw new Error(`HTTP ${response.status} khi tải mô hình ${spec.label}`);
   }
 
-  const contentLengthHeader = response.headers.get('Content-Length');
-  const totalBytes = contentLengthHeader ? parseInt(contentLengthHeader, 10) : 30 * 1024 * 1024;
+  const lengthHeader = Number(response.headers.get('Content-Length') || 0);
+  const expected = lengthHeader > 0 ? lengthHeader : spec.approxBytes;
+  let bytes: Uint8Array;
 
-  let modelBuffer: ArrayBuffer;
-
-  if (response.body && typeof response.body.getReader === 'function') {
+  if (response.body) {
     const reader = response.body.getReader();
     const chunks: Uint8Array[] = [];
-    let receivedBytes = 0;
-
-    while (true) {
+    let received = 0;
+    let lastReported = -1;
+    for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       if (value) {
         chunks.push(value);
-        receivedBytes += value.byteLength;
-        if (onProgress && totalBytes > 0) {
-          const pct = Math.min(99, Math.max(1, Math.round((receivedBytes / totalBytes) * 100)));
-          onProgress(pct, false);
+        received += value.byteLength;
+        const pct = Math.min(99, Math.floor((received / expected) * 100));
+        if (pct !== lastReported) {
+          lastReported = pct;
+          post({ type: 'MODEL_PROGRESS', progress: pct, cached: false });
         }
       }
     }
-
-    const merged = new Uint8Array(receivedBytes);
+    bytes = new Uint8Array(received);
     let offset = 0;
     for (const chunk of chunks) {
-      merged.set(chunk, offset);
+      bytes.set(chunk, offset);
       offset += chunk.byteLength;
     }
-    modelBuffer = merged.buffer;
   } else {
-    modelBuffer = await response.arrayBuffer();
+    bytes = new Uint8Array(await response.arrayBuffer());
   }
 
-  // 3. Persist the 30MB ONNX payload into Browser Cache API for future sessions
-  if (hasCacheApi && modelBuffer.byteLength > 0) {
+  const truncated =
+    (lengthHeader > 0 && bytes.byteLength !== lengthHeader) ||
+    bytes.byteLength < spec.approxBytes * 0.8;
+  if (truncated) {
+    throw new Error('Tải mô hình bị gián đoạn (dữ liệu không đầy đủ). Vui lòng thử lại.');
+  }
+
+  if (hasCacheApi) {
     try {
-      const cache = await caches.open(ONNX_MODEL_CACHE_NAME);
-      const responseToCache = new Response(modelBuffer.slice(0), {
-        status: 200,
-        headers: {
-          'Content-Type': 'application/octet-stream',
-          'Content-Length': String(modelBuffer.byteLength),
-          'X-Cytools-Cached-At': new Date().toISOString(),
-        },
+      const cache = await caches.open(MODEL_CACHE_NAME);
+      await cache.put(
+        spec.url,
+        new Response(bytes.slice().buffer, {
+          status: 200,
+          headers: {
+            'Content-Type': 'application/octet-stream',
+            'Content-Length': String(bytes.byteLength),
+          },
+        })
+      );
+    } catch {
+      // Quota exceeded: model still usable for this session
+    }
+  }
+
+  post({ type: 'MODEL_PROGRESS', progress: 100, cached: false });
+  return { bytes, cached: false };
+}
+
+/* ------------------------------------------------------------------ */
+/* Session management with webgpu -> wasm fallback                     */
+/* ------------------------------------------------------------------ */
+
+interface LoadedSession {
+  session: ort.InferenceSession;
+  backend: ExecutionBackend;
+  bytes: Uint8Array;
+}
+
+const sessions = new Map<string, LoadedSession>();
+const pendingLoads = new Map<string, Promise<LoadedSession>>();
+
+async function isWebGpuUsable(): Promise<boolean> {
+  try {
+    const gpu = scope.navigator?.gpu;
+    if (!gpu) return false;
+    const adapter = await gpu.requestAdapter();
+    return Boolean(adapter);
+  } catch {
+    return false;
+  }
+}
+
+async function createSession(bytes: Uint8Array, preferWebGpu: boolean): Promise<{ session: ort.InferenceSession; backend: ExecutionBackend }> {
+  if (preferWebGpu && (await isWebGpuUsable())) {
+    try {
+      const session = await ort.InferenceSession.create(bytes, {
+        executionProviders: ['webgpu'],
+        graphOptimizationLevel: 'all',
       });
-      await cache.put(modelUrl, responseToCache);
-    } catch (cacheWriteErr) {
-      console.warn('[ONNX Cache API] Không thể lưu mô hình vào CacheStorage:', cacheWriteErr);
+      return { session, backend: 'webgpu' };
+    } catch (err) {
+      post({
+        type: 'WORKER_ERROR',
+        code: 'WEBGPU_FAILED',
+        message: `WebGPU không khả dụng (${err instanceof Error ? err.message : 'unknown'}). Đã chuyển sang WASM.`,
+        fatal: false,
+      });
     }
   }
-
-  workerCachedOnnxBuffer = modelBuffer;
-  workerCachedOnnxUrl = modelUrl;
-  if (onProgress) onProgress(100, false);
-
-  return modelBuffer;
+  const session = await ort.InferenceSession.create(bytes, {
+    executionProviders: ['wasm'],
+    graphOptimizationLevel: 'all',
+  });
+  return { session, backend: 'wasm' };
 }
 
-/**
- * Binary Min-Heap Priority Queue for Fast Marching Method (FMM)
- */
-class MinHeap {
-  private indices: Int32Array;
-  private priorities: Float32Array;
-  private size: number = 0;
+async function ensureSession(spec: InpaintModelSpec): Promise<LoadedSession> {
+  const existing = sessions.get(spec.id);
+  if (existing) return existing;
+  const pending = pendingLoads.get(spec.id);
+  if (pending) return pending;
 
-  constructor(capacity: number) {
-    this.indices = new Int32Array(capacity);
-    this.priorities = new Float32Array(capacity);
-  }
+  const loader = (async (): Promise<LoadedSession> => {
+    const modelBytes = await loadModelBytes(spec);
+    const { session, backend } = await createSession(modelBytes.bytes, true);
+    const loaded: LoadedSession = { session, backend, bytes: modelBytes.bytes };
+    sessions.set(spec.id, loaded);
+    post({ type: 'MODEL_READY', backend, cached: modelBytes.cached });
+    return loaded;
+  })();
 
-  push(idx: number, priority: number): void {
-    let i = this.size++;
-    this.indices[i] = idx;
-    this.priorities[i] = priority;
-
-    // Up-heap
-    while (i > 0) {
-      const parent = (i - 1) >> 1;
-      if (this.priorities[i] < this.priorities[parent]) {
-        this.swap(i, parent);
-        i = parent;
-      } else {
-        break;
-      }
-    }
-  }
-
-  pop(): number | null {
-    if (this.size === 0) return null;
-    const top = this.indices[0];
-    this.size--;
-
-    if (this.size > 0) {
-      this.indices[0] = this.indices[this.size];
-      this.priorities[0] = this.priorities[this.size];
-      this.downHeap(0);
-    }
-
-    return top;
-  }
-
-  isEmpty(): boolean {
-    return this.size === 0;
-  }
-
-  private downHeap(i: number): void {
-    while (true) {
-      const left = (i << 1) + 1;
-      const right = left + 1;
-      let smallest = i;
-
-      if (left < this.size && this.priorities[left] < this.priorities[smallest]) {
-        smallest = left;
-      }
-      if (right < this.size && this.priorities[right] < this.priorities[smallest]) {
-        smallest = right;
-      }
-
-      if (smallest !== i) {
-        this.swap(i, smallest);
-        i = smallest;
-      } else {
-        break;
-      }
-    }
-  }
-
-  private swap(a: number, b: number): void {
-    const tempIdx = this.indices[a];
-    this.indices[a] = this.indices[b];
-    this.indices[b] = tempIdx;
-
-    const tempPri = this.priorities[a];
-    this.priorities[a] = this.priorities[b];
-    this.priorities[b] = tempPri;
+  pendingLoads.set(spec.id, loader);
+  try {
+    return await loader;
+  } finally {
+    pendingLoads.delete(spec.id);
   }
 }
 
-const FLAG_KNOWN = 0;
-const FLAG_BAND = 1;
-const FLAG_INSIDE = 2;
-
-/**
- * Pure TypeScript Telea Inpainting Algorithm (Alexandru Telea, 2004)
- * Executes Fast Marching Method on pixel buffers with directional gradient propagation.
- */
-export function inpaintTelea(
-  srcImg: ImageData,
-  maskImg: ImageData,
-  radius: number = 5,
-  onProgress?: (progress: number) => void
-): ImageData {
-  const width = srcImg.width;
-  const height = srcImg.height;
-  const numPixels = width * height;
-
-  // Clone source image data buffer
-  const outImg = new ImageData(
-    new Uint8ClampedArray(srcImg.data),
-    width,
-    height
-  );
-  const outData = outImg.data;
-  const maskData = maskImg.data;
-
-  // Flags map & Distance transform map T
-  const flags = new Uint8Array(numPixels);
-  const T = new Float32Array(numPixels);
-  T.fill(1e9);
-
-  let targetCount = 0;
-
-  // Initialize flags: 0 = KNOWN, 2 = INSIDE (any mask alpha > 30 or mask red > 30)
-  for (let i = 0, p = 0; i < maskData.length; i += 4, p++) {
-    if (maskData[i + 3] > 30 || maskData[i] > 30) {
-      flags[p] = FLAG_INSIDE;
-      targetCount++;
-    } else {
-      flags[p] = FLAG_KNOWN;
-      T[p] = 0;
-    }
+async function downgradeToWasm(spec: InpaintModelSpec, current: LoadedSession): Promise<LoadedSession> {
+  try {
+    await current.session.release();
+  } catch {
+    // ignore
   }
-
-  // If nothing to inpaint, return original copy immediately
-  if (targetCount === 0) {
-    if (onProgress) onProgress(100);
-    return outImg;
-  }
-
-  const heap = new MinHeap(Math.max(1024, targetCount * 2));
-
-  // Find initial narrow band pixels (INSIDE pixels adjacent to KNOWN pixels)
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const p = y * width + x;
-      if (flags[p] === FLAG_INSIDE) {
-        let hasKnownNeighbor = false;
-        // Check 4-neighborhood
-        if (x > 0 && flags[p - 1] === FLAG_KNOWN) hasKnownNeighbor = true;
-        else if (x < width - 1 && flags[p + 1] === FLAG_KNOWN) hasKnownNeighbor = true;
-        else if (y > 0 && flags[p - width] === FLAG_KNOWN) hasKnownNeighbor = true;
-        else if (y < height - 1 && flags[p + width] === FLAG_KNOWN) hasKnownNeighbor = true;
-
-        if (hasKnownNeighbor) {
-          flags[p] = FLAG_BAND;
-          T[p] = 0;
-          heap.push(p, 0);
-        }
-      }
-    }
-  }
-
-  let processedCount = 0;
-  let lastReportedProgress = 0;
-  const reportInterval = Math.max(100, Math.floor(targetCount / 40));
-
-  // Fast Marching Main Loop
-  while (!heap.isEmpty()) {
-    const p = heap.pop();
-    if (p === null) break;
-
-    const px = p % width;
-    const py = Math.floor(p / width);
-
-    flags[p] = FLAG_KNOWN;
-    processedCount++;
-
-    if (onProgress && processedCount % reportInterval === 0) {
-      const currentProgress = Math.min(99, Math.round((processedCount / targetCount) * 100));
-      if (currentProgress > lastReportedProgress) {
-        lastReportedProgress = currentProgress;
-        onProgress(currentProgress);
-      }
-    }
-
-    // Inpaint color at pixel p from surrounding KNOWN pixels within radius
-    let sumR = 0;
-    let sumG = 0;
-    let sumB = 0;
-    let sumW = 0;
-
-    // Directional gradient computation \nabla T(p)
-    let gradX = 0;
-    let gradY = 0;
-
-    if (px > 0 && px < width - 1) {
-      gradX = (T[py * width + (px + 1)] - T[py * width + (px - 1)]) * 0.5;
-    } else if (px > 0) {
-      gradX = T[p] - T[py * width + (px - 1)];
-    } else if (px < width - 1) {
-      gradX = T[py * width + (px + 1)] - T[p];
-    }
-
-    if (py > 0 && py < height - 1) {
-      gradY = (T[(py + 1) * width + px] - T[(py - 1) * width + px]) * 0.5;
-    } else if (py > 0) {
-      gradY = T[p] - T[(py - 1) * width + px];
-    } else if (py < height - 1) {
-      gradY = T[(py + 1) * width + px] - T[p];
-    }
-
-    const gradLen = Math.hypot(gradX, gradY) + 1e-6;
-    const normGradX = gradX / gradLen;
-    const normGradY = gradY / gradLen;
-
-    const rMinX = Math.max(0, px - radius);
-    const rMaxX = Math.min(width - 1, px + radius);
-    const rMinY = Math.max(0, py - radius);
-    const rMaxY = Math.min(height - 1, py + radius);
-
-    for (let qy = rMinY; qy <= rMaxY; qy++) {
-      for (let qx = rMinX; qx <= rMaxX; qx++) {
-        const q = qy * width + qx;
-        if (flags[q] === FLAG_KNOWN) {
-          const dx = px - qx;
-          const dy = py - qy;
-          const distSq = dx * dx + dy * dy;
-          if (distSq === 0 || distSq > radius * radius) continue;
-
-          const dist = Math.sqrt(distSq);
-
-          // Direction factor: alignment with contour normal
-          const dir = Math.abs(dx * normGradX + dy * normGradY) / dist + 1e-4;
-
-          // Geometric distance factor
-          const dst = 1.0 / distSq;
-
-          // Level set distance factor
-          const lev = 1.0 / (1.0 + Math.abs(T[p] - T[q]));
-
-          const weight = dir * dst * lev;
-          const qIdx = q * 4;
-
-          sumR += weight * outData[qIdx];
-          sumG += weight * outData[qIdx + 1];
-          sumB += weight * outData[qIdx + 2];
-          sumW += weight;
-        }
-      }
-    }
-
-    if (sumW > 0) {
-      const pIdx = p * 4;
-      outData[pIdx] = Math.min(255, Math.max(0, Math.round(sumR / sumW)));
-      outData[pIdx + 1] = Math.min(255, Math.max(0, Math.round(sumG / sumW)));
-      outData[pIdx + 2] = Math.min(255, Math.max(0, Math.round(sumB / sumW)));
-      outData[pIdx + 3] = 255;
-    }
-
-    // Update 4-connected neighbors
-    const neighbors = [
-      { x: px - 1, y: py },
-      { x: px + 1, y: py },
-      { x: px, y: py - 1 },
-      { x: px, y: py + 1 },
-    ];
-
-    for (const n of neighbors) {
-      if (n.x >= 0 && n.x < width && n.y >= 0 && n.y < height) {
-        const nIdx = n.y * width + n.x;
-        if (flags[nIdx] !== FLAG_KNOWN) {
-          // Compute new distance estimate for neighbor
-          let minKnownT = 1e9;
-          if (n.x > 0 && flags[n.y * width + n.x - 1] === FLAG_KNOWN) {
-            minKnownT = Math.min(minKnownT, T[n.y * width + n.x - 1]);
-          }
-          if (n.x < width - 1 && flags[n.y * width + n.x + 1] === FLAG_KNOWN) {
-            minKnownT = Math.min(minKnownT, T[n.y * width + n.x + 1]);
-          }
-          if (n.y > 0 && flags[(n.y - 1) * width + n.x] === FLAG_KNOWN) {
-            minKnownT = Math.min(minKnownT, T[(n.y - 1) * width + n.x]);
-          }
-          if (n.y < height - 1 && flags[(n.y + 1) * width + n.x] === FLAG_KNOWN) {
-            minKnownT = Math.min(minKnownT, T[(n.y + 1) * width + n.x]);
-          }
-
-          const newT = minKnownT < 1e8 ? minKnownT + 1.0 : T[p] + 1.0;
-
-          if (flags[nIdx] === FLAG_INSIDE) {
-            flags[nIdx] = FLAG_BAND;
-            T[nIdx] = newT;
-            heap.push(nIdx, newT);
-          } else if (flags[nIdx] === FLAG_BAND && newT < T[nIdx]) {
-            T[nIdx] = newT;
-            heap.push(nIdx, newT);
-          }
-        }
-      }
-    }
-  }
-
-  if (onProgress) onProgress(100);
-  return outImg;
+  const { session } = await createSession(current.bytes, false);
+  const downgraded: LoadedSession = { session, backend: 'wasm', bytes: current.bytes };
+  sessions.set(spec.id, downgraded);
+  return downgraded;
 }
 
-// Web Worker Event Listener (works in both classic and ES module Web Workers)
-const isWorkerContext =
-  typeof self !== 'undefined' &&
-  typeof window === 'undefined';
+/* ------------------------------------------------------------------ */
+/* Inference pipeline                                                  */
+/* ------------------------------------------------------------------ */
 
-if (isWorkerContext) {
-  self.addEventListener('message', async (event: MessageEvent<InpaintWorkerRequest>) => {
-    const data = event.data;
+function resolveInputNames(session: ort.InferenceSession): { imageName: string; maskName: string } {
+  const names = session.inputNames;
+  const maskName = names.find((n) => n.toLowerCase().includes('mask')) ?? names[1];
+  const imageName = names.find((n) => n !== maskName) ?? names[0];
+  return { imageName, maskName };
+}
 
-    if (data?.type === 'PRELOAD_AI_MODEL') {
+async function runModel(
+  loaded: LoadedSession,
+  spec: InpaintModelSpec,
+  squareRgba: Uint8ClampedArray,
+  squareMask: Uint8Array
+): Promise<Uint8ClampedArray> {
+  const size = spec.inputSize;
+  const tensors = toModelTensors(squareRgba, squareMask, size, spec);
+  const { imageName, maskName } = resolveInputNames(loaded.session);
+
+  const imageTensor =
+    tensors.image instanceof Float32Array
+      ? new ort.Tensor('float32', tensors.image, tensors.dims.image)
+      : new ort.Tensor('uint8', tensors.image, tensors.dims.image);
+  const maskTensor =
+    tensors.mask instanceof Float32Array
+      ? new ort.Tensor('float32', tensors.mask, tensors.dims.mask)
+      : new ort.Tensor('uint8', tensors.mask, tensors.dims.mask);
+
+  const results = await loaded.session.run({ [imageName]: imageTensor, [maskName]: maskTensor });
+  const output = results[loaded.session.outputNames[0]];
+  const dims = output.dims;
+  const outH = Number(dims[dims.length - 2]);
+  const outW = Number(dims[dims.length - 1]);
+  const data = (await output.getData()) as ArrayLike<number>;
+
+  imageTensor.dispose();
+  maskTensor.dispose();
+  output.dispose();
+
+  if (outW !== size || outH !== size) {
+    throw new Error(`Kích thước đầu ra mô hình không hợp lệ (${outW}x${outH}).`);
+  }
+  return fromModelOutput(data, outW, outH, spec);
+}
+
+async function handleRunInpaint(req: RunInpaintRequest): Promise<void> {
+  const { jobId, model, width, height } = req;
+
+  post({ type: 'INFERENCE_PROGRESS', jobId, stage: 'preprocess', progress: 5 });
+
+  let loaded: LoadedSession;
+  try {
+    loaded = await ensureSession(model);
+  } catch (err) {
+    post({
+      type: 'WORKER_ERROR',
+      jobId,
+      code: 'MODEL_DOWNLOAD_FAILED',
+      message: err instanceof Error ? err.message : 'Không thể tải mô hình AI.',
+      fatal: true,
+    });
+    return;
+  }
+
+  const binary = rgbaMaskToBinary(req.mask, width, height);
+  const dilated = dilateMask(binary, width, height, MASK_DILATION_RADIUS);
+  const bbox = computeMaskBBox(dilated, width, height);
+
+  if (!bbox) {
+    const passthrough = new Uint8ClampedArray(req.image);
+    post(
+      { type: 'INFERENCE_SUCCESS', jobId, output: passthrough, width, height, backend: loaded.backend },
+      [passthrough.buffer]
+    );
+    return;
+  }
+
+  const crop = computeCropRegion(bbox, width, height, model.inputSize);
+  const cropPixels = cropRGBA(req.image, width, crop);
+  const cropMaskBinary = cropMask(dilated, width, crop);
+  const lb = computeLetterbox(crop.w, crop.h, model.inputSize);
+  const squareRgba = letterboxRGBA(cropPixels, crop.w, crop.h, model.inputSize, lb);
+  const squareMask = letterboxMask(cropMaskBinary, crop.w, crop.h, model.inputSize, lb);
+
+  post({ type: 'INFERENCE_PROGRESS', jobId, stage: 'inference', progress: 25 });
+
+  let modelOut: Uint8ClampedArray;
+  try {
+    modelOut = await runModel(loaded, model, squareRgba, squareMask);
+  } catch (firstErr) {
+    if (loaded.backend === 'webgpu') {
+      post({
+        type: 'WORKER_ERROR',
+        jobId,
+        code: 'WEBGPU_FAILED',
+        message: 'Suy luận WebGPU thất bại, đang thử lại bằng WASM...',
+        fatal: false,
+      });
       try {
-        const modelUrl = data.modelUrl || DEFAULT_ONNX_INPAINT_MODEL_URL;
-        let wasCached = false;
-        const buffer = await loadCachedOnnxModel(modelUrl, (progress, cached) => {
-          wasCached = cached;
-          self.postMessage({
-            type: 'AI_MODEL_PROGRESS',
-            progress,
-            cached,
-          } as InpaintWorkerResponse);
+        loaded = await downgradeToWasm(model, loaded);
+        modelOut = await runModel(loaded, model, squareRgba, squareMask);
+      } catch (secondErr) {
+        post({
+          type: 'WORKER_ERROR',
+          jobId,
+          code: 'INFERENCE_FAILED',
+          message: secondErr instanceof Error ? secondErr.message : 'Suy luận AI thất bại.',
+          fatal: true,
         });
-
-        self.postMessage({
-          type: 'AI_MODEL_READY',
-          cached: wasCached,
-          byteLength: buffer.byteLength,
-        } as InpaintWorkerResponse);
-      } catch (err) {
-        self.postMessage({
-          type: 'INPAINT_ERROR',
-          error:
-            err instanceof Error
-              ? err.message
-              : 'Không thể tải hoặc lưu bộ nhớ đệm mô hình AI ONNX.',
-        } as InpaintWorkerResponse);
+        return;
       }
+    } else {
+      post({
+        type: 'WORKER_ERROR',
+        jobId,
+        code: 'INFERENCE_FAILED',
+        message: firstErr instanceof Error ? firstErr.message : 'Suy luận AI thất bại.',
+        fatal: true,
+      });
       return;
     }
+  }
 
-    if (data?.type === 'INPAINT_REQUEST') {
-      try {
-        // Optional ONNX model cache warm-up if a modelUrl was supplied
-        if (data.modelUrl) {
-          try {
-            await loadCachedOnnxModel(data.modelUrl, (progress, cached) => {
-              self.postMessage({
-                type: 'AI_MODEL_PROGRESS',
-                progress,
-                cached,
-              } as InpaintWorkerResponse);
-            });
-          } catch {
-            // Continue with Telea FMM engine if external ONNX binary is not yet hosted
-          }
-        }
+  post({ type: 'INFERENCE_PROGRESS', jobId, stage: 'postprocess', progress: 85 });
 
-        const result = inpaintTelea(data.imageData, data.maskData, data.radius, (progress) => {
-          self.postMessage({
-            type: 'INPAINT_PROGRESS',
-            progress,
-          } as InpaintWorkerResponse);
-        });
+  const patch = unletterboxRGBA(modelOut, model.inputSize, lb, crop.w, crop.h);
+  const blended = featherBlendBack(req.image, width, patch, crop, cropMaskBinary, FEATHER_PX);
 
-        self.postMessage({
-          type: 'INPAINT_SUCCESS',
-          resultData: result,
-        } as InpaintWorkerResponse);
-      } catch (err) {
-        self.postMessage({
-          type: 'INPAINT_ERROR',
-          error: err instanceof Error ? err.message : 'Lỗi không xác định khi xóa watermark hình ảnh.',
-        } as InpaintWorkerResponse);
-      }
-    }
-  });
+  post({ type: 'INFERENCE_PROGRESS', jobId, stage: 'postprocess', progress: 100 });
+  post(
+    { type: 'INFERENCE_SUCCESS', jobId, output: blended, width, height, backend: loaded.backend },
+    [blended.buffer]
+  );
 }
+
+/* ------------------------------------------------------------------ */
+/* Message routing                                                     */
+/* ------------------------------------------------------------------ */
+
+scope.addEventListener('message', (event: MessageEvent<InpaintWorkerRequest>) => {
+  const req = event.data;
+  if (req.type === 'LOAD_MODEL') {
+    ensureSession(req.model).catch((err: unknown) => {
+      post({
+        type: 'WORKER_ERROR',
+        code: 'MODEL_DOWNLOAD_FAILED',
+        message: err instanceof Error ? err.message : 'Không thể tải mô hình AI.',
+        fatal: true,
+      });
+    });
+    return;
+  }
+  if (req.type === 'RUN_INPAINT') {
+    handleRunInpaint(req).catch((err: unknown) => {
+      post({
+        type: 'WORKER_ERROR',
+        jobId: req.jobId,
+        code: 'INFERENCE_FAILED',
+        message: err instanceof Error ? err.message : 'Lỗi không xác định trong Web Worker.',
+        fatal: true,
+      });
+    });
+  }
+});
