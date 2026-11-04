@@ -410,13 +410,12 @@ async function resolveYouTubeClientSide(
 }
 
 /**
- * Triggers a direct download on the client without routing large files through Vercel (/api/proxy or /api/download)
- * and without buffering massive files into browser RAM via fetch().then(r => r.blob()):
+ * Triggers a direct native download on the client without jumping tabs and without buffering files in JS memory:
  * - Chrome Extension: Uses chrome.downloads.download({ url, filename: cleanName }) (writes directly to disk)
  * - Web App:
- *    1. URLs with guaranteed attachment headers (SaveTube VIP/ME CDN, Cobalt tunnel, SaveNow): Hidden iframe injection.
- *    2. Direct CDN URLs (TikTok, Facebook, Instagram, Pinterest, etc.): Uses an <a> tag with download attribute and target="_blank"
- *       so the browser handles the stream natively regardless of file size (e.g. 422MB+ videos).
+ *    1. URLs with guaranteed attachment headers (SaveTube VIP/ME CDN, Cobalt tunnel, SaveNow): Hidden iframe injection directly to `url`.
+ *    2. Direct CDN URLs (TikTok, Facebook, Instagram, Pinterest, etc.): Hidden iframe injection to `/api/download?url=...&filename=...`
+ *       which streams with `Content-Disposition: attachment` so the browser's native download manager starts immediately within 500ms without opening a new tab.
  */
 export async function triggerDirectDownload(url: string, filename: string): Promise<void> {
   const cleanName = cleanDownloadFilename(filename);
@@ -460,34 +459,21 @@ export async function triggerDirectDownload(url: string, filename: string): Prom
     url.includes('savetube.me') ||
     url.includes('savetube.su');
 
-  if (isAttachmentGuaranteed) {
-    const iframe = document.createElement('iframe');
-    iframe.style.display = 'none';
-    iframe.src = url;
-    document.body.appendChild(iframe);
-    setTimeout(() => {
-      if (document.body.contains(iframe)) {
-        document.body.removeChild(iframe);
-      }
-    }, 300000);
-    return;
-  }
+  const streamUrl = isAttachmentGuaranteed
+    ? url
+    : getApiUrl(
+        `/api/download?url=${encodeURIComponent(url)}&filename=${encodeURIComponent(cleanName)}`
+      );
 
-  // 3. Web App - Direct CDN links (TikTok, Facebook, Instagram, Pinterest, etc.)
-  // Never buffer 400MB+ files in RAM via fetch().blob() and never proxy through Vercel serverless (/api/proxy or /api/download)
-  const directDownloadUrl =
-    (url.includes('fbcdn.net') || url.includes('cdninstagram.com')) && !url.includes('dl=1')
-      ? `${url}${url.includes('?') ? '&' : '?'}dl=1`
-      : url;
-
-  const a = document.createElement('a');
-  a.href = directDownloadUrl;
-  a.setAttribute('download', cleanName);
-  a.target = '_blank';
-  a.rel = 'noopener noreferrer';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  const iframe = document.createElement('iframe');
+  iframe.style.display = 'none';
+  iframe.src = streamUrl;
+  document.body.appendChild(iframe);
+  setTimeout(() => {
+    if (document.body.contains(iframe)) {
+      document.body.removeChild(iframe);
+    }
+  }, 60000);
 }
 
 export const useSocialDownloader = (): UseSocialDownloaderReturn => {

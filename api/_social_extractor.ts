@@ -163,6 +163,55 @@ export async function fetchMediaMetadata(targetUrl: string, platform: SocialPlat
 }
 
 /**
+ * Resolves Facebook lookaside.fbsbx.com crawler URLs into direct *.fbcdn.net/*.mp4 video URLs
+ * by sending the official facebookexternalhit/1.1 User-Agent and capturing the redirect location.
+ */
+export async function resolveFacebookLookasideUrl(rawUrl: string): Promise<string> {
+  const cleanUrl = rawUrl.replaceAll('&amp;', '&').trim();
+  if (!cleanUrl.includes('lookaside.fbsbx.com')) {
+    return cleanUrl;
+  }
+
+  const crawlerHeaders = {
+    'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+    Accept: '*/*',
+  };
+
+  // 1. Fast manual redirect inspection to grab Location header without downloading the video payload
+  try {
+    const manualRes = await fetch(cleanUrl, {
+      method: 'GET',
+      headers: crawlerHeaders,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(5000),
+    });
+    const loc = manualRes.headers.get('location');
+    if (loc && loc.startsWith('http') && !loc.includes('facebook.com/login')) {
+      return loc;
+    }
+  } catch {
+    // Fallback to follow
+  }
+
+  // 2. Fallback: HEAD or GET with redirect: 'follow'
+  try {
+    const followRes = await fetch(cleanUrl, {
+      method: 'HEAD',
+      headers: crawlerHeaders,
+      redirect: 'follow',
+      signal: AbortSignal.timeout(5000),
+    });
+    if (followRes.url && followRes.url.startsWith('http') && !followRes.url.includes('lookaside.fbsbx.com')) {
+      return followRes.url;
+    }
+  } catch {
+    // Return decoded lookaside URL (which /api/download also handles with facebookexternalhit/1.1)
+  }
+
+  return cleanUrl;
+}
+
+/**
  * Multi-instance Cobalt caller with automatic retry, anti-bot filtering and direct CDN URLs.
  */
 export async function extractCobalt(url: string, platform: SocialPlatform): Promise<ExtractionResult> {
@@ -370,19 +419,32 @@ export async function extractCobalt(url: string, platform: SocialPlatform): Prom
 
     if (res.ok) {
       const html = await res.text();
-      const hdMatch = html.match(/"browser_native_hd_url":"([^"]+)"/) || html.match(/"hd_src":"([^"]+)"/);
-      const sdMatch = html.match(/"browser_native_sd_url":"([^"]+)"/) || html.match(/"sd_src":"([^"]+)"/);
+      const unescaped = html.replaceAll('\\/', '/').replaceAll('\\u0025', '%').replaceAll('\\u0026', '&');
+      const hdMatch =
+        unescaped.match(/"browser_native_hd_url":"(https:[^"]+)"/) ||
+        unescaped.match(/"playable_url_quality_hd":"(https:[^"]+)"/) ||
+        unescaped.match(/"hd_src_no_ratelimit":"(https:[^"]+)"/) ||
+        unescaped.match(/"hd_src":"(https:[^"]+)"/);
+      const sdMatch =
+        unescaped.match(/"browser_native_sd_url":"(https:[^"]+)"/) ||
+        unescaped.match(/"playable_url":"(https:[^"]+)"/) ||
+        unescaped.match(/"sd_src_no_ratelimit":"(https:[^"]+)"/) ||
+        unescaped.match(/"sd_src":"(https:[^"]+)"/);
       const ogVideo = html.match(/<meta\s+property=["']og:video(?::secure_url)?["']\s+content=["']([^"']+)["']/i);
       const ogTitle = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
       const ogImage = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
 
       let directVideoUrl: string | null = null;
       if (hdMatch && hdMatch[1]) {
-        directVideoUrl = JSON.parse(`"${hdMatch[1]}"`);
+        directVideoUrl = hdMatch[1];
       } else if (sdMatch && sdMatch[1]) {
-        directVideoUrl = JSON.parse(`"${sdMatch[1]}"`);
+        directVideoUrl = sdMatch[1];
       } else if (ogVideo && ogVideo[1] && !ogVideo[1].includes('/embed/')) {
-        directVideoUrl = ogVideo[1];
+        directVideoUrl = ogVideo[1].replaceAll('&amp;', '&');
+      }
+
+      if (directVideoUrl && directVideoUrl.includes('lookaside.fbsbx.com')) {
+        directVideoUrl = await resolveFacebookLookasideUrl(directVideoUrl);
       }
 
       if (directVideoUrl && !directVideoUrl.includes('<!DOCTYPE') && !directVideoUrl.startsWith('data:text/html')) {
@@ -391,7 +453,7 @@ export async function extractCobalt(url: string, platform: SocialPlatform): Prom
           platform,
           type: 'video',
           title: ogTitle ? ogTitle[1] : `Video ${platform.toUpperCase()}`,
-          thumbnail: ogImage ? ogImage[1] : undefined,
+          thumbnail: ogImage ? ogImage[1].replaceAll('&amp;', '&') : undefined,
           videoHd: directVideoUrl,
           mediaOptions: [
             {
@@ -929,13 +991,21 @@ export async function extractFacebook(url: string): Promise<ExtractionResult> {
         if (!hdUrl && !sdUrl) {
           const ogVideo = html.match(/<meta\s+property=["']og:video(?::secure_url)?["']\s+content=["']([^"']+)["']/i);
           if (ogVideo && ogVideo[1] && (ogVideo[1].includes('lookaside') || ogVideo[1].includes('fbcdn'))) {
-            sdUrl = ogVideo[1];
+            sdUrl = ogVideo[1].replaceAll('&amp;', '&');
           }
         }
       }
     } catch {
       // Continue
     }
+  }
+
+  // Resolve lookaside.fbsbx.com crawler URLs to direct *.fbcdn.net/*.mp4 video streams
+  if (hdUrl && hdUrl.includes('lookaside.fbsbx.com')) {
+    hdUrl = await resolveFacebookLookasideUrl(hdUrl);
+  }
+  if (sdUrl && sdUrl.includes('lookaside.fbsbx.com')) {
+    sdUrl = await resolveFacebookLookasideUrl(sdUrl);
   }
 
   if (hdUrl || sdUrl) {

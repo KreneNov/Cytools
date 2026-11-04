@@ -1002,20 +1002,33 @@ async function extractCobalt(url: string, platform: SocialPlatform): Promise<Ext
 
     if (res.ok) {
       const html = await res.text();
+      const unescaped = html.replaceAll('\\/', '/').replaceAll('\\u0025', '%').replaceAll('\\u0026', '&');
       // 1. Direct browser native stream strings (used by Facebook & Instagram)
-      const hdMatch = html.match(/"browser_native_hd_url":"([^"]+)"/) || html.match(/"hd_src":"([^"]+)"/);
-      const sdMatch = html.match(/"browser_native_sd_url":"([^"]+)"/) || html.match(/"sd_src":"([^"]+)"/);
+      const hdMatch =
+        unescaped.match(/"browser_native_hd_url":"(https:[^"]+)"/) ||
+        unescaped.match(/"playable_url_quality_hd":"(https:[^"]+)"/) ||
+        unescaped.match(/"hd_src_no_ratelimit":"(https:[^"]+)"/) ||
+        unescaped.match(/"hd_src":"(https:[^"]+)"/);
+      const sdMatch =
+        unescaped.match(/"browser_native_sd_url":"(https:[^"]+)"/) ||
+        unescaped.match(/"playable_url":"(https:[^"]+)"/) ||
+        unescaped.match(/"sd_src_no_ratelimit":"(https:[^"]+)"/) ||
+        unescaped.match(/"sd_src":"(https:[^"]+)"/);
       const ogVideo = html.match(/<meta\s+property=["']og:video(?::secure_url)?["']\s+content=["']([^"']+)["']/i);
       const ogTitle = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
       const ogImage = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
 
       let directVideoUrl: string | null = null;
       if (hdMatch && hdMatch[1]) {
-        directVideoUrl = JSON.parse(`"${hdMatch[1]}"`);
+        directVideoUrl = hdMatch[1];
       } else if (sdMatch && sdMatch[1]) {
-        directVideoUrl = JSON.parse(`"${sdMatch[1]}"`);
+        directVideoUrl = sdMatch[1];
       } else if (ogVideo && ogVideo[1] && !ogVideo[1].includes('/embed/')) {
-        directVideoUrl = ogVideo[1];
+        directVideoUrl = ogVideo[1].replaceAll('&amp;', '&');
+      }
+
+      if (directVideoUrl && directVideoUrl.includes('lookaside.fbsbx.com')) {
+        directVideoUrl = await resolveFacebookLookasideUrl(directVideoUrl);
       }
 
       if (directVideoUrl) {
@@ -1024,7 +1037,7 @@ async function extractCobalt(url: string, platform: SocialPlatform): Promise<Ext
           platform,
           type: 'video',
           title: ogTitle ? ogTitle[1] : `Video ${platform.toUpperCase()}`,
-          thumbnail: ogImage ? ogImage[1] : undefined,
+          thumbnail: ogImage ? ogImage[1].replaceAll('&amp;', '&') : undefined,
           videoHd: directVideoUrl,
           mediaOptions: [
             {
@@ -1045,6 +1058,262 @@ async function extractCobalt(url: string, platform: SocialPlatform): Promise<Ext
   throw new Error(
     `Không thể trích xuất luồng video từ liên kết ${platform.toUpperCase()}. Nền tảng có thể đã hạn chế quyền truy cập hoặc video ở chế độ riêng tư/bản quyền.`
   );
+}
+
+/**
+ * Resolves Facebook lookaside.fbsbx.com crawler URLs into direct *.fbcdn.net/*.mp4 video URLs
+ * by sending the official facebookexternalhit/1.1 User-Agent and capturing the redirect location.
+ */
+async function resolveFacebookLookasideUrl(rawUrl: string): Promise<string> {
+  const cleanUrl = rawUrl.replaceAll('&amp;', '&').trim();
+  if (!cleanUrl.includes('lookaside.fbsbx.com')) {
+    return cleanUrl;
+  }
+
+  const crawlerHeaders = {
+    'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+    Accept: '*/*',
+  };
+
+  try {
+    const manualRes = await fetch(cleanUrl, {
+      method: 'GET',
+      headers: crawlerHeaders,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(5000),
+    });
+    const loc = manualRes.headers.get('location');
+    if (loc && loc.startsWith('http') && !loc.includes('facebook.com/login')) {
+      return loc;
+    }
+  } catch {
+    // Fallback to follow
+  }
+
+  try {
+    const followRes = await fetch(cleanUrl, {
+      method: 'HEAD',
+      headers: crawlerHeaders,
+      redirect: 'follow',
+      signal: AbortSignal.timeout(5000),
+    });
+    if (followRes.url && followRes.url.startsWith('http') && !followRes.url.includes('lookaside.fbsbx.com')) {
+      return followRes.url;
+    }
+  } catch {
+    // Return decoded lookaside URL
+  }
+
+  return cleanUrl;
+}
+
+/**
+ * Extracts Facebook video or Reel MP4 streams directly from HTML and resolves lookaside.fbsbx.com redirects.
+ */
+async function extractFacebook(url: string): Promise<ExtractionResult> {
+  let resolvedUrl = url;
+
+  try {
+    const headRes = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Sec-Fetch-Mode': 'navigate',
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(5000),
+    });
+    if (headRes.ok) {
+      resolvedUrl = headRes.url || resolvedUrl;
+    }
+  } catch {
+    // Continue
+  }
+
+  let ogTitleStr: string | null = null;
+  let ogImageStr: string | null = null;
+  let hdUrl: string | null = null;
+  let sdUrl: string | null = null;
+
+  // Query Facebook Video Embed Plugin endpoint first (extracts direct fbcdn.net stream)
+  try {
+    const embedPluginUrl = `https://www.facebook.com/plugins/video.php?href=${encodeURIComponent(resolvedUrl)}&show_text=0`;
+    const pluginRes = await fetch(embedPluginUrl, {
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+      },
+      signal: AbortSignal.timeout(6000),
+    });
+
+    if (pluginRes.ok) {
+      const pText = await pluginRes.text();
+      const pUnescaped = pText.replaceAll('\\/', '/').replaceAll('\\u0025', '%').replaceAll('\\u0026', '&');
+
+      const pHd =
+        pUnescaped.match(/"browser_native_hd_url":"(https:[^"]+)"/) ||
+        pUnescaped.match(/"playable_url_quality_hd":"(https:[^"]+)"/) ||
+        pUnescaped.match(/"hd_src_no_ratelimit":"(https:[^"]+)"/) ||
+        pUnescaped.match(/"hd_src":"(https:[^"]+)"/);
+
+      const pSd =
+        pUnescaped.match(/"browser_native_sd_url":"(https:[^"]+)"/) ||
+        pUnescaped.match(/"playable_url":"(https:[^"]+)"/) ||
+        pUnescaped.match(/"sd_src_no_ratelimit":"(https:[^"]+)"/) ||
+        pUnescaped.match(/"sd_src":"(https:[^"]+)"/);
+
+      if (pHd && pHd[1] && !pHd[1].includes('facebook.com')) hdUrl = pHd[1];
+      if (pSd && pSd[1] && !pSd[1].includes('facebook.com')) sdUrl = pSd[1];
+    }
+  } catch {
+    // Continue to HTML scraping
+  }
+
+  // Fetch main Facebook page HTML if plugin didn't extract both streams
+  if (!hdUrl || !sdUrl) {
+    try {
+      const res = await fetch(resolvedUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Sec-Fetch-Mode': 'navigate',
+        },
+        signal: AbortSignal.timeout(6000),
+      });
+
+      if (res.ok) {
+        const html = await res.text();
+        const unescaped = html.replaceAll('\\/', '/').replaceAll('\\u0025', '%').replaceAll('\\u0026', '&');
+
+        const hdMatch =
+          unescaped.match(/"browser_native_hd_url":"(https:[^"]+)"/) ||
+          unescaped.match(/"playable_url_quality_hd":"(https:[^"]+)"/) ||
+          unescaped.match(/"hd_src_no_ratelimit":"(https:[^"]+)"/) ||
+          unescaped.match(/"hd_src":"(https:[^"]+)"/);
+
+        const sdMatch =
+          unescaped.match(/"browser_native_sd_url":"(https:[^"]+)"/) ||
+          unescaped.match(/"playable_url":"(https:[^"]+)"/) ||
+          unescaped.match(/"sd_src_no_ratelimit":"(https:[^"]+)"/) ||
+          unescaped.match(/"sd_src":"(https:[^"]+)"/);
+
+        const ogTitle = html.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
+        const ogImage = html.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
+
+        if (ogTitle && ogTitle[1]) ogTitleStr = ogTitle[1].trim();
+        if (ogImage && ogImage[1]) ogImageStr = ogImage[1].replaceAll('&amp;', '&');
+
+        if (!hdUrl && hdMatch && hdMatch[1] && !hdMatch[1].includes('facebook.com')) {
+          hdUrl = hdMatch[1];
+        }
+        if (!sdUrl && sdMatch && sdMatch[1] && !sdMatch[1].includes('facebook.com')) {
+          sdUrl = sdMatch[1];
+        }
+
+        if (!hdUrl && !sdUrl) {
+          const ogVideo = html.match(/<meta\s+property=["']og:video(?::secure_url)?["']\s+content=["']([^"']+)["']/i);
+          if (ogVideo && ogVideo[1] && (ogVideo[1].includes('lookaside') || ogVideo[1].includes('fbcdn'))) {
+            sdUrl = ogVideo[1].replaceAll('&amp;', '&');
+          }
+        }
+      }
+    } catch {
+      // Continue
+    }
+  }
+
+  // Also try facebookexternalhit/1.1 if neither hdUrl nor sdUrl was extracted yet
+  if (!hdUrl && !sdUrl) {
+    try {
+      const crawlerRes = await fetch(resolvedUrl, {
+        headers: {
+          'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (crawlerRes.ok) {
+        const cHtml = await crawlerRes.text();
+        const cUnescaped = cHtml.replaceAll('\\/', '/').replaceAll('\\u0025', '%').replaceAll('\\u0026', '&');
+        const cHd =
+          cUnescaped.match(/"browser_native_hd_url":"(https:[^"]+)"/) ||
+          cUnescaped.match(/"playable_url_quality_hd":"(https:[^"]+)"/) ||
+          cUnescaped.match(/"hd_src":"(https:[^"]+)"/);
+        const cSd =
+          cUnescaped.match(/"browser_native_sd_url":"(https:[^"]+)"/) ||
+          cUnescaped.match(/"playable_url":"(https:[^"]+)"/) ||
+          cUnescaped.match(/"sd_src":"(https:[^"]+)"/);
+        const ogVideo = cHtml.match(/<meta\s+property=["']og:video(?::secure_url)?["']\s+content=["']([^"']+)["']/i);
+        const ogTitle = cHtml.match(/<meta\s+property=["']og:title["']\s+content=["']([^"']+)["']/i);
+        const ogImage = cHtml.match(/<meta\s+property=["']og:image["']\s+content=["']([^"']+)["']/i);
+
+        if (!ogTitleStr && ogTitle && ogTitle[1]) ogTitleStr = ogTitle[1].trim();
+        if (!ogImageStr && ogImage && ogImage[1]) ogImageStr = ogImage[1].replaceAll('&amp;', '&');
+        if (cHd && cHd[1]) hdUrl = cHd[1];
+        if (cSd && cSd[1]) sdUrl = cSd[1];
+        if (!hdUrl && !sdUrl && ogVideo && ogVideo[1] && !ogVideo[1].includes('/embed/')) {
+          sdUrl = ogVideo[1].replaceAll('&amp;', '&');
+        }
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  // Resolve lookaside.fbsbx.com crawler URLs to direct *.fbcdn.net/*.mp4 video streams
+  if (hdUrl && hdUrl.includes('lookaside.fbsbx.com')) {
+    hdUrl = await resolveFacebookLookasideUrl(hdUrl);
+  }
+  if (sdUrl && sdUrl.includes('lookaside.fbsbx.com')) {
+    sdUrl = await resolveFacebookLookasideUrl(sdUrl);
+  }
+
+  if (hdUrl || sdUrl) {
+    const primaryUrl = (hdUrl || sdUrl)!;
+    const mediaOptions: MediaDownloadOption[] = [];
+
+    if (hdUrl) {
+      mediaOptions.push({
+        id: 'facebook_hd',
+        label: 'Tải Video Facebook (MP4 HD)',
+        description: 'Độ nét cao nhất từ máy chủ Facebook',
+        format: 'mp4',
+        quality: 'HD 1080p / 720p',
+        url: hdUrl,
+      });
+    }
+
+    if (sdUrl && sdUrl !== hdUrl) {
+      mediaOptions.push({
+        id: 'facebook_sd',
+        label: 'Tải Video Facebook (MP4 SD)',
+        description: 'Dung lượng nhẹ, tốc độ tải nhanh',
+        format: 'mp4',
+        quality: 'SD Tiêu Chuẩn',
+        url: sdUrl,
+      });
+    }
+
+    return {
+      success: true,
+      platform: 'facebook',
+      type: 'video',
+      title: ogTitleStr || 'Video Facebook HD',
+      thumbnail: ogImageStr || undefined,
+      videoHd: hdUrl || primaryUrl,
+      videoSd: sdUrl || primaryUrl,
+      mediaOptions,
+    };
+  }
+
+  return await extractCobalt(resolvedUrl, 'facebook');
 }
 
 /**
@@ -1163,9 +1432,10 @@ export async function extractSocialMedia(url: string): Promise<ExtractionResult>
       return await extractTikTok(cleanUrl);
     case 'pinterest':
       return await extractPinterest(cleanUrl);
+    case 'facebook':
+      return await extractFacebook(cleanUrl);
     case 'youtube':
       return await extractYouTubeDirect(cleanUrl);
-    case 'facebook':
     case 'instagram':
     case 'twitter':
       return await extractCobalt(cleanUrl, detectedPlatform);
@@ -1699,14 +1969,38 @@ export function socialDownloadProxyPlugin(): Plugin {
           }
 
           try {
+            const upstreamHeaders: Record<string, string> = {
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+              Accept: '*/*',
+            };
+
+            const host = parsedMediaUrl.hostname.toLowerCase();
+            if (host.includes('lookaside.fbsbx.com') || host.includes('fbsbx.com')) {
+              upstreamHeaders['User-Agent'] =
+                'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
+              upstreamHeaders['Accept'] = '*/*';
+            } else if (host.includes('instagram') || host.includes('cdninstagram')) {
+              upstreamHeaders['Referer'] = 'https://www.instagram.com/';
+            } else if (host.includes('pinimg.com') || host.includes('pinterest.com')) {
+              upstreamHeaders['Referer'] = 'https://www.pinterest.com/';
+            } else if (host.includes('fbcdn.net') || host.includes('facebook.com')) {
+              upstreamHeaders['Referer'] = 'https://www.facebook.com/';
+            } else if (
+              host.includes('tiktok.com') ||
+              host.includes('tiktokcdn') ||
+              host.includes('tikwm.com') ||
+              host.includes('byteoversea.com')
+            ) {
+              upstreamHeaders['Referer'] = 'https://www.tiktok.com/';
+            } else if (host.includes('googlevideo.com') || host.includes('youtube.com')) {
+              upstreamHeaders['Referer'] = 'https://www.youtube.com/';
+            }
+
             // Fetch upstream with redirect: 'follow'
             const remoteRes = await fetch(mediaUrl, {
               method: 'GET',
-              headers: {
-                'User-Agent':
-                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                Accept: '*/*',
-              },
+              headers: upstreamHeaders,
               redirect: 'follow',
             });
 
