@@ -88,10 +88,10 @@ export function cleanDownloadFilename(filename: string): string {
   return name + ext;
 }
 
-const COBALT_V7_INSTANCES = [
+const COBALT_INSTANCES = [
   'https://api.cobalt.tools/',
-  'https://cobalt.q0.is/',
-  'https://api.cobalt.space/',
+  'https://cobalt.wuk.sh/',
+  'https://co.wuk.sh/',
 ];
 
 interface YouTubeResolutionResult {
@@ -100,20 +100,19 @@ interface YouTubeResolutionResult {
 }
 
 /**
- * Resolves a direct YouTube download URL purely via Cobalt API v7 and its public instances:
- * - Endpoint: root `/` (without `/api/json`)
- * - Payload: `{ url: targetUrl, vQuality: "1080" }`
+ * Resolves a direct YouTube download URL purely via Cobalt API instances:
+ * - Primary: https://api.cobalt.tools/
+ * - Fallback 1: https://cobalt.wuk.sh/
+ * - Fallback 2: https://co.wuk.sh/
+ * - Strictly sends `{ url: targetUrl }` (no `vQuality` or `videoQuality`) to pass strict schema validation.
  */
 async function resolveYouTubeClientSide(
-  videoId: string,
-  quality: '1080p' | '720p',
-  type: 'video' | 'audio'
+  videoId: string
 ): Promise<YouTubeResolutionResult> {
   const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const vQuality = quality === '1080p' ? '1080' : '720';
   let failureReason: 'rate_limit' | 'timeout' | 'network' = 'network';
 
-  for (const instanceUrl of COBALT_V7_INSTANCES) {
+  for (const instanceUrl of COBALT_INSTANCES) {
     try {
       const response = await fetch(instanceUrl, {
         method: 'POST',
@@ -123,8 +122,6 @@ async function resolveYouTubeClientSide(
         },
         body: JSON.stringify({
           url: targetUrl,
-          vQuality,
-          ...(type === 'audio' ? { isAudioOnly: true } : {}),
         }),
         signal: AbortSignal.timeout(25000),
       });
@@ -139,8 +136,8 @@ async function resolveYouTubeClientSide(
       }
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const data: any = await response.json().catch(() => null);
-      const resolvedUrl = data?.url || data?.picker?.[0]?.url;
+      const res: any = await response.json().catch(() => null);
+      const resolvedUrl = res?.url;
 
       if (
         resolvedUrl &&
@@ -156,7 +153,7 @@ async function resolveYouTubeClientSide(
       ) {
         failureReason = 'timeout';
       }
-      // Seamlessly try the next Cobalt v7 instance
+      // Seamlessly try the next Cobalt instance
     }
   }
 
@@ -207,8 +204,7 @@ export async function triggerDirectDownload(url: string, filename: string): Prom
     url.includes('/tunnel') ||
     url.includes('api.cobalt.tools') ||
     url.includes('cobalt.tools') ||
-    url.includes('cobalt.q0.is') ||
-    url.includes('cobalt.space') ||
+    url.includes('wuk.sh') ||
     url.includes('xenon.zone');
 
   const streamUrl = isAttachmentGuaranteed
@@ -426,7 +422,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       try {
         const directUrl = mediaUrl;
 
-        // Phase 1 & 2: Dedicated YouTube Client-Side Resolution via Cobalt API v7 Instances
+        // Phase 1 & 2: Dedicated YouTube Client-Side Resolution via Cobalt Instances
         const isYouTube =
           optionId?.startsWith('youtube_') ||
           optionId?.startsWith('yt_') ||
@@ -438,14 +434,6 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
         if (isYouTube && result?.videoId) {
           const isAudio = optionId === 'youtube_audio' || optionId === 'yt_audio';
-          const quality: '1080p' | '720p' =
-            optionId === 'youtube_1080p' ||
-            optionId === 'yt_1080p' ||
-            optionId === 'yt_1440p' ||
-            optionId === 'yt_2160p'
-              ? '1080p'
-              : '720p';
-          const mediaType: 'video' | 'audio' = isAudio ? 'audio' : 'video';
 
           setDownloadProgress((prev) => ({
             ...prev,
@@ -453,7 +441,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             stage: isAudio ? 'audio' : 'video',
           }));
 
-          const ytResolution = await resolveYouTubeClientSide(result.videoId, quality, mediaType);
+          const ytResolution = await resolveYouTubeClientSide(result.videoId);
           const resolvedYtUrl = ytResolution.url;
 
           if (!resolvedYtUrl) {
