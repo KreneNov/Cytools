@@ -76,23 +76,29 @@ export const HallOfFame: React.FC<HallOfFameProps> = ({
     };
   }, [refreshTrigger]);
 
+  const isProMemberEntry = (d: DonorEntry): boolean => {
+    if (d.badge === 'DONOR' || d.type === 'DONOR') return false;
+    if (d.badge === 'PRO' || d.type === 'PRO') return true;
+    return d.role === 'PRO Member' || d.badgeType === 'pro';
+  };
+
   const filteredDonors = useMemo(() => {
     if (filter === 'pro') {
-      return donorsList.filter((d) => d.role === 'PRO Member' || d.badgeType === 'pro');
+      return donorsList.filter((d) => isProMemberEntry(d));
     }
     if (filter === 'donate') {
-      return donorsList.filter((d) => d.role !== 'PRO Member' && d.badgeType !== 'pro');
+      return donorsList.filter((d) => !isProMemberEntry(d));
     }
     return donorsList;
   }, [filter, donorsList]);
 
   const proCount = useMemo(
-    () => donorsList.filter((d) => d.role === 'PRO Member' || d.badgeType === 'pro').length,
+    () => donorsList.filter((d) => isProMemberEntry(d)).length,
     [donorsList]
   );
 
   const donateCount = useMemo(
-    () => donorsList.filter((d) => d.role !== 'PRO Member' && d.badgeType !== 'pro').length,
+    () => donorsList.filter((d) => !isProMemberEntry(d)).length,
     [donorsList]
   );
 
@@ -177,7 +183,7 @@ export const HallOfFame: React.FC<HallOfFameProps> = ({
                   <span className="text-sm font-mono font-bold text-slate-800 dark:text-slate-200">
                     {donor.amount}
                   </span>
-                  {donor.role === 'PRO Member' || donor.badgeType === 'pro' ? (
+                  {isProMemberEntry(donor) ? (
                     <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-pink-500/10 border border-pink-500/20 text-pink-600 dark:text-pink-400 text-xs font-bold font-mono">
                       <Sparkles className="w-3 h-3" />
                       <span>PRO</span>
@@ -332,7 +338,7 @@ export const HallOfFame: React.FC<HallOfFameProps> = ({
                     <span className="text-sm font-mono font-bold text-slate-900 dark:text-slate-100">
                       {donor.amount}
                     </span>
-                    {donor.role === 'PRO Member' || donor.badgeType === 'pro' ? (
+                    {isProMemberEntry(donor) ? (
                       <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-pink-500/10 border border-pink-500/20 text-pink-600 dark:text-pink-400 text-xs font-bold font-mono">
                         <Sparkles className="w-3 h-3" />
                         <span>PRO</span>

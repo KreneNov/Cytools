@@ -4,6 +4,8 @@ import { createClient } from '@vercel/kv';
 export interface Order {
   code: string;
   type: 'PRO' | 'DONOR';
+  badge?: 'PRO' | 'DONOR';
+  isPro?: boolean;
   donorName: string;
   expectedAmount: number;
   actualAmount: number;
@@ -24,6 +26,8 @@ export interface Donor {
   name: string;
   role: string;
   badgeType: 'pro' | 'coffee' | 'heart';
+  badge?: 'PRO' | 'DONOR';
+  isPro?: boolean;
   amount: string;
   numericAmount: number;
   type: 'PRO' | 'DONOR';
@@ -293,10 +297,11 @@ export async function createOrder({
   await saveDb(db);
 
   // VietinBank (ICB) account 0862151811 (Nguyen Dang Khanh)
+  const addInfoContent = encodeURIComponent(type === 'DONOR' ? `${code} DONATE` : `${code} PRO`);
   const qrUrl =
     type === 'PRO'
-      ? `https://img.vietqr.io/image/ICB-0862151811-compact2.png?amount=5000&addInfo=${code}&accountName=NGUYEN%20DANG%20KHANH`
-      : `https://img.vietqr.io/image/ICB-0862151811-compact2.png?addInfo=${code}&accountName=NGUYEN%20DANG%20KHANH`;
+      ? `https://img.vietqr.io/image/ICB-0862151811-compact2.png?amount=5000&addInfo=${addInfoContent}&accountName=NGUYEN%20DANG%20KHANH`
+      : `https://img.vietqr.io/image/ICB-0862151811-compact2.png?addInfo=${addInfoContent}&accountName=NGUYEN%20DANG%20KHANH`;
 
   return { order: newOrder, qrUrl };
 }
@@ -351,7 +356,8 @@ export async function updateOrderName(code: string, donorName: string): Promise<
  */
 export async function markOrderPaid(
   code: string,
-  actualAmount: number = 5000
+  actualAmount: number = 5000,
+  badgeOverride?: 'PRO' | 'DONOR'
 ): Promise<{
   success: boolean;
   order?: Order;
@@ -370,13 +376,15 @@ export async function markOrderPaid(
 
   const now = new Date();
   const paidIso = now.toISOString();
+  const resolvedBadge: 'PRO' | 'DONOR' = badgeOverride || (order?.type === 'DONOR' ? 'DONOR' : 'PRO');
 
   if (!order) {
     // Auto-provision order on-the-fly for confirmed payments
-    const isPro = actualAmount >= 5000;
     order = {
       code: upper,
-      type: isPro ? 'PRO' : 'DONOR',
+      type: resolvedBadge,
+      badge: resolvedBadge,
+      isPro: true,
       donorName: 'Người bạn đồng hành',
       expectedAmount: actualAmount,
       actualAmount: actualAmount,
@@ -391,19 +399,22 @@ export async function markOrderPaid(
       return { success: true, order, donor: existingDonor, alreadyPaid: true };
     }
 
-    if (order.type === 'PRO' && actualAmount < 5000) {
+    if (resolvedBadge === 'PRO' && actualAmount < 5000) {
       return { success: false, error: 'Số tiền thanh toán chưa đủ 5.000đ cho gói PRO' };
     }
 
     order.status = 'PAID';
+    order.type = resolvedBadge;
+    order.badge = resolvedBadge;
+    order.isPro = true;
     order.actualAmount = actualAmount;
     order.paidAt = paidIso;
   }
 
   const finalName = order.donorName?.trim() || 'Người bạn đồng hành';
-  const isPro = order.type === 'PRO' || actualAmount >= 5000;
+  const isPro = true;
 
-  // 1. Register license key (order code acts as the license key) for any PRO or 5k+ donation
+  // 1. Register license key (order code acts as the license key) for both PRO and DONOR transactions
   if (isPro && !db.licenses.some((l) => l && l.key && l.key.toUpperCase() === upper)) {
     db.licenses.push({
       key: upper,
@@ -415,10 +426,10 @@ export async function markOrderPaid(
   // 2. Prepend or update donor in Hall of Fame
   const formattedDate = `${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`;
   const formattedAmount = `${new Intl.NumberFormat('vi-VN').format(actualAmount)}đ`;
-  const role = isPro ? 'PRO Member' : actualAmount >= 50000 ? 'Super Supporter' : 'Donator';
-  const badgeType: 'pro' | 'coffee' | 'heart' = isPro ? 'pro' : actualAmount >= 50000 ? 'coffee' : 'heart';
+  const role = resolvedBadge === 'PRO' ? 'PRO Member' : actualAmount >= 50000 ? 'Super Supporter' : 'Donator';
+  const badgeType: 'pro' | 'coffee' | 'heart' = resolvedBadge === 'PRO' ? 'pro' : actualAmount >= 50000 ? 'coffee' : 'heart';
   const randomColor = AVATAR_COLORS[Math.floor(Math.random() * AVATAR_COLORS.length)];
-  const defaultMessage = isPro
+  const defaultMessage = resolvedBadge === 'PRO'
     ? 'Kích hoạt gói PRO tự động qua VietQR.'
     : 'Ủng hộ dự án Cytools phát triển cộng đồng.';
 
@@ -432,7 +443,9 @@ export async function markOrderPaid(
       name: finalName,
       amount: formattedAmount,
       numericAmount: actualAmount,
-      type: isPro ? 'PRO' : 'DONOR',
+      type: resolvedBadge,
+      badge: resolvedBadge,
+      isPro: true,
       role,
       badgeType,
     };
@@ -444,9 +457,11 @@ export async function markOrderPaid(
       name: finalName,
       role,
       badgeType,
+      badge: resolvedBadge,
+      isPro: true,
       amount: formattedAmount,
       numericAmount: actualAmount,
-      type: isPro ? 'PRO' : 'DONOR',
+      type: resolvedBadge,
       message: defaultMessage,
       date: formattedDate,
       avatarColor: randomColor,
@@ -505,8 +520,12 @@ export async function getHallOfFame(): Promise<{
     return sum + (Number.isNaN(parsed) ? 0 : parsed);
   }, 0);
 
-  const proCount = donors.filter((d) => d.type === 'PRO' || d.role === 'PRO Member').length;
-  const donorCount = donors.filter((d) => d.type !== 'PRO' && d.role !== 'PRO Member').length;
+  const proCount = donors.filter(
+    (d) => (d.badge || d.type) === 'PRO' || (d.badge !== 'DONOR' && d.role === 'PRO Member')
+  ).length;
+  const donorCount = donors.filter(
+    (d) => (d.badge || d.type) === 'DONOR' || (d.badge !== 'PRO' && d.type !== 'PRO' && d.role !== 'PRO Member')
+  ).length;
 
   return {
     donors,

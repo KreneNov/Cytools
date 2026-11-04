@@ -349,13 +349,16 @@ export const UpgradeModal: React.FC = () => {
     }, 2000);
   };
 
-  const currentTransferContent = sessionCode || generateClientPaymentCode();
+  const baseTransferCode = sessionCode || generateClientPaymentCode();
+  const proTransferContent = `${baseTransferCode} PRO`;
+  const donateTransferContent = `${baseTransferCode} DONATE`;
+  const currentTransferContent = activeTab === 'donate' ? donateTransferContent : proTransferContent;
   const effectiveQrUrl =
     activeTab === 'pro'
-      ? (qrUrl && qrUrl.includes('amount=5000')
+      ? (qrUrl && qrUrl.includes('amount=5000') && qrUrl.includes('PRO')
           ? qrUrl
-          : `https://img.vietqr.io/image/ICB-0862151811-compact2.png?amount=5000&addInfo=${currentTransferContent}&accountName=NGUYEN%20DANG%20KHANH`)
-      : `https://img.vietqr.io/image/ICB-0862151811-compact2.png?addInfo=${currentTransferContent}&accountName=NGUYEN%20DANG%20KHANH`;
+          : `https://img.vietqr.io/image/ICB-0862151811-compact2.png?amount=5000&addInfo=${encodeURIComponent(proTransferContent)}&accountName=NGUYEN%20DANG%20KHANH`)
+      : `https://img.vietqr.io/image/ICB-0862151811-compact2.png?addInfo=${encodeURIComponent(donateTransferContent)}&accountName=NGUYEN%20DANG%20KHANH`;
 
   return (
     <AnimatePresence>

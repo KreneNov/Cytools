@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import {
-  Shield,
   Sparkles,
   CheckCircle2,
   Loader2,
@@ -89,12 +88,6 @@ export const Header: React.FC<HeaderProps> = ({ onOpenMobileMenu }) => {
       </div>
 
       <div className="flex items-center gap-3">
-        {/* Client-Side Sandbox Guarantee Badge */}
-        <div className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400">
-          <Shield className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
-          <span>Client-Side Sandbox</span>
-        </div>
-
         {/* Install Extension Shortcut Button */}
         <button
           type="button"

@@ -70,7 +70,8 @@ export function extractPaymentCode(description: unknown): string | null {
   const text = description.trim();
 
   // 1. Primary: Match SEVQR + 5 alphanumeric characters (VietinBank / SePay standard)
-  const sevqrMatch = text.match(/(?:^|[^A-Z0-9])(SEVQR[A-Z0-9]{5})(?:[^A-Z0-9]|$)/i);
+  // Safely extracts the 10-char SEVQR code even when followed by " PRO", " DONATE", or concatenated "PRO"/"DONATE"
+  const sevqrMatch = text.match(/(?:^|[^A-Z0-9])(SEVQR[A-Z0-9]{5})/i);
   if (sevqrMatch && sevqrMatch[1]) {
     return sevqrMatch[1].toUpperCase();
   }
@@ -207,9 +208,18 @@ export async function handleWebhookRequest(req: ExtendedRequest, res: ExtendedRe
       });
     }
 
-    console.log(`[Webhook Matched Code] Tìm thấy mã đơn hàng: ${code}`);
+    // Determine badge classification from raw transaction content (PRO vs DONATE)
+    const upperContent = String(description || '').toUpperCase();
+    let badge: 'PRO' | 'DONOR' = 'PRO';
+    if (upperContent.includes('DONATE')) {
+      badge = 'DONOR';
+    } else if (upperContent.includes('PRO')) {
+      badge = 'PRO';
+    }
 
-    const result = await markOrderPaid(code, amount || 5000);
+    console.log(`[Webhook Matched Code] Tìm thấy mã đơn hàng: ${code}, Phân loại badge: ${badge}`);
+
+    const result = await markOrderPaid(code, amount || 5000, badge);
 
     if (!result.success) {
       console.warn(`[Webhook Warning] Không thể kích hoạt đơn ${code}:`, result.error);
