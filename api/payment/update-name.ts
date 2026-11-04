@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'http';
 import { updateOrderName } from '../_db.js';
+import { applyCorsHeaders } from '../_cors.js';
 
 interface ExtendedRequest extends IncomingMessage {
   body?: {
@@ -13,9 +14,9 @@ interface ExtendedResponse extends ServerResponse {
   json?: (data: any) => void;
 }
 
-function sendJson(res: ExtendedResponse, statusCode: number, data: any) {
+function sendJson(res: ExtendedResponse, statusCode: number, data: any, req?: IncomingMessage) {
   res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  applyCorsHeaders(req, res, 'POST, OPTIONS');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
@@ -24,9 +25,7 @@ function sendJson(res: ExtendedResponse, statusCode: number, data: any) {
 }
 
 export default async function handler(req: ExtendedRequest, res: ExtendedResponse) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  applyCorsHeaders(req, res, 'POST, OPTIONS');
 
   if (req.method === 'OPTIONS') {
     res.statusCode = 200;

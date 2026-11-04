@@ -17,7 +17,7 @@ async function runTests() {
   globalThis.window = {
     location: {
       protocol: 'https:',
-      hostname: 'cytools.vercel.app',
+      hostname: 'cytools.io.vn',
     },
   };
   globalThis.chrome = undefined;
@@ -40,11 +40,11 @@ async function runTests() {
   assert.strictEqual(apiModule.isExtensionEnvironment(), true, 'Must detect extension via protocol');
   const extVerifyUrl = apiModule.getApiUrl('/api/payment/verify-key');
   console.log('Extension verify-key URL:', extVerifyUrl);
-  assert.strictEqual(extVerifyUrl, 'https://cytools.vercel.app/api/payment/verify-key', 'Must prepend production Vercel domain');
+  assert.strictEqual(extVerifyUrl, 'https://cytools.io.vn/api/payment/verify-key', 'Must prepend production cytools.io.vn domain');
 
   const extStatusUrl = apiModule.getApiUrl('/api/payment/status?code=SEVQR99999');
   console.log('Extension status URL:', extStatusUrl);
-  assert.strictEqual(extStatusUrl, 'https://cytools.vercel.app/api/payment/status?code=SEVQR99999', 'Must preserve query parameters');
+  assert.strictEqual(extStatusUrl, 'https://cytools.io.vn/api/payment/status?code=SEVQR99999', 'Must preserve query parameters');
   console.log('✓ Test 2 Passed');
 
   // Test 3: Chrome Extension simulation via chrome.runtime.id
@@ -64,7 +64,7 @@ async function runTests() {
   assert.strictEqual(apiModule.isExtensionEnvironment(), true, 'Must detect extension via chrome.runtime.id');
   const extHofUrl = apiModule.getApiUrl('/api/hall-of-fame');
   console.log('Extension Hall of Fame URL:', extHofUrl);
-  assert.strictEqual(extHofUrl, 'https://cytools.vercel.app/api/hall-of-fame', 'Must route to production Vercel domain');
+  assert.strictEqual(extHofUrl, 'https://cytools.io.vn/api/hall-of-fame', 'Must route to production cytools.io.vn domain');
   console.log('✓ Test 3 Passed');
 
   // Test 4: External absolute URLs should not be modified
@@ -73,14 +73,17 @@ async function runTests() {
   assert.strictEqual(apiModule.getApiUrl(externalUrl), externalUrl, 'External URLs must pass through untouched');
   console.log('✓ Test 4 Passed');
 
-  // Test 5: Verify public/manifest.json host_permissions
-  console.log('\n[Test 5] Verifying public/manifest.json host_permissions:');
+  // Test 5: Verify public/manifest.json host_permissions, externally_connectable, and CSP
+  console.log('\n[Test 5] Verifying public/manifest.json host_permissions & externally_connectable:');
   const manifestPath = path.resolve(__dirname, '../public/manifest.json');
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
 
   assert.ok(Array.isArray(manifest.host_permissions), 'manifest.json must have host_permissions array');
-  assert.ok(manifest.host_permissions.includes('https://cytools.vercel.app/*'), 'host_permissions must contain https://cytools.vercel.app/*');
-  assert.ok(manifest.host_permissions.includes('*://*.vercel.app/*'), 'host_permissions must contain *://*.vercel.app/*');
+  assert.ok(manifest.host_permissions.includes('https://cytools.io.vn/*'), 'host_permissions must contain https://cytools.io.vn/*');
+  assert.ok(manifest.host_permissions.includes('https://*.cytools.io.vn/*'), 'host_permissions must contain https://*.cytools.io.vn/*');
+  assert.ok(Array.isArray(manifest.externally_connectable?.matches), 'manifest.json must have externally_connectable.matches');
+  assert.ok(manifest.externally_connectable.matches.includes('https://*.cytools.io.vn/*'), 'externally_connectable.matches must include https://*.cytools.io.vn/*');
+  assert.ok(manifest.content_security_policy?.extension_pages?.includes('https://cytools.io.vn'), 'CSP must whitelist https://cytools.io.vn');
   console.log('Manifest Host Permissions:', manifest.host_permissions);
   console.log('✓ Test 5 Passed');
 

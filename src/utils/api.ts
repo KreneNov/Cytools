@@ -1,10 +1,10 @@
 /**
  * Universal API URL Resolver for Cytools
- * Automatically routes API calls to https://cytools.vercel.app when running
+ * Automatically routes API calls to https://cytools.io.vn when running
  * in a Chrome Extension context, while preserving relative /api paths for standard Web.
  */
 
-export const PRODUCTION_API_URL = 'https://cytools.vercel.app';
+export const PRODUCTION_API_URL = 'https://cytools.io.vn';
 
 /**
  * Detects whether the code is executing within a Chrome Extension (Manifest V3)
@@ -25,7 +25,7 @@ export function isExtensionEnvironment(): boolean {
 
 /**
  * Returns the resolved API URL for a given path.
- * - In Chrome Extension: prepends https://cytools.vercel.app
+ * - In Chrome Extension: prepends https://cytools.io.vn
  * - In Web Browser: returns relative path (or VITE_API_BASE_URL if configured)
  */
 export function getApiUrl(path: string): string {

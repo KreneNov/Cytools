@@ -43,7 +43,7 @@ const INITIAL_PROGRESS: DownloadProgress = {
 const SAVETUBE_AES_KEY_HEX = 'C5D58EF67A7584E4A29F6C35BBC4EB12';
 
 /**
- * Strips unwanted upstream branding domains and suffixes (e.g. -ytshorts.savetube.me, savenow, cobalt...)
+ * Strips unwanted upstream branding domains and suffixes (e.g. -ytshorts, savetube, savenow, cobalt...)
  * and sanitizes illegal OS file system characters (\ / : * ? " < > |), control characters,
  * leading dots/slashes, and trailing dots to prevent Chrome Extension "Invalid filename" errors.
  */
@@ -129,7 +129,6 @@ async function decryptSaveTubeData(encryptedBase64: string): Promise<any> {
 
 const SAVETUBE_DISCOVERY_ENDPOINTS = [
   'https://media.savetube.vip/api/random-cdn',
-  'https://media.savetube.me/api/random-cdn',
 ];
 
 interface YouTubeResolutionResult {
@@ -138,11 +137,11 @@ interface YouTubeResolutionResult {
 }
 
 /**
- * Resolves a direct YouTube download URL 100% client-side (completely bypassing Vercel /api/download):
- * 1. Engine 1 (Primary): SaveTube VIP / ME CDN v2 (45s timeout for long 1080p muxing + fresh node retry on 429/error).
- * 2. Engine 2 (Fallback 1): Client-side Cobalt v10 via https://rue-cobalt.xenon.zone/ (strict v10 payload, no dead /api/json URLs).
- * 3. Engine 3 (Fallback 2): Loader.to / OceanSaver (https://p.savenow.to) client-side polling.
- * 4. Engine 4 (Extension Fallback): Chrome Extension Direct Innertube ANDROID_VR.
+ * Resolves a direct YouTube download URL 100% client-side with a resilient multi-tier fallback chain:
+ * 1. Engine 1 (Primary): Official Cobalt API (`https://api.cobalt.tools/api/json`) with `videoQuality: "1080"` and `filenamePattern: "classic"`.
+ * 2. Engine 2 (Fallback 1): Client-side Cobalt v10 via `https://rue-cobalt.xenon.zone/`.
+ * 3. Engine 3 (Fallback 2): SaveTube VIP CDN v2 (`https://media.savetube.vip/api/random-cdn`) with graceful 429 handling.
+ * 4. Engine 4 (Fallback 3): Loader.to / OceanSaver (`https://p.savenow.to`) client-side polling & Chrome Extension Innertube.
  */
 async function resolveYouTubeClientSide(
   videoId: string,
@@ -152,11 +151,89 @@ async function resolveYouTubeClientSide(
   const targetYouTubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
   let failureReason: 'rate_limit' | 'timeout' | 'network' = 'network';
 
-  // Engine 1 (Primary): SaveTube VIP / ME CDN v2 with 300s (5m) muxing timeout & fresh CDN node retry
+  // Engine 1 (Primary): Cobalt API (https://api.cobalt.tools/api/json)
+  try {
+    const primaryCobaltRes = await fetch('https://api.cobalt.tools/api/json', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        url: targetYouTubeUrl,
+        videoQuality: quality === '1080p' ? '1080' : '720',
+        filenamePattern: 'classic',
+        ...(type === 'audio' ? { isAudioOnly: true } : {}),
+      }),
+      signal: AbortSignal.timeout(25000),
+    });
+
+    if (primaryCobaltRes.status === 429) {
+      failureReason = 'rate_limit';
+    } else if (primaryCobaltRes.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const primaryData: any = await primaryCobaltRes.json().catch(() => null);
+      const primaryUrl = primaryData?.url || primaryData?.picker?.[0]?.url;
+      if (
+        primaryUrl &&
+        typeof primaryUrl === 'string' &&
+        primaryUrl.startsWith('http')
+      ) {
+        return { url: primaryUrl };
+      }
+    }
+  } catch (primaryCobaltErr) {
+    if (
+      primaryCobaltErr instanceof Error &&
+      (primaryCobaltErr.name === 'TimeoutError' ||
+        primaryCobaltErr.name === 'AbortError')
+    ) {
+      failureReason = 'timeout';
+    }
+  }
+
+  // Engine 2 (Fallback 1): Cobalt v10 Mesh Node (https://rue-cobalt.xenon.zone/)
+  try {
+    const cobaltRes = await fetch('https://rue-cobalt.xenon.zone/', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        url: targetYouTubeUrl,
+        videoQuality: quality === '1080p' ? '1080' : '720',
+        downloadMode: type === 'audio' ? 'audio' : 'auto',
+        youtubeVideoCodec: 'h264',
+        filenameStyle: 'classic',
+      }),
+      signal: AbortSignal.timeout(45000),
+    });
+
+    if (cobaltRes.status === 429) {
+      failureReason = 'rate_limit';
+    } else if (cobaltRes.ok) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const data: any = await cobaltRes.json().catch(() => null);
+      const cobaltUrl = data?.url || data?.picker?.[0]?.url;
+      if (cobaltUrl && typeof cobaltUrl === 'string' && cobaltUrl.startsWith('http')) {
+        return { url: cobaltUrl };
+      }
+    }
+  } catch (cobaltErr) {
+    if (
+      cobaltErr instanceof Error &&
+      (cobaltErr.name === 'TimeoutError' || cobaltErr.name === 'AbortError')
+    ) {
+      failureReason = 'timeout';
+    }
+  }
+
+  // Engine 3 (Fallback 2): SaveTube VIP CDN v2 with graceful 429 handling (no uncaught throw)
   for (const discoveryUrl of SAVETUBE_DISCOVERY_ENDPOINTS) {
     try {
       const cdnRes = await fetch(discoveryUrl, {
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.timeout(25000),
       });
       if (cdnRes.status === 429) {
         failureReason = 'rate_limit';
@@ -167,7 +244,7 @@ async function resolveYouTubeClientSide(
       }
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const cdnData: any = await cdnRes.json();
+      const cdnData: any = await cdnRes.json().catch(() => null);
       const cdnHost = cdnData?.cdn || 'cdn405.savetube.vip';
 
       const infoRes = await fetch(`https://${cdnHost}/v2/info`, {
@@ -177,7 +254,7 @@ async function resolveYouTubeClientSide(
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ url: targetYouTubeUrl }),
-        signal: AbortSignal.timeout(60000),
+        signal: AbortSignal.timeout(45000),
       });
 
       if (infoRes.status === 429) {
@@ -189,7 +266,7 @@ async function resolveYouTubeClientSide(
       }
 
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const infoJson: any = await infoRes.json();
+      const infoJson: any = await infoRes.json().catch(() => null);
       if (infoJson?.status && typeof infoJson.data === 'string') {
         const decrypted = await decryptSaveTubeData(infoJson.data);
         if (decrypted?.key) {
@@ -201,7 +278,10 @@ async function resolveYouTubeClientSide(
                 ? ['1080', '720', '360']
                 : ['720', '360'];
 
+          let hitRateLimitOnNode = false;
           for (const q of targetQualities) {
+            if (hitRateLimitOnNode) break;
+
             const dlRes = await fetch(`https://${cdnHost}/download`, {
               method: 'POST',
               headers: {
@@ -214,13 +294,13 @@ async function resolveYouTubeClientSide(
                 key: decrypted.key,
                 title: cleanDownloadFilename(decrypted?.title || 'video'),
               }),
-              // 300,000ms (5 minutes) timeout so massive/long videos never prematurely abort during muxing
-              signal: AbortSignal.timeout(300000),
+              signal: AbortSignal.timeout(180000),
             });
 
             if (dlRes.status === 429) {
               failureReason = 'rate_limit';
-              throw new Error('SAVETUBE_RATE_LIMITED_429');
+              hitRateLimitOnNode = true;
+              break;
             }
 
             if (!dlRes.ok) {
@@ -228,10 +308,11 @@ async function resolveYouTubeClientSide(
             }
 
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const dlJson: any = await dlRes.json();
+            const dlJson: any = await dlRes.json().catch(() => null);
             if (dlJson?.status === false && String(dlJson?.message || '').includes('429')) {
               failureReason = 'rate_limit';
-              throw new Error('SAVETUBE_RATE_LIMITED_429');
+              hitRateLimitOnNode = true;
+              break;
             }
 
             const resolvedLink = dlJson?.data?.downloadUrl;
@@ -252,56 +333,15 @@ async function resolveYouTubeClientSide(
       ) {
         failureReason = 'timeout';
       }
-      console.warn(
-        `[useSocialDownloader] Savetube node (${discoveryUrl}) failed, retrying next CDN or fallback:`,
-        saveTubeErr
-      );
     }
   }
 
-  // Engine 2 (Fallback 1): Strict Cobalt v10 on https://rue-cobalt.xenon.zone/ (root path /, NO isAudioOnly)
-  try {
-    const cobaltRes = await fetch('https://rue-cobalt.xenon.zone/', {
-      method: 'POST',
-      headers: {
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        url: targetYouTubeUrl,
-        videoQuality: quality === '1080p' ? '1080' : '720',
-        downloadMode: type === 'audio' ? 'audio' : 'auto',
-        youtubeVideoCodec: 'h264',
-      }),
-      signal: AbortSignal.timeout(60000),
-    });
-
-    if (cobaltRes.status === 429) {
-      failureReason = 'rate_limit';
-    } else if (cobaltRes.ok) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const data: any = await cobaltRes.json().catch(() => null);
-      const cobaltUrl = data?.url || data?.picker?.[0]?.url;
-      if (cobaltUrl && typeof cobaltUrl === 'string' && cobaltUrl.startsWith('http')) {
-        return { url: cobaltUrl };
-      }
-    }
-  } catch (cobaltErr) {
-    if (
-      cobaltErr instanceof Error &&
-      (cobaltErr.name === 'TimeoutError' || cobaltErr.name === 'AbortError')
-    ) {
-      failureReason = 'timeout';
-    }
-    console.warn('[useSocialDownloader] Fallback 1 (rue-cobalt.xenon.zone) failed:', cobaltErr);
-  }
-
-  // Engine 3 (Fallback 2): Loader.to / OceanSaver (p.savenow.to) Client-Side Polling
+  // Engine 4 (Fallback 3): Loader.to / OceanSaver (p.savenow.to) Client-Side Polling
   try {
     const format = type === 'audio' ? 'mp3' : quality === '1080p' ? '1080' : '720';
     const initUrl = `https://p.savenow.to/ajax/download.php?copyright=0&format=${format}&url=${encodeURIComponent(targetYouTubeUrl)}&api=dfcb6d76f2f6a9894gjkege8a4ab232222`;
     const initRes = await fetch(initUrl, {
-      signal: AbortSignal.timeout(60000),
+      signal: AbortSignal.timeout(45000),
     });
 
     if (initRes.status === 429) {
@@ -310,11 +350,11 @@ async function resolveYouTubeClientSide(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const initData: any = await initRes.json().catch(() => null);
       if (initData?.id) {
-        for (let attempt = 0; attempt < 60; attempt++) {
+        for (let attempt = 0; attempt < 45; attempt++) {
           await new Promise((resolve) => setTimeout(resolve, 1500));
           const progRes = await fetch(
             `https://p.savenow.to/ajax/progress.php?id=${encodeURIComponent(initData.id)}`,
-            { signal: AbortSignal.timeout(30000) }
+            { signal: AbortSignal.timeout(25000) }
           );
           if (!progRes.ok) continue;
 
@@ -346,10 +386,9 @@ async function resolveYouTubeClientSide(
     ) {
       failureReason = 'timeout';
     }
-    console.warn('[useSocialDownloader] Fallback 2 (p.savenow.to) failed:', savenowErr);
   }
 
-  // Engine 4 (Extension Fallback): Chrome Extension Direct Innertube ANDROID_VR
+  // Engine 5 (Extension Fallback): Chrome Extension Direct Innertube ANDROID_VR
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
   if (chromeObj?.downloads?.download) {
@@ -377,7 +416,7 @@ async function resolveYouTubeClientSide(
             },
           },
         }),
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.timeout(25000),
       });
 
       if (vrRes.ok && vrRes.status !== 429) {
@@ -413,7 +452,7 @@ async function resolveYouTubeClientSide(
  * Triggers a direct native download on the client without jumping tabs and without buffering files in JS memory:
  * - Chrome Extension: Uses chrome.downloads.download({ url, filename: cleanName }) (writes directly to disk)
  * - Web App:
- *    1. URLs with guaranteed attachment headers (SaveTube VIP/ME CDN, Cobalt tunnel, SaveNow): Hidden iframe injection directly to `url`.
+ *    1. URLs with guaranteed attachment headers (Cobalt tunnel, SaveTube VIP CDN, SaveNow): Hidden iframe injection directly to `url`.
  *    2. Direct CDN URLs (TikTok, Facebook, Instagram, Pinterest, etc.): Hidden iframe injection to `/api/download?url=...&filename=...`
  *       which streams with `Content-Disposition: attachment` so the browser's native download manager starts immediately within 500ms without opening a new tab.
  */
@@ -448,15 +487,16 @@ export async function triggerDirectDownload(url: string, filename: string): Prom
     return;
   }
 
-  // 2. Web App - Tunnel/API/CDN URLs with guaranteed attachment headers (SaveTube CDN, Cobalt tunnel, SaveNow...)
+  // 2. Web App - Tunnel/API/CDN URLs with guaranteed attachment headers (Cobalt tunnel, SaveTube VIP CDN, SaveNow...)
   const isAttachmentGuaranteed =
     url.includes('/tunnel') ||
+    url.includes('api.cobalt.tools') ||
+    url.includes('cobalt.tools') ||
     url.includes('xenon.zone') ||
     url.includes('savenow.to') ||
     url.includes('oceansaver.in') ||
     url.includes('loader.to') ||
     url.includes('savetube.vip') ||
-    url.includes('savetube.me') ||
     url.includes('savetube.su');
 
   const streamUrl = isAttachmentGuaranteed
@@ -498,35 +538,49 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         cleanUrl.includes('instagram.com');
 
       if (isInstagram) {
-        // Direct Client-Side Cobalt v10 Extraction for Instagram using rue-cobalt.xenon.zone (Permissive CORS)
+        // Direct Client-Side Cobalt Extraction for Instagram
         let directVideoUrl: string | null = null;
         let thumbUrl: string | undefined = undefined;
 
-        try {
-          const response = await fetch('https://rue-cobalt.xenon.zone/', {
-            method: 'POST',
-            headers: {
-              Accept: 'application/json',
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              url: cleanUrl,
-              downloadMode: 'auto',
-            }),
-            signal: AbortSignal.timeout(60000),
-          });
+        for (const cobaltEndpoint of [
+          'https://api.cobalt.tools/api/json',
+          'https://rue-cobalt.xenon.zone/',
+        ]) {
+          if (directVideoUrl) break;
+          try {
+            const response = await fetch(cobaltEndpoint, {
+              method: 'POST',
+              headers: {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(
+                cobaltEndpoint.includes('/api/json')
+                  ? {
+                      url: cleanUrl,
+                      videoQuality: '1080',
+                      filenamePattern: 'classic',
+                    }
+                  : {
+                      url: cleanUrl,
+                      downloadMode: 'auto',
+                    }
+              ),
+              signal: AbortSignal.timeout(30000),
+            });
 
-          if (response.ok) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const resJson: any = await response.json();
-            directVideoUrl = resJson.url || resJson.picker?.[0]?.url || null;
-            thumbUrl = resJson.picker?.[0]?.thumb || undefined;
+            if (response.ok) {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const resJson: any = await response.json().catch(() => null);
+              directVideoUrl = resJson?.url || resJson?.picker?.[0]?.url || null;
+              thumbUrl = resJson?.picker?.[0]?.thumb || undefined;
+            }
+          } catch {
+            // Try next endpoint
           }
-        } catch (cobaltErr) {
-          console.warn('[useSocialDownloader] Client rue-cobalt Instagram attempt failed:', cobaltErr);
         }
 
-        // Parallel / Fallback: Server-side extractor via /api/social/extract if client rue-cobalt failed or returned no URL
+        // Parallel / Fallback: Server-side extractor via /api/social/extract if client Cobalt failed or returned no URL
         if (!directVideoUrl) {
           try {
             const apiRes = await apiFetch(`/api/social/extract?url=${encodeURIComponent(cleanUrl)}`);
@@ -537,8 +591,8 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
                 return serverData;
               }
             }
-          } catch (serverErr) {
-            console.warn('[useSocialDownloader] Server fallback Instagram extraction failed:', serverErr);
+          } catch {
+            // Fallback handled below
           }
         }
 
@@ -602,7 +656,10 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       setResult(data);
       return data;
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Đã có lỗi xảy ra khi bóc tách liên kết.';
+      const msg =
+        err instanceof Error && !err.message.toLowerCase().includes('failed to fetch')
+          ? err.message
+          : 'Hệ thống tải đang quá tải, vui lòng thử lại sau.';
       setExtractError(msg);
       return null;
     } finally {
@@ -669,9 +726,9 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       scheduleStageProgression();
 
       try {
-        let directUrl = mediaUrl;
+        const directUrl = mediaUrl;
 
-        // Phase 1 & 2: Dedicated YouTube Client-Side Resolution & Direct Download (Bypasses Vercel /api/download)
+        // Phase 1 & 2: Dedicated YouTube Client-Side Resolution & Direct Download
         const isYouTube =
           optionId?.startsWith('youtube_') ||
           optionId?.startsWith('yt_') ||
@@ -699,7 +756,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             stage: isAudio ? 'audio' : 'video',
           }));
 
-          // Resolve direct stream URL 100% client-side (Engine 1: Savetube -> Engine 2: rue-cobalt -> Engine 3: savenow.to -> Engine 4: Extension Innertube)
+          // Resolve direct stream URL client-side (Cobalt API -> rue-cobalt -> savetube.vip -> savenow.to -> Extension Innertube)
           const ytResolution = await resolveYouTubeClientSide(result.videoId, quality, mediaType);
           let resolvedYtUrl = ytResolution.url;
 
@@ -716,19 +773,12 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           }
 
           if (!resolvedYtUrl) {
-            if (ytResolution.failureReason === 'rate_limit') {
-              throw new Error(
-                'Hệ thống máy chủ xử lý đang quá tải (HTTP 429). Vui lòng thử lại sau ít phút hoặc sử dụng Extension.'
-              );
-            }
             if (ytResolution.failureReason === 'timeout') {
               throw new Error(
-                'Quá thời gian chờ ghép kênh video 1080p dung lượng lớn (Timeout). Vui lòng thử lại hoặc chọn bản 720p.'
+                'Quá thời gian chờ ghép kênh video 1080p dung lượng lớn. Vui lòng thử lại hoặc chọn bản 720p.'
               );
             }
-            throw new Error(
-              'Không thể kết nối máy chủ phân giải luồng YouTube vào lúc này. Vui lòng thử lại sau giây lát.'
-            );
+            throw new Error('Hệ thống tải đang quá tải, vui lòng thử lại sau.');
           }
 
           setDownloadProgress((prev) => ({
@@ -737,7 +787,6 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             stage: 'muxing',
           }));
 
-          // Trigger direct download (chrome.downloads on Extension, Hidden Iframe or <a target="_blank"> on Web App)
           await triggerDirectDownload(resolvedYtUrl, cleanTargetFileName);
 
           stopStageTimer();
@@ -754,7 +803,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           return;
         }
 
-        // Phase 2.5: Dedicated Instagram Download Flow (Direct CDN / Cobalt Tunnel without Vercel Proxy or Blob RAM buffering)
+        // Phase 2.5: Dedicated Instagram Download Flow
         const isInstagram =
           optionId?.startsWith('instagram_') ||
           result?.platform === 'instagram' ||
@@ -769,32 +818,51 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
           let resolvedIgUrl = directUrl;
 
-          // If directUrl is not yet resolved or still an Instagram page link, resolve it via rue-cobalt.xenon.zone
           if (
             !resolvedIgUrl ||
             resolvedIgUrl.includes('instagram.com') ||
             resolvedIgUrl.includes('instagr.am')
           ) {
-            try {
-              const cobaltRes = await fetch('https://rue-cobalt.xenon.zone/', {
-                method: 'POST',
-                headers: {
-                  Accept: 'application/json',
-                  'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({
-                  url: result?.videoHd || mediaUrl,
-                  downloadMode: 'auto',
-                }),
-                signal: AbortSignal.timeout(60000),
-              });
-              if (cobaltRes.ok) {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const cJson: any = await cobaltRes.json();
-                resolvedIgUrl = cJson.url || cJson.picker?.[0]?.url || resolvedIgUrl;
+            for (const cobaltEndpoint of [
+              'https://api.cobalt.tools/api/json',
+              'https://rue-cobalt.xenon.zone/',
+            ]) {
+              if (
+                resolvedIgUrl &&
+                !resolvedIgUrl.includes('instagram.com') &&
+                !resolvedIgUrl.includes('instagr.am')
+              ) {
+                break;
               }
-            } catch {
-              // Ignore fallback
+              try {
+                const cobaltRes = await fetch(cobaltEndpoint, {
+                  method: 'POST',
+                  headers: {
+                    Accept: 'application/json',
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify(
+                    cobaltEndpoint.includes('/api/json')
+                      ? {
+                          url: result?.videoHd || mediaUrl,
+                          videoQuality: '1080',
+                          filenamePattern: 'classic',
+                        }
+                      : {
+                          url: result?.videoHd || mediaUrl,
+                          downloadMode: 'auto',
+                        }
+                  ),
+                  signal: AbortSignal.timeout(30000),
+                });
+                if (cobaltRes.ok) {
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const cJson: any = await cobaltRes.json().catch(() => null);
+                  resolvedIgUrl = cJson?.url || cJson?.picker?.[0]?.url || resolvedIgUrl;
+                }
+              } catch {
+                // Ignore fallback error
+              }
             }
           }
 
@@ -803,7 +871,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             resolvedIgUrl.includes('instagram.com') ||
             resolvedIgUrl.includes('instagr.am')
           ) {
-            throw new Error('Không thể phân giải luồng tải Instagram trực tiếp.');
+            throw new Error('Hệ thống tải đang quá tải, vui lòng thử lại sau.');
           }
 
           setDownloadProgress((prev) => ({
@@ -829,7 +897,6 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         }
 
         // Phase 3: Smart Routing for TikTok, Facebook, Pinterest, and all other platforms
-        // Bypasses Vercel (/api/proxy & /api/download) and avoids fetch().blob() RAM/timeout crashes on 400MB+ videos
         setDownloadProgress((prev) => ({
           ...prev,
           percentage: 85,
@@ -853,17 +920,17 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         }, 3500);
       } catch (err) {
         stopStageTimer();
-        const msg =
-          err instanceof Error
-            ? err.message
-            : 'Không thể tải tệp về máy tính vào lúc này. Vui lòng thử lại sau giây lát.';
-        console.error('Download stream error:', err);
+        const rawMessage = err instanceof Error ? err.message : '';
+        const friendlyMsg =
+          rawMessage && !rawMessage.toLowerCase().includes('failed to fetch')
+            ? rawMessage
+            : 'Hệ thống tải đang quá tải, vui lòng thử lại sau.';
         setDownloadProgress((prev) => ({
           ...prev,
           isDownloading: false,
           percentage: 0,
           status: 'error',
-          errorMessage: msg,
+          errorMessage: friendlyMsg,
         }));
       }
     },
@@ -895,7 +962,8 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
       try {
         const zip = new JSZip();
-        const cleanTitle = albumTitle.replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1EA0-\u1EF9]/g, '_') || 'album';
+        const cleanTitle =
+          albumTitle.replace(/[^a-zA-Z0-9_\u00C0-\u024F\u1EA0-\u1EF9]/g, '_') || 'album';
         const folder = zip.folder(cleanTitle) || zip;
 
         for (let i = 0; i < images.length; i++) {
@@ -911,13 +979,15 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
           } catch {
             // Fallback to proxy for small images if CORS restricted
             try {
-              const proxyUrl = getApiUrl(`/api/download?url=${encodeURIComponent(item.url)}&filename=image_${i + 1}.jpg`);
+              const proxyUrl = getApiUrl(
+                `/api/download?url=${encodeURIComponent(item.url)}&filename=image_${i + 1}.jpg`
+              );
               const res = await fetch(proxyUrl);
               if (res.ok) {
                 arrayBuffer = await res.arrayBuffer();
               }
-            } catch (e) {
-              console.warn(`Failed to fetch image ${i + 1} for zip:`, e);
+            } catch {
+              // Skip failed image
             }
           }
 

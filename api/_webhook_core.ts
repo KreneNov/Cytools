@@ -1,5 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'http';
 import { markOrderPaid, getStorageDriver } from './_db.js';
+import { applyCorsHeaders } from './_cors.js';
 
 export interface ExtendedRequest extends IncomingMessage {
   query?: Record<string, string>;
@@ -11,10 +12,10 @@ export interface ExtendedResponse extends ServerResponse {
   json?: (data: any) => void;
 }
 
-export function sendJson(res: ExtendedResponse, statusCode: number, data: any) {
+export function sendJson(res: ExtendedResponse, statusCode: number, data: any, req?: IncomingMessage) {
   if (typeof res.setHeader === 'function') {
     res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    applyCorsHeaders(req, res, 'POST, OPTIONS');
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
@@ -140,11 +141,7 @@ export function isWebhookAuthorized(req: ExtendedRequest, body?: Record<string, 
 export async function handleWebhookRequest(req: ExtendedRequest, res: ExtendedResponse) {
   try {
     // CORS Preflight
-    if (typeof res.setHeader === 'function') {
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Secret-Key, x-sepay-token, x-api-key');
-    }
+    applyCorsHeaders(req, res, 'POST, OPTIONS');
 
     if (req.method === 'OPTIONS') {
       res.statusCode = 200;

@@ -211,12 +211,12 @@ async function runTests() {
   console.log('✔ /api/download: Same-Lambda YouTube resolve & binary streaming verified without IP mismatch!');
 
   console.log('\n=== TEST 12: Client-Side YouTube Resolution (Cobalt v10 + SaveTube VIP CDN WebCrypto) ===');
-  const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', { headers: { Origin: 'https://cytools.vercel.app' } });
+  const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', { headers: { Origin: 'https://cytools.io.vn' } });
   console.assert(cdnRes.ok, 'Expected 200 from SaveTube random-cdn');
   const { cdn } = await cdnRes.json();
   const infoRes = await fetch(`https://${cdn}/v2/info`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: 'https://cytools.vercel.app' },
+    headers: { 'Content-Type': 'application/json', Origin: 'https://cytools.io.vn' },
     body: JSON.stringify({ url: 'https://www.youtube.com/watch?v=p8K6ws6Ivlo' }),
   });
   const infoJson = await infoRes.json();
@@ -234,7 +234,7 @@ async function runTests() {
 
   const dl1080Res = await fetch(`https://${cdn}/download`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', Origin: 'https://cytools.vercel.app' },
+    headers: { 'Content-Type': 'application/json', Origin: 'https://cytools.io.vn' },
     body: JSON.stringify({ downloadType: 'video', quality: '1080', key: decData.key }),
   });
   const dl1080Json = await dl1080Res.json();

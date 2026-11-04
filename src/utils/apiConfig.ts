@@ -10,7 +10,7 @@ export { getApiUrl, isExtensionEnvironment, PRODUCTION_API_URL };
 /**
  * Returns the backend API base origin:
  * - Empty string in standard Web app (so relative paths /api/... hit Vite proxy or hosting origin)
- * - https://cytools.vercel.app when running inside Chrome Extension
+ * - https://cytools.io.vn when running inside Chrome Extension
  */
 export function getApiBaseUrl(): string {
   if (typeof window === 'undefined') return '';

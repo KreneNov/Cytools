@@ -18,8 +18,9 @@
     "downloads"
   ],
   "host_permissions": [
-    "https://cytools.vercel.app/*",
-    "*://*.vercel.app/*",
+    "https://cytools.io.vn/*",
+    "https://www.cytools.io.vn/*",
+    "https://*.cytools.io.vn/*",
     "*://*.youtube.com/*",
     "*://*.googlevideo.com/*",
     "*://*.cobalt.tools/*",
@@ -28,6 +29,15 @@
     "*://*.cdninstagram.com/*",
     "<all_urls>"
   ],
+  "externally_connectable": {
+    "matches": [
+      "https://cytools.io.vn/*",
+      "https://*.cytools.io.vn/*"
+    ]
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; connect-src 'self' https://cytools.io.vn https://*.cytools.io.vn https://* http://localhost:* http://127.0.0.1:* data: blob:;"
+  },
   "background": {
     "service_worker": "background.js",
     "type": "module"

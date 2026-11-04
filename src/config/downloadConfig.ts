@@ -47,4 +47,4 @@ export const EXTENSION_DOWNLOAD_URL: string = getDirectDriveDownloadUrl(RAW_EXTE
  */
 export const CYTOOLS_WEB_URL: string =
   (typeof import.meta !== 'undefined' && import.meta.env?.VITE_APP_URL) ||
-  'https://cytools.vercel.app';
+  'https://cytools.io.vn';

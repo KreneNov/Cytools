@@ -3,6 +3,7 @@ import {
   extractSocialMedia,
   resolveInnertubeStreams,
 } from '../_social_extractor.js';
+import { applyCorsHeaders } from '../_cors.js';
 
 interface ExtendedRequest extends IncomingMessage {
   query?: Record<string, string>;
@@ -14,11 +15,9 @@ interface ExtendedResponse extends ServerResponse {
   json?: (data: any) => void;
 }
 
-function sendJson(res: ExtendedResponse, statusCode: number, data: any) {
+function sendJson(res: ExtendedResponse, statusCode: number, data: any, req?: IncomingMessage) {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  applyCorsHeaders(req, res, 'GET, POST, OPTIONS');
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
@@ -63,9 +62,7 @@ async function parseBody(req: ExtendedRequest): Promise<Record<string, any>> {
 
 export default async function handler(req: ExtendedRequest, res: ExtendedResponse) {
   // CORS Preflight
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  applyCorsHeaders(req, res, 'GET, POST, OPTIONS');
 
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
