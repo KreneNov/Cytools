@@ -2,15 +2,16 @@ import { createDecipheriv } from 'node:crypto';
 
 /**
  * Server-Side YouTube Resolver Proxy (shared by Vercel Serverless `api/social/extract.ts`
- * and the Vite dev middleware `src/server/socialExtractor.ts`).
+ * and Vite dev middleware `src/server/socialExtractor.ts`).
  *
  * Runs entirely on the server so that `Origin`, `Referer` and `User-Agent` are controlled by us:
  * - Provider A: Savetube Multi-CDN (spoofed as `ytshorts.savetube.me`), AES-128-CBC decryption,
- *   retry across up to 3 CDN hosts and quality fallback (1080 -> 720 -> 360).
- * - Provider B: Savenow / Loader.to (`p.savenow.to`, spoofed as `en.loader.to`) with short server polling,
- *   returning a `pendingId` for long conversions so the serverless function never times out.
+ *   deep response URL extraction across multiple keys/encrypted payloads, and instant breakout
+ *   if no downloadUrl is returned.
+ * - Provider B: Savenow / Loader.to (`p.savenow.to`, spoofed as `en.loader.to`) fallback,
+ *   returning `pendingId` if not ready in <2s so serverless function never times out.
  *
- * The file name starts with `_` so Vercel does not deploy it as a separate Serverless Function.
+ * Guaranteed to never throw unhandled exceptions or return HTTP 502.
  */
 
 export type YouTubeResolveFormat = '1080' | '720' | '360' | 'mp3';
@@ -55,16 +56,15 @@ const SAVENOW_HEADERS: Record<string, string> = {
 const SAVETUBE_AES_KEY_HEX = 'C5D58EF67A7584E4A29F6C35BBC4EB12';
 const SAVETUBE_CDN_POOL = [
   'cdn401.savetube.vip',
-  'cdn402.savetube.vip',
+  'cdn403.savetube.vip',
   'cdn404.savetube.vip',
   'cdn405.savetube.vip',
   'cdn406.savetube.vip',
 ];
-const SAVETUBE_MAX_CDN_ATTEMPTS = 3;
+const SAVETUBE_MAX_CDN_ATTEMPTS = 2;
 
 const SAVENOW_API_KEY = 'dfcb6d76f2f6a9894gjkege8a4ab232222';
-const SAVENOW_INITIAL_POLLS = 3;
-const SAVENOW_POLL_INTERVAL_MS = 1200;
+const SAVENOW_INITIAL_POLL_DELAY_MS = 800;
 
 const YT_ID_REGEX = /^[A-Za-z0-9_-]{11}$/;
 
@@ -72,6 +72,13 @@ class RateLimitError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'RateLimitError';
+  }
+}
+
+class NoDownloadUrlError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NoDownloadUrlError';
   }
 }
 
@@ -132,12 +139,90 @@ function decryptSavetubePayload(b64: string): Record<string, unknown> {
   return JSON.parse(decryptedStr) as Record<string, unknown>;
 }
 
+/**
+ * Resilient recursive URL extractor across all known Savetube response formats:
+ * - Direct fields: `downloadUrl`, `download_url`, `url`, `streamUrl`, `stream_url`, `file`, `link`, `href`
+ * - Nested objects: `data`, `result`, `info`
+ * - Direct string URLs (`http://`, `https://`)
+ * - Encrypted base64 payload strings (AES-128-CBC)
+ * - Array collections
+ */
+export function extractUrlFromAny(target: unknown): string | null {
+  if (!target) return null;
+
+  if (typeof target === 'string') {
+    const s = target.trim();
+    if (s.startsWith('http://') || s.startsWith('https://')) {
+      return s;
+    }
+    // Check if it might be an encrypted base64 payload
+    if (s.length > 32 && /^[A-Za-z0-9+/=\s]+$/.test(s)) {
+      try {
+        const decrypted = decryptSavetubePayload(s);
+        return extractUrlFromAny(decrypted);
+      } catch {
+        // Not encrypted or wrong key, ignore
+      }
+    }
+    return null;
+  }
+
+  if (Array.isArray(target)) {
+    for (const item of target) {
+      const url = extractUrlFromAny(item);
+      if (url) return url;
+    }
+    return null;
+  }
+
+  if (typeof target === 'object') {
+    const obj = target as Record<string, unknown>;
+
+    // Direct key scan
+    const candidateKeys = [
+      'downloadUrl',
+      'download_url',
+      'url',
+      'streamUrl',
+      'stream_url',
+      'mediaUrl',
+      'media_url',
+      'file',
+      'link',
+      'href',
+    ];
+
+    for (const key of candidateKeys) {
+      const val = obj[key];
+      if (typeof val === 'string' && (val.startsWith('http://') || val.startsWith('https://'))) {
+        return val;
+      }
+    }
+
+    // Inspect nested structures
+    if (obj.data) {
+      const nested = extractUrlFromAny(obj.data);
+      if (nested) return nested;
+    }
+    if (obj.result) {
+      const nested = extractUrlFromAny(obj.result);
+      if (nested) return nested;
+    }
+    if (obj.info) {
+      const nested = extractUrlFromAny(obj.info);
+      if (nested) return nested;
+    }
+  }
+
+  return null;
+}
+
 async function getSavetubeCdnCandidates(): Promise<string[]> {
   const candidates: string[] = [];
   try {
     const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', {
       headers: SAVETUBE_HEADERS,
-      signal: AbortSignal.timeout(4000),
+      signal: AbortSignal.timeout(2000),
     });
     if (cdnRes.ok) {
       const cdnData = (await cdnRes.json().catch(() => null)) as { cdn?: unknown } | null;
@@ -157,13 +242,6 @@ async function getSavetubeCdnCandidates(): Promise<string[]> {
   return candidates.slice(0, SAVETUBE_MAX_CDN_ATTEMPTS);
 }
 
-function savetubeQualityChain(format: YouTubeResolveFormat): string[] {
-  if (format === 'mp3') return ['128'];
-  if (format === '1080') return ['1080', '720', '360'];
-  if (format === '720') return ['720', '360'];
-  return ['360'];
-}
-
 async function trySavetubeOnCdn(
   cdn: string,
   youtubeUrl: string,
@@ -173,7 +251,7 @@ async function trySavetubeOnCdn(
     method: 'POST',
     headers: SAVETUBE_HEADERS,
     body: JSON.stringify({ url: youtubeUrl }),
-    signal: AbortSignal.timeout(8000),
+    signal: AbortSignal.timeout(3500),
   });
   if (infoRes.status === 429) throw new RateLimitError(`${cdn}/v2/info 429`);
   if (!infoRes.ok) throw new Error(`${cdn}/v2/info HTTP ${infoRes.status}`);
@@ -188,37 +266,57 @@ async function trySavetubeOnCdn(
   if (!key) throw new Error(`${cdn}/v2/info decrypted payload has no key`);
   const title = typeof decrypted.title === 'string' ? decrypted.title : undefined;
 
-  const downloadType = format === 'mp3' ? 'audio' : 'video';
-  let lastError: Error | null = null;
-
-  for (const quality of savetubeQualityChain(format)) {
-    try {
-      const dlRes = await fetch(`https://${cdn}/download`, {
-        method: 'POST',
-        headers: SAVETUBE_HEADERS,
-        body: JSON.stringify({ downloadType, quality, key }),
-        signal: AbortSignal.timeout(10000),
-      });
-      if (dlRes.status === 429) {
-        lastError = new RateLimitError(`${cdn}/download ${quality} 429`);
-        continue;
-      }
-      if (!dlRes.ok) {
-        lastError = new Error(`${cdn}/download ${quality} HTTP ${dlRes.status}`);
-        continue;
-      }
-      const dlJson = (await dlRes.json().catch(() => null)) as { data?: { downloadUrl?: unknown } } | null;
-      const downloadUrl = dlJson?.data?.downloadUrl;
-      if (typeof downloadUrl === 'string' && downloadUrl.startsWith('http')) {
-        return { url: downloadUrl, quality, title };
-      }
-      lastError = new Error(`${cdn}/download ${quality} returned no downloadUrl`);
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(errMsg(err));
+  // 1. Instant Direct Stream Shortcut:
+  // Sometimes Savetube's decrypted info payload already contains direct googlevideo playback URLs
+  if (Array.isArray(decrypted.video_formats) && format !== 'mp3') {
+    const targetQNum = Number(format);
+    const directMatch = (decrypted.video_formats as Array<Record<string, unknown>>).find(
+      (f) => Number(f.quality) === targetQNum && typeof f.url === 'string' && f.url.startsWith('http')
+    );
+    if (directMatch && typeof directMatch.url === 'string') {
+      return { url: directMatch.url, quality: format, title };
     }
   }
 
-  throw lastError || new Error(`${cdn}/download failed`);
+  // 2. Determine best quality to request
+  let requestedQuality = format === 'mp3' ? '128' : format;
+  if (format !== 'mp3' && Array.isArray(decrypted.video_formats)) {
+    const availableQualities = (decrypted.video_formats as Array<Record<string, unknown>>)
+      .map((f) => String(f.quality || ''))
+      .filter(Boolean);
+
+    // If 1080 was requested but not available, auto-step down to 720
+    if (format === '1080' && !availableQualities.includes('1080')) {
+      requestedQuality = availableQualities.includes('720') ? '720' : '360';
+    }
+  }
+
+  const downloadType = format === 'mp3' ? 'audio' : 'video';
+
+  const dlRes = await fetch(`https://${cdn}/download`, {
+    method: 'POST',
+    headers: SAVETUBE_HEADERS,
+    body: JSON.stringify({ downloadType, quality: requestedQuality, key }),
+    signal: AbortSignal.timeout(3500),
+  });
+
+  if (dlRes.status === 429) {
+    throw new RateLimitError(`${cdn}/download ${requestedQuality} 429`);
+  }
+  if (!dlRes.ok) {
+    throw new Error(`${cdn}/download ${requestedQuality} HTTP ${dlRes.status}`);
+  }
+
+  const dlJson = await dlRes.json().catch(() => null);
+  const downloadUrl = extractUrlFromAny(dlJson);
+
+  if (downloadUrl) {
+    return { url: downloadUrl, quality: requestedQuality, title };
+  }
+
+  // If Savetube responded with 200 OK but has no valid URL, Savetube is unable to serve this video.
+  // Throw NoDownloadUrlError so caller can IMMEDIATELY break out and switch to Savenow!
+  throw new NoDownloadUrlError(`${cdn}/download returned 200 without downloadUrl`);
 }
 
 async function resolveViaSavetube(
@@ -242,8 +340,15 @@ async function resolveViaSavetube(
       };
     } catch (err) {
       attempts.push(`savetube:${errMsg(err)}`);
+
+      // INSTANT BREAKOUT: If Savetube responded cleanly but has no downloadUrl,
+      // all other Savetube CDNs will fail the same way. Break out immediately to Savenow!
+      if (err instanceof NoDownloadUrlError) {
+        break;
+      }
+
       if (err instanceof RateLimitError) {
-        await sleep(300);
+        await sleep(200);
       }
     }
   }
@@ -285,7 +390,7 @@ export async function pollYouTubeSaveNowProgress(taskId: string): Promise<YouTub
   try {
     const progRes = await fetch(`https://p.savenow.to/ajax/progress.php?id=${encodeURIComponent(id)}`, {
       headers: SAVENOW_HEADERS,
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(3500),
     });
     if (progRes.status === 429) {
       return { success: true, status: 'processing', progress: 0 };
@@ -313,7 +418,7 @@ async function resolveViaSaveNow(
   try {
     const initRes = await fetch(initUrl, {
       headers: SAVENOW_HEADERS,
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(4000),
     });
     if (!initRes.ok) {
       attempts.push(`savenow:init HTTP ${initRes.status}`);
@@ -335,18 +440,18 @@ async function resolveViaSaveNow(
           ? initData.info.title
           : undefined;
 
-    for (let i = 0; i < SAVENOW_INITIAL_POLLS; i++) {
-      await sleep(SAVENOW_POLL_INTERVAL_MS);
-      const prog = await pollYouTubeSaveNowProgress(taskId);
-      if (prog.url) {
-        return { success: true, url: prog.url, provider: 'savenow', quality: format, title, attempts };
-      }
-      if (prog.status === 'failed') {
-        attempts.push(`savenow:progress ${prog.error || 'failed'}`);
-        return null;
-      }
+    // Fast initial check after 800ms
+    await sleep(SAVENOW_INITIAL_POLL_DELAY_MS);
+    const prog = await pollYouTubeSaveNowProgress(taskId);
+    if (prog.url) {
+      return { success: true, url: prog.url, provider: 'savenow', quality: format, title, attempts };
+    }
+    if (prog.status === 'failed') {
+      attempts.push(`savenow:progress ${prog.error || 'failed'}`);
+      return null;
     }
 
+    // Still converting: return pendingId for client to poll, preventing serverless function timeout
     return { success: true, pendingId: taskId, provider: 'savenow', quality: format, title, attempts };
   } catch (err) {
     attempts.push(`savenow:${errMsg(err)}`);
@@ -356,28 +461,39 @@ async function resolveViaSaveNow(
 
 /**
  * Resolves a direct YouTube download URL on the server via the 2-provider fallback chain.
+ * Wrapped in a top-level try/catch to guarantee returning clean JSON and never crashing the server.
  */
 export async function resolveYouTubeServerSide(
   urlOrVideoId: string,
   formatInput: unknown
 ): Promise<YouTubeResolveResult> {
-  const videoId = normalizeYouTubeVideoId(urlOrVideoId);
-  if (!videoId) {
-    return { success: false, error: 'Không nhận diện được ID video YouTube.' };
+  try {
+    const videoId = normalizeYouTubeVideoId(urlOrVideoId);
+    if (!videoId) {
+      return { success: false, error: 'Không nhận diện được ID video YouTube.' };
+    }
+    const format = normalizeYouTubeFormat(formatInput);
+    const attempts: string[] = [];
+
+    // Provider A: Savetube Multi-CDN
+    const savetube = await resolveViaSavetube(videoId, format, attempts);
+    if (savetube) return savetube;
+
+    // Provider B: Savenow / Loader.to Fallback
+    const savenow = await resolveViaSaveNow(videoId, format, attempts);
+    if (savenow) return savenow;
+
+    console.warn('[YouTube Resolver] All providers failed:', attempts.join(' | '));
+    return {
+      success: false,
+      error: 'Hệ thống tải đang quá tải, vui lòng thử lại sau hoặc chọn định dạng khác.',
+      attempts,
+    };
+  } catch (fatalErr) {
+    console.error('[YouTube Resolver Fatal Error]:', fatalErr);
+    return {
+      success: false,
+      error: fatalErr instanceof Error ? fatalErr.message : 'Lỗi phân giải video YouTube.',
+    };
   }
-  const format = normalizeYouTubeFormat(formatInput);
-  const attempts: string[] = [];
-
-  const savetube = await resolveViaSavetube(videoId, format, attempts);
-  if (savetube) return savetube;
-
-  const savenow = await resolveViaSaveNow(videoId, format, attempts);
-  if (savenow) return savenow;
-
-  console.warn('[YouTube Resolver] All providers failed:', attempts.join(' | '));
-  return {
-    success: false,
-    error: 'Hệ thống tải đang quá tải, vui lòng thử lại sau.',
-    attempts,
-  };
 }

@@ -1676,7 +1676,7 @@ export function socialDownloadProxyPlugin(): Plugin {
                   return;
                 }
                 const resolved = await resolveYouTubeServerSide(source, format);
-                res.statusCode = resolved.success ? 200 : 502;
+                res.statusCode = 200;
                 res.end(JSON.stringify(resolved));
                 return;
               }
@@ -1689,11 +1689,11 @@ export function socialDownloadProxyPlugin(): Plugin {
                 return;
               }
               const progress = await pollYouTubeSaveNowProgress(taskId);
-              res.statusCode = progress.success ? 200 : 502;
+              res.statusCode = 200;
               res.end(JSON.stringify(progress));
               return;
             } catch (ytErr) {
-              res.statusCode = 500;
+              res.statusCode = 200;
               res.end(
                 JSON.stringify({
                   success: false,

@@ -94,6 +94,7 @@ interface YouTubeResolutionResult {
   url: string | null;
   provider?: string;
   failureReason?: 'rate_limit' | 'timeout' | 'network';
+  errorMessage?: string;
 }
 
 interface YouTubeResolveResponse {
@@ -148,9 +149,13 @@ async function resolveYouTubeClientSide(
       return { url: data.url, provider: data.provider };
     }
 
+    if (data && data.success === false && data.error) {
+      return { url: null, failureReason: 'network', errorMessage: data.error };
+    }
+
     const pendingId = data?.pendingId;
     if (!pendingId) {
-      return { url: null, failureReason: 'network' };
+      return { url: null, failureReason: 'network', errorMessage: data?.error };
     }
 
     for (let attempt = 0; attempt < YT_PROGRESS_MAX_POLLS; attempt++) {
@@ -171,7 +176,7 @@ async function resolveYouTubeClientSide(
           return { url: progData.url, provider: data?.provider || 'savenow' };
         }
         if (progData?.status === 'failed') {
-          return { url: null, failureReason: 'network' };
+          return { url: null, failureReason: 'network', errorMessage: progData.error };
         }
         if (onProgress && typeof progData?.progress === 'number') {
           onProgress(progData.progress);
@@ -494,6 +499,9 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
               throw new Error(
                 'Quá thời gian chờ xử lý video. Vui lòng thử lại hoặc chọn độ phân giải khác.'
               );
+            }
+            if (ytResolution.errorMessage) {
+              throw new Error(ytResolution.errorMessage);
             }
             throw new Error('Hệ thống tải đang quá tải, vui lòng thử lại sau.');
           }

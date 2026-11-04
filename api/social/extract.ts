@@ -116,20 +116,30 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
     }
 
     if (action === 'youtube-resolve') {
-      const source = videoId || targetUrl || '';
-      if (!source) {
-        return sendJson(res, 400, { success: false, error: 'Thiếu tham số videoId hoặc url YouTube.' }, req);
+      try {
+        const source = videoId || targetUrl || '';
+        if (!source) {
+          return sendJson(res, 400, { success: false, error: 'Thiếu tham số videoId hoặc url YouTube.' }, req);
+        }
+        const resolved = await resolveYouTubeServerSide(source, format);
+        return sendJson(res, 200, resolved, req);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Lỗi phân giải liên kết YouTube.';
+        return sendJson(res, 200, { success: false, error: msg }, req);
       }
-      const resolved = await resolveYouTubeServerSide(source, format);
-      return sendJson(res, resolved.success ? 200 : 502, resolved, req);
     }
 
     if (action === 'youtube-progress') {
-      if (!taskId) {
-        return sendJson(res, 400, { success: false, error: 'Thiếu tham số id tiến trình.' }, req);
+      try {
+        if (!taskId) {
+          return sendJson(res, 400, { success: false, error: 'Thiếu tham số id tiến trình.' }, req);
+        }
+        const progress = await pollYouTubeSaveNowProgress(taskId);
+        return sendJson(res, 200, progress, req);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Lỗi kiểm tra tiến trình YouTube.';
+        return sendJson(res, 200, { success: false, error: msg }, req);
       }
-      const progress = await pollYouTubeSaveNowProgress(taskId);
-      return sendJson(res, progress.success ? 200 : 502, progress, req);
     }
 
     // Handle instant stream resolution action for YouTube
