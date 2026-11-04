@@ -9,6 +9,7 @@ import path from 'path';
 import os from 'os';
 import { detectPlatform } from '../types/socialDownloader.ts';
 import type { ExtractionResult, SocialPlatform, SocialMediaType, MediaDownloadOption, AvailableFormat } from '../types/socialDownloader.ts';
+import { resolveYouTubeServerSide, pollYouTubeSaveNowProgress } from '../../api/_youtube_resolver.ts';
 
 const ytdlInstance = new Ytdl();
 
@@ -1609,6 +1610,101 @@ export function socialDownloadProxyPlugin(): Plugin {
           return;
         }
 
+        // 0. Server-Side YouTube Resolver Proxy: /api/youtube-resolve, /api/youtube-progress,
+        //    or /api/social/extract?action=youtube-resolve|youtube-progress (Savetube Multi-CDN -> Savenow)
+        {
+          const isYtResolvePath = urlObj.pathname === '/api/youtube-resolve';
+          const isYtProgressPath = urlObj.pathname === '/api/youtube-progress';
+          const queryAction = urlObj.searchParams.get('action');
+          const isExtractYtAction =
+            urlObj.pathname === '/api/social/extract' &&
+            (queryAction === 'youtube-resolve' || queryAction === 'youtube-progress');
+
+          let ytBody: Record<string, unknown> = {};
+          let bodyAction: string | null = null;
+          const mayCarryYtBody =
+            req.method === 'POST' &&
+            (isYtResolvePath || isYtProgressPath || urlObj.pathname === '/api/social/extract');
+
+          if (mayCarryYtBody && (isYtResolvePath || isYtProgressPath || isExtractYtAction || !urlObj.searchParams.get('url'))) {
+            const peekChunks: Buffer[] = [];
+            for await (const chunk of req) {
+              peekChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            }
+            const peekStr = Buffer.concat(peekChunks).toString('utf-8');
+            try {
+              ytBody = peekStr ? (JSON.parse(peekStr) as Record<string, unknown>) : {};
+            } catch {
+              ytBody = Object.fromEntries(new URLSearchParams(peekStr).entries());
+            }
+            bodyAction = typeof ytBody.action === 'string' ? ytBody.action : null;
+            // Re-expose the consumed body for the downstream /api/social/extract handler
+            (req as IncomingMessage & { __cachedBody?: string }).__cachedBody = peekStr;
+          }
+
+          const ytAction = isYtResolvePath
+            ? 'youtube-resolve'
+            : isYtProgressPath
+              ? 'youtube-progress'
+              : urlObj.pathname === '/api/social/extract'
+                ? queryAction || bodyAction
+                : null;
+
+          if (ytAction === 'youtube-resolve' || ytAction === 'youtube-progress') {
+            res.setHeader('Content-Type', 'application/json');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+
+            if (req.method === 'OPTIONS') {
+              res.statusCode = 204;
+              res.end();
+              return;
+            }
+
+            try {
+              if (ytAction === 'youtube-resolve') {
+                const source =
+                  urlObj.searchParams.get('videoId') ||
+                  urlObj.searchParams.get('url') ||
+                  (typeof ytBody.videoId === 'string' ? ytBody.videoId : '') ||
+                  (typeof ytBody.url === 'string' ? ytBody.url : '');
+                const format = urlObj.searchParams.get('format') || ytBody.format;
+                if (!source) {
+                  res.statusCode = 400;
+                  res.end(JSON.stringify({ success: false, error: 'Thiếu tham số videoId hoặc url YouTube.' }));
+                  return;
+                }
+                const resolved = await resolveYouTubeServerSide(source, format);
+                res.statusCode = resolved.success ? 200 : 502;
+                res.end(JSON.stringify(resolved));
+                return;
+              }
+
+              const taskId =
+                urlObj.searchParams.get('id') || (typeof ytBody.id === 'string' ? ytBody.id : '');
+              if (!taskId) {
+                res.statusCode = 400;
+                res.end(JSON.stringify({ success: false, error: 'Thiếu tham số id tiến trình.' }));
+                return;
+              }
+              const progress = await pollYouTubeSaveNowProgress(taskId);
+              res.statusCode = progress.success ? 200 : 502;
+              res.end(JSON.stringify(progress));
+              return;
+            } catch (ytErr) {
+              res.statusCode = 500;
+              res.end(
+                JSON.stringify({
+                  success: false,
+                  error: ytErr instanceof Error ? ytErr.message : 'Lỗi phân giải YouTube.',
+                })
+              );
+              return;
+            }
+          }
+        }
+
         // 1. Extraction Endpoint: /api/social/extract
         if (urlObj.pathname === '/api/social/extract') {
           res.setHeader('Content-Type', 'application/json');
@@ -1640,11 +1736,17 @@ export function socialDownloadProxyPlugin(): Plugin {
 
             // If POST request, read body
             if (!targetUrl && req.method === 'POST') {
-              const buffers: Buffer[] = [];
-              for await (const chunk of req) {
-                buffers.push(chunk);
+              const cachedBody = (req as IncomingMessage & { __cachedBody?: string }).__cachedBody;
+              let bodyStr: string;
+              if (typeof cachedBody === 'string') {
+                bodyStr = cachedBody;
+              } else {
+                const buffers: Buffer[] = [];
+                for await (const chunk of req) {
+                  buffers.push(chunk);
+                }
+                bodyStr = Buffer.concat(buffers).toString('utf-8');
               }
-              const bodyStr = Buffer.concat(buffers).toString('utf-8');
               try {
                 const bodyJson = JSON.parse(bodyStr);
                 targetUrl = bodyJson.url;

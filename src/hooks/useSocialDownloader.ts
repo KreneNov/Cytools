@@ -88,76 +88,106 @@ export function cleanDownloadFilename(filename: string): string {
   return name + ext;
 }
 
-const COBALT_INSTANCES = [
-  'https://api.cobalt.tools/',
-  'https://cobalt.wuk.sh/',
-  'https://co.wuk.sh/',
-];
+type YouTubeResolveFormat = '1080' | '720' | 'mp3';
 
 interface YouTubeResolutionResult {
   url: string | null;
+  provider?: string;
   failureReason?: 'rate_limit' | 'timeout' | 'network';
 }
 
+interface YouTubeResolveResponse {
+  success?: boolean;
+  url?: string;
+  pendingId?: string;
+  provider?: string;
+  status?: 'ready' | 'processing' | 'failed';
+  progress?: number;
+  error?: string;
+}
+
+const YT_PROGRESS_MAX_POLLS = 20;
+const YT_PROGRESS_INTERVAL_MS = 1500;
+
+function isHttpUrl(value: unknown): value is string {
+  return typeof value === 'string' && value.startsWith('http');
+}
+
 /**
- * Resolves a direct YouTube download URL purely via Cobalt API instances:
- * - Primary: https://api.cobalt.tools/
- * - Fallback 1: https://cobalt.wuk.sh/
- * - Fallback 2: https://co.wuk.sh/
- * - Strictly sends `{ url: targetUrl }` (no `vQuality` or `videoQuality`) to pass strict schema validation.
+ * Resolves a direct YouTube download URL through our own Server-Side Resolver Proxy
+ * (`/api/social/extract?action=youtube-resolve`). The server spoofs Origin/Referer/User-Agent
+ * for Savetube Multi-CDN (Provider A) and Savenow / Loader.to (Provider B), so the browser never
+ * makes CORS-blocked (403) or rate-limited (429) requests to third-party converters.
+ * If the server returns a `pendingId`, progress is polled via `action=youtube-progress`.
  */
 async function resolveYouTubeClientSide(
-  videoId: string
+  videoId: string,
+  format: YouTubeResolveFormat,
+  onProgress?: (percentage: number) => void
 ): Promise<YouTubeResolutionResult> {
   const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  let failureReason: 'rate_limit' | 'timeout' | 'network' = 'network';
 
-  for (const instanceUrl of COBALT_INSTANCES) {
-    try {
-      const response = await fetch(instanceUrl, {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          url: targetUrl,
-        }),
-        signal: AbortSignal.timeout(25000),
-      });
+  try {
+    const response = await apiFetch('/api/social/extract?action=youtube-resolve', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ action: 'youtube-resolve', videoId, url: targetUrl, format }),
+      signal: AbortSignal.timeout(55000),
+    });
 
-      if (response.status === 429) {
-        failureReason = 'rate_limit';
-        continue;
-      }
-
-      if (!response.ok) {
-        continue;
-      }
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const res: any = await response.json().catch(() => null);
-      const resolvedUrl = res?.url;
-
-      if (
-        resolvedUrl &&
-        typeof resolvedUrl === 'string' &&
-        resolvedUrl.startsWith('http')
-      ) {
-        return { url: resolvedUrl };
-      }
-    } catch (err) {
-      if (
-        err instanceof Error &&
-        (err.name === 'TimeoutError' || err.name === 'AbortError')
-      ) {
-        failureReason = 'timeout';
-      }
-      // Seamlessly try the next Cobalt instance
+    if (response.status === 429) {
+      return { url: null, failureReason: 'rate_limit' };
     }
-  }
 
-  return { url: null, failureReason };
+    const data = (await response.json().catch(() => null)) as YouTubeResolveResponse | null;
+
+    if (data && isHttpUrl(data.url)) {
+      return { url: data.url, provider: data.provider };
+    }
+
+    const pendingId = data?.pendingId;
+    if (!pendingId) {
+      return { url: null, failureReason: 'network' };
+    }
+
+    for (let attempt = 0; attempt < YT_PROGRESS_MAX_POLLS; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, YT_PROGRESS_INTERVAL_MS));
+
+      try {
+        const progRes = await apiFetch(
+          `/api/social/extract?action=youtube-progress&id=${encodeURIComponent(pendingId)}`,
+          {
+            method: 'GET',
+            headers: { Accept: 'application/json' },
+            signal: AbortSignal.timeout(12000),
+          }
+        );
+        const progData = (await progRes.json().catch(() => null)) as YouTubeResolveResponse | null;
+
+        if (progData && isHttpUrl(progData.url)) {
+          return { url: progData.url, provider: data?.provider || 'savenow' };
+        }
+        if (progData?.status === 'failed') {
+          return { url: null, failureReason: 'network' };
+        }
+        if (onProgress && typeof progData?.progress === 'number') {
+          onProgress(progData.progress);
+        }
+      } catch {
+        // Transient poll error: keep polling until the attempt budget is exhausted
+      }
+    }
+
+    return { url: null, failureReason: 'timeout' };
+  } catch (err) {
+    if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+      return { url: null, failureReason: 'timeout' };
+    }
+    return { url: null, failureReason: 'network' };
+  }
 }
 
 /**
@@ -422,7 +452,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
       try {
         const directUrl = mediaUrl;
 
-        // Phase 1 & 2: Dedicated YouTube Client-Side Resolution via Cobalt Instances
+        // Phase 1 & 2: Dedicated YouTube Resolution via Server-Side Resolver Proxy (Savetube -> Savenow)
         const isYouTube =
           optionId?.startsWith('youtube_') ||
           optionId?.startsWith('yt_') ||
@@ -441,7 +471,22 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             stage: isAudio ? 'audio' : 'video',
           }));
 
-          const ytResolution = await resolveYouTubeClientSide(result.videoId);
+          const ytFormat: YouTubeResolveFormat = isAudio
+            ? 'mp3'
+            : optionId?.includes('1080')
+              ? '1080'
+              : '720';
+
+          const ytResolution = await resolveYouTubeClientSide(
+            result.videoId,
+            ytFormat,
+            (serverProgress) => {
+              setDownloadProgress((prev) => ({
+                ...prev,
+                percentage: Math.max(prev.percentage, Math.min(80, 45 + Math.round(serverProgress * 0.35))),
+              }));
+            }
+          );
           const resolvedYtUrl = ytResolution.url;
 
           if (!resolvedYtUrl) {

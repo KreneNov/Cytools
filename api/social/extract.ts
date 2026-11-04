@@ -4,6 +4,7 @@ import {
   resolveInnertubeStreams,
 } from '../_social_extractor.js';
 import { applyCorsHeaders } from '../_cors.js';
+import { resolveYouTubeServerSide, pollYouTubeSaveNowProgress } from '../_youtube_resolver.js';
 
 interface ExtendedRequest extends IncomingMessage {
   query?: Record<string, string>;
@@ -77,17 +78,58 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
     let targetUrl: string | null = null;
     let action: string | null = null;
     let videoId: string | null = null;
+    let format: string | null = null;
+    let taskId: string | null = null;
+    let pathname = '';
 
     // 1. Try URL Query parameters
     if (req.url) {
       try {
         const parsed = new URL(req.url, 'http://127.0.0.1');
+        pathname = parsed.pathname;
         targetUrl = parsed.searchParams.get('url');
         action = parsed.searchParams.get('action');
         videoId = parsed.searchParams.get('videoId');
+        format = parsed.searchParams.get('format');
+        taskId = parsed.searchParams.get('id');
       } catch {
         // Continue
       }
+    }
+
+    if (!action && pathname.endsWith('/youtube-resolve')) {
+      action = 'youtube-resolve';
+    }
+
+    // Server-Side YouTube Resolver Proxy (Savetube Multi-CDN -> Savenow), zero browser CORS.
+    // Parse the POST body once up-front and cache it on req.body so the later parseBody() call reuses it.
+    if (req.method === 'POST') {
+      const earlyBody = await parseBody(req);
+      req.body = earlyBody;
+      if (!action && earlyBody.action) action = String(earlyBody.action);
+      if (action === 'youtube-resolve' || action === 'youtube-progress') {
+        if (earlyBody.url && !targetUrl) targetUrl = String(earlyBody.url);
+        if (earlyBody.videoId && !videoId) videoId = String(earlyBody.videoId);
+        if (earlyBody.format && !format) format = String(earlyBody.format);
+        if (earlyBody.id && !taskId) taskId = String(earlyBody.id);
+      }
+    }
+
+    if (action === 'youtube-resolve') {
+      const source = videoId || targetUrl || '';
+      if (!source) {
+        return sendJson(res, 400, { success: false, error: 'Thiếu tham số videoId hoặc url YouTube.' }, req);
+      }
+      const resolved = await resolveYouTubeServerSide(source, format);
+      return sendJson(res, resolved.success ? 200 : 502, resolved, req);
+    }
+
+    if (action === 'youtube-progress') {
+      if (!taskId) {
+        return sendJson(res, 400, { success: false, error: 'Thiếu tham số id tiến trình.' }, req);
+      }
+      const progress = await pollYouTubeSaveNowProgress(taskId);
+      return sendJson(res, progress.success ? 200 : 502, progress, req);
     }
 
     // Handle instant stream resolution action for YouTube
