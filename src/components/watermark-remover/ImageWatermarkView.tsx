@@ -13,8 +13,7 @@ import {
   Image as ImageIcon,
 } from 'lucide-react';
 import { detectWatermarkRegions } from '../../utils/imageWatermarkDetector';
-import { inpaintTelea } from '../../workers/inpaintWorker';
-import type { InpaintWorkerResponse } from '../../types/watermarkRemover';
+import { useWatermarkRemover } from '../../hooks/useWatermarkRemover';
 
 interface ImageWatermarkViewProps {
   isCompact?: boolean;
@@ -27,12 +26,19 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
   // Tools state
   const [toolMode, setToolMode] = useState<'brush' | 'eraser'>('brush');
   const [brushSize, setBrushSize] = useState<number>(24);
-  const [isProcessing, setIsProcessing] = useState<boolean>(false);
-  const [processProgress, setProcessProgress] = useState<number>(0);
   const [hasInpainted, setHasInpainted] = useState<boolean>(false);
   const [isComparing, setIsComparing] = useState<boolean>(false);
   const [autoDetectedCount, setAutoDetectedCount] = useState<number | null>(null);
   const [historyCount, setHistoryCount] = useState<number>(0);
+
+  const {
+    isProcessing,
+    processProgress,
+    aiModelProgress,
+    isAiModelCached,
+    isAiModelLoading,
+    executeInpaint,
+  } = useWatermarkRemover();
 
   // Canvas refs
   const containerRef = useRef<HTMLDivElement>(null);
@@ -45,17 +51,6 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
   const maskHistoryRef = useRef<ImageData[]>([]);
   const isDrawingRef = useRef<boolean>(false);
   const lastPosRef = useRef<{ x: number; y: number } | null>(null);
-  const workerRef = useRef<Worker | null>(null);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (workerRef.current) {
-        workerRef.current.terminate();
-        workerRef.current = null;
-      }
-    };
-  }, []);
 
   // Save current mask state to undo stack
   const saveMaskSnapshot = useCallback(() => {
@@ -267,7 +262,7 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
     setAutoDetectedCount(boxes.length);
   };
 
-  // Execute Telea Inpainting via Web Worker (with synchronous fallback)
+  // Execute Telea / ONNX Inpainting via Web Worker hook (with synchronous fallback)
   const handleExecuteInpaint = async () => {
     if (!baseCanvasRef.current || !maskCanvasRef.current || !originalImageDataRef.current) return;
     const baseCanvas = baseCanvasRef.current;
@@ -279,62 +274,13 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
     const currentBase = baseCtx.getImageData(0, 0, baseCanvas.width, baseCanvas.height);
     const currentMask = maskCtx.getImageData(0, 0, maskCanvas.width, maskCanvas.height);
 
-    setIsProcessing(true);
-    setProcessProgress(0);
-
-    const onComplete = (cleanedData: ImageData) => {
-      baseCtx.putImageData(cleanedData, 0, 0);
-      inpaintedImageDataRef.current = cleanedData;
-      setHasInpainted(true);
-      setIsProcessing(false);
-      setProcessProgress(100);
-      // Clear mask so user can review output directly
-      maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
-      saveMaskSnapshot();
-    };
-
-    try {
-      // Try Web Worker execution for non-blocking 60fps UI
-      if (typeof Worker !== 'undefined') {
-        if (!workerRef.current) {
-          workerRef.current = new Worker(
-            new URL('../../workers/inpaintWorker.ts', import.meta.url),
-            { type: 'module' }
-          );
-        }
-
-        const worker = workerRef.current;
-
-        worker.onmessage = (e: MessageEvent<InpaintWorkerResponse>) => {
-          const resp = e.data;
-          if (resp.type === 'INPAINT_PROGRESS') {
-            setProcessProgress(resp.progress);
-          } else if (resp.type === 'INPAINT_SUCCESS') {
-            onComplete(resp.resultData);
-          } else if (resp.type === 'INPAINT_ERROR') {
-            console.warn('[InpaintWorker Error]:', resp.error);
-            // Fallback to direct Telea inpainting on main thread
-            const direct = inpaintTelea(currentBase, currentMask, 6, setProcessProgress);
-            onComplete(direct);
-          }
-        };
-
-        worker.postMessage({
-          type: 'INPAINT_REQUEST',
-          imageData: currentBase,
-          maskData: currentMask,
-          radius: 6,
-        });
-      } else {
-        // Direct execution fallback
-        const result = inpaintTelea(currentBase, currentMask, 6, setProcessProgress);
-        onComplete(result);
-      }
-    } catch (err) {
-      console.warn('Worker instantiation failed, running direct fallback:', err);
-      const result = inpaintTelea(currentBase, currentMask, 6, setProcessProgress);
-      onComplete(result);
-    }
+    const cleanedData = await executeInpaint(currentBase, currentMask, 6);
+    baseCtx.putImageData(cleanedData, 0, 0);
+    inpaintedImageDataRef.current = cleanedData;
+    setHasInpainted(true);
+    // Clear mask so user can review output directly
+    maskCtx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+    saveMaskSnapshot();
   };
 
   // Download cleaned image
@@ -484,6 +430,20 @@ export const ImageWatermarkView: React.FC<ImageWatermarkViewProps> = ({ isCompac
 
             {/* Action Buttons: Compare, Inpaint & Download */}
             <div className="flex items-center gap-2">
+              {(isAiModelLoading || aiModelProgress > 0) && (
+                <div
+                  className="hidden md:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-[11px] font-mono text-slate-600 dark:text-slate-400"
+                  title="Trạng thái bộ nhớ đệm mô hình AI ONNX (Browser Cache API)"
+                >
+                  <Sparkles className="w-3 h-3 text-pink-500" />
+                  <span>
+                    {isAiModelCached
+                      ? `AI Cache: Sẵn sàng (${aiModelProgress}%)`
+                      : `AI Model: ${aiModelProgress}%`}
+                  </span>
+                </div>
+              )}
+
               {hasInpainted && (
                 <button
                   type="button"

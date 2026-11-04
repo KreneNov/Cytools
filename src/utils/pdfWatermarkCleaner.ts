@@ -3,8 +3,10 @@ import {
   PDFName,
   PDFArray,
   PDFDict,
+  PDFRawStream,
 } from 'pdf-lib';
 import type { PdfCleanOptions, PdfCleanResult } from '../types/watermarkRemover';
+import { stripPdfPageContentStreams } from './pdfWatermarkStripper';
 
 const DEFAULT_WATERMARK_KEYWORDS = [
   'camscanner',
@@ -22,7 +24,7 @@ const DEFAULT_WATERMARK_KEYWORDS = [
 /**
  * 100% Client-Side PDF Watermark & Stamp Cleaner
  * Powered by pdf-lib: removes watermark annotations, PieceInfo dictionaries,
- * overlay form XObjects, and content stream text blocks matching target keywords.
+ * overlay form XObjects, and deep-cleans compressed Page Content Streams (Tj/TJ/BDC).
  */
 export async function cleanPdfWatermarks(
   pdfBuffer: ArrayBuffer,
@@ -40,7 +42,6 @@ export async function cleanPdfWatermarks(
   );
 
   let strippedAnnotsCount = 0;
-  let strippedKeywordsCount = 0;
   let strippedXObjectsCount = 0;
 
   const pages = pdfDoc.getPages();
@@ -119,10 +120,16 @@ export async function cleanPdfWatermarks(
               keysToDelete.push(key);
             } else {
               const xObj = pdfDoc.context.lookup(xObjDict.get(key));
-              if (xObj instanceof PDFDict) {
-                const subtype = xObj.get(PDFName.of('Subtype'));
+              const targetDict =
+                xObj instanceof PDFDict
+                  ? xObj
+                  : xObj instanceof PDFRawStream
+                  ? xObj.dict
+                  : null;
+              if (targetDict) {
+                const subtype = targetDict.get(PDFName.of('Subtype'));
                 if (subtype instanceof PDFName && subtype.asString() === '/Form') {
-                  const pieceInfo = xObj.get(PDFName.of('PieceInfo'));
+                  const pieceInfo = targetDict.get(PDFName.of('PieceInfo'));
                   if (pieceInfo) keysToDelete.push(key);
                 }
               }
@@ -136,56 +143,10 @@ export async function cleanPdfWatermarks(
         }
       }
     }
-
-    // 4. Strip matching BT ... ET text blocks from page Content Streams
-    try {
-      const contentsRef = pageNode.get(PDFName.of('Contents'));
-      const contentsObj = pdfDoc.context.lookup(contentsRef);
-
-      const contentStreams = Array.isArray(contentsObj)
-        ? contentsObj
-        : contentsObj
-        ? [contentsObj]
-        : [];
-
-      for (const stream of contentStreams) {
-        if (
-          stream &&
-          typeof (stream as any).getContents === 'function' &&
-          typeof (stream as any).setContents === 'function'
-        ) {
-          const rawBytes: Uint8Array = (stream as any).getContents();
-          const decoder = new TextDecoder('latin1');
-          const streamText = decoder.decode(rawBytes);
-
-          // Regex matching BT ... ET text blocks
-          const btRegex = /BT[\s\S]*?ET/g;
-          let modified = false;
-
-          const cleanedText = streamText.replace(btRegex, (match) => {
-            const lowerMatch = match.toLowerCase();
-            const containsWatermark = allTargetKeywords.some((kw) =>
-              lowerMatch.includes(kw)
-            );
-
-            if (containsWatermark) {
-              strippedKeywordsCount++;
-              modified = true;
-              return ''; // Remove matching BT ... ET block
-            }
-            return match;
-          });
-
-          if (modified) {
-            const encoder = new TextEncoder();
-            (stream as any).setContents(encoder.encode(cleanedText));
-          }
-        }
-      }
-    } catch {
-      // Ignore content stream parsing issues on encrypted or non-standard streams
-    }
   }
+
+  // 4. Deep-Clean Raw Page & Form XObject Content Streams (Tj, TJ, BDC...EMC, ToUnicode CMaps)
+  const strippedKeywordsCount = stripPdfPageContentStreams(pdfDoc, allTargetKeywords);
 
   // Also remove PieceInfo and Watermark metadata from document Catalog
   const catalog = pdfDoc.catalog;
@@ -204,3 +165,5 @@ export async function cleanPdfWatermarks(
     strippedXObjectsCount,
   };
 }
+
+export { stripPdfPageContentStreams } from './pdfWatermarkStripper';

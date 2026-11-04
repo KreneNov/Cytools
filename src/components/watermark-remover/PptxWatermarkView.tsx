@@ -108,13 +108,11 @@ export const PptxWatermarkView: React.FC<PptxWatermarkViewProps> = ({ isCompact 
     }
   };
 
-  const handleDownload = () => {
-    if (!result || !pptxFile) return;
-    const url = URL.createObjectURL(result.cleanedBlob);
+  const triggerDirectDownload = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    const originalName = pptxFile.name.replace(/\.[^/.]+$/, '');
-    a.download = `${originalName}_cleaned.pptx`;
+    a.download = filename;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -127,7 +125,16 @@ export const PptxWatermarkView: React.FC<PptxWatermarkViewProps> = ({ isCompact 
     setDetectedItems([]);
     setResult(null);
     setErrorMsg(null);
+    setIsScanning(false);
+    setIsCleaning(false);
     if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleDownload = () => {
+    if (!result || !pptxFile) return;
+    const originalName = pptxFile.name.replace(/\.[^/.]+$/, '');
+    triggerDirectDownload(result.cleanedBlob, `${originalName}_cleaned.pptx`);
+    handleReset();
   };
 
   const allSelected = detectedItems.length > 0 && detectedItems.every((i) => i.selected);

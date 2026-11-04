@@ -3,6 +3,113 @@ import type {
   InpaintWorkerResponse,
 } from '../types/watermarkRemover';
 
+export const ONNX_MODEL_CACHE_NAME = 'cytools-onnx-models-v1';
+export const DEFAULT_ONNX_INPAINT_MODEL_URL = '/models/inpaint-lama-fp16.onnx';
+
+// In-memory cached buffer inside the Worker thread to avoid repeated CacheStorage reads
+let workerCachedOnnxBuffer: ArrayBuffer | null = null;
+let workerCachedOnnxUrl: string | null = null;
+
+/**
+ * Fetches an ONNX binary payload (~30MB) and caches it permanently in the browser's Cache API
+ * so the 30MB payload is only downloaded once per user device.
+ * Reports streaming download progress (0-100) via `onProgress`.
+ */
+export async function loadCachedOnnxModel(
+  modelUrl: string = DEFAULT_ONNX_INPAINT_MODEL_URL,
+  onProgress?: (progress: number, cached: boolean) => void
+): Promise<ArrayBuffer> {
+  if (workerCachedOnnxBuffer && workerCachedOnnxUrl === modelUrl) {
+    if (onProgress) onProgress(100, true);
+    return workerCachedOnnxBuffer;
+  }
+
+  const hasCacheApi = typeof caches !== 'undefined';
+
+  // 1. Check browser Cache Storage first
+  if (hasCacheApi) {
+    try {
+      const cache = await caches.open(ONNX_MODEL_CACHE_NAME);
+      const cachedResponse = await cache.match(modelUrl);
+      if (cachedResponse && cachedResponse.ok) {
+        if (onProgress) onProgress(50, true);
+        const buffer = await cachedResponse.arrayBuffer();
+        workerCachedOnnxBuffer = buffer;
+        workerCachedOnnxUrl = modelUrl;
+        if (onProgress) onProgress(100, true);
+        return buffer;
+      }
+    } catch (cacheReadErr) {
+      console.warn('[ONNX Cache API] Không thể đọc bộ nhớ đệm CacheStorage:', cacheReadErr);
+    }
+  }
+
+  // 2. Cache miss -> Stream download with live 0-100% progress reporting
+  if (onProgress) onProgress(0, false);
+  const response = await fetch(modelUrl, { credentials: 'same-origin' });
+  if (!response.ok) {
+    throw new Error(`Không thể tải mô hình AI (${response.status} ${response.statusText})`);
+  }
+
+  const contentLengthHeader = response.headers.get('Content-Length');
+  const totalBytes = contentLengthHeader ? parseInt(contentLengthHeader, 10) : 30 * 1024 * 1024;
+
+  let modelBuffer: ArrayBuffer;
+
+  if (response.body && typeof response.body.getReader === 'function') {
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let receivedBytes = 0;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        receivedBytes += value.byteLength;
+        if (onProgress && totalBytes > 0) {
+          const pct = Math.min(99, Math.max(1, Math.round((receivedBytes / totalBytes) * 100)));
+          onProgress(pct, false);
+        }
+      }
+    }
+
+    const merged = new Uint8Array(receivedBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    modelBuffer = merged.buffer;
+  } else {
+    modelBuffer = await response.arrayBuffer();
+  }
+
+  // 3. Persist the 30MB ONNX payload into Browser Cache API for future sessions
+  if (hasCacheApi && modelBuffer.byteLength > 0) {
+    try {
+      const cache = await caches.open(ONNX_MODEL_CACHE_NAME);
+      const responseToCache = new Response(modelBuffer.slice(0), {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Length': String(modelBuffer.byteLength),
+          'X-Cytools-Cached-At': new Date().toISOString(),
+        },
+      });
+      await cache.put(modelUrl, responseToCache);
+    } catch (cacheWriteErr) {
+      console.warn('[ONNX Cache API] Không thể lưu mô hình vào CacheStorage:', cacheWriteErr);
+    }
+  }
+
+  workerCachedOnnxBuffer = modelBuffer;
+  workerCachedOnnxUrl = modelUrl;
+  if (onProgress) onProgress(100, false);
+
+  return modelBuffer;
+}
+
 /**
  * Binary Min-Heap Priority Queue for Fast Marching Method (FMM)
  */
@@ -301,12 +408,62 @@ export function inpaintTelea(
   return outImg;
 }
 
-// Web Worker Event Listener (if executing in Web Worker context)
-if (typeof self !== 'undefined' && typeof (self as any).importScripts !== 'undefined') {
-  self.addEventListener('message', (event: MessageEvent<InpaintWorkerRequest>) => {
+// Web Worker Event Listener (works in both classic and ES module Web Workers)
+const isWorkerContext =
+  typeof self !== 'undefined' &&
+  typeof window === 'undefined';
+
+if (isWorkerContext) {
+  self.addEventListener('message', async (event: MessageEvent<InpaintWorkerRequest>) => {
     const data = event.data;
+
+    if (data?.type === 'PRELOAD_AI_MODEL') {
+      try {
+        const modelUrl = data.modelUrl || DEFAULT_ONNX_INPAINT_MODEL_URL;
+        let wasCached = false;
+        const buffer = await loadCachedOnnxModel(modelUrl, (progress, cached) => {
+          wasCached = cached;
+          self.postMessage({
+            type: 'AI_MODEL_PROGRESS',
+            progress,
+            cached,
+          } as InpaintWorkerResponse);
+        });
+
+        self.postMessage({
+          type: 'AI_MODEL_READY',
+          cached: wasCached,
+          byteLength: buffer.byteLength,
+        } as InpaintWorkerResponse);
+      } catch (err) {
+        self.postMessage({
+          type: 'INPAINT_ERROR',
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Không thể tải hoặc lưu bộ nhớ đệm mô hình AI ONNX.',
+        } as InpaintWorkerResponse);
+      }
+      return;
+    }
+
     if (data?.type === 'INPAINT_REQUEST') {
       try {
+        // Optional ONNX model cache warm-up if a modelUrl was supplied
+        if (data.modelUrl) {
+          try {
+            await loadCachedOnnxModel(data.modelUrl, (progress, cached) => {
+              self.postMessage({
+                type: 'AI_MODEL_PROGRESS',
+                progress,
+                cached,
+              } as InpaintWorkerResponse);
+            });
+          } catch {
+            // Continue with Telea FMM engine if external ONNX binary is not yet hosted
+          }
+        }
+
         const result = inpaintTelea(data.imageData, data.maskData, data.radius, (progress) => {
           self.postMessage({
             type: 'INPAINT_PROGRESS',

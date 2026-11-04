@@ -9,12 +9,22 @@ export interface ImageDetectionBox {
   confidence: number;
 }
 
-export interface InpaintWorkerRequest {
+export interface InpaintWorkerInpaintRequest {
   type: 'INPAINT_REQUEST';
   imageData: ImageData;
   maskData: ImageData;
   radius: number;
+  modelUrl?: string;
 }
+
+export interface InpaintWorkerModelPreloadRequest {
+  type: 'PRELOAD_AI_MODEL';
+  modelUrl: string;
+}
+
+export type InpaintWorkerRequest =
+  | InpaintWorkerInpaintRequest
+  | InpaintWorkerModelPreloadRequest;
 
 export interface InpaintWorkerProgress {
   type: 'INPAINT_PROGRESS';
@@ -31,10 +41,24 @@ export interface InpaintWorkerError {
   error: string;
 }
 
+export interface InpaintWorkerModelProgress {
+  type: 'AI_MODEL_PROGRESS';
+  progress: number;
+  cached: boolean;
+}
+
+export interface InpaintWorkerModelReady {
+  type: 'AI_MODEL_READY';
+  cached: boolean;
+  byteLength: number;
+}
+
 export type InpaintWorkerResponse =
   | InpaintWorkerProgress
   | InpaintWorkerSuccess
-  | InpaintWorkerError;
+  | InpaintWorkerError
+  | InpaintWorkerModelProgress
+  | InpaintWorkerModelReady;
 
 export interface PdfCleanOptions {
   customKeywords?: string[];
