@@ -8,18 +8,35 @@ import {
   AlertCircle,
   Clock,
   Gauge,
+  Trash2,
+  Plus,
+  Crown,
+  FileVideo,
 } from 'lucide-react';
 import { Skeleton } from '../ui/Skeleton';
 import { useFFmpeg } from '../../hooks/useFFmpeg';
 import { usePro } from '../../context/ProContext';
 
+interface BatchGifQueueItem {
+  id: string;
+  file: File;
+  status: 'pending' | 'processing' | 'done' | 'error';
+  errorMsg?: string;
+}
+
+const PRO_BATCH_MESSAGE =
+  'Tính năng chuyển đổi hàng loạt (Batch Processing) chỉ dành riêng cho tài khoản PRO. Hãy nâng cấp để tiết kiệm thời gian!';
+
 export const GifCreatorTab: React.FC = () => {
   const { isPro, openProModal } = usePro();
-  const { taskStatus, progressPercent, error, generateGif, resetTask } = useFFmpeg();
+  const { progressPercent, error, generateGif, resetTask } = useFFmpeg();
 
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [queue, setQueue] = useState<BatchGifQueueItem[]>([]);
+  const [isBatchProcessing, setIsBatchProcessing] = useState(false);
+  const [activeFileIndex, setActiveFileIndex] = useState<number>(0);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
-  const [resultGif, setResultGif] = useState<{ blob: Blob; url: string } | null>(null);
+  const [resultGif, setResultGif] = useState<{ blob: Blob; url: string; fileName: string } | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
 
   // Settings
   const [startTime, setStartTime] = useState<number>(0);
@@ -29,17 +46,78 @@ export const GifCreatorTab: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const file = e.target.files[0];
-      setSelectedFile(file);
-      const url = URL.createObjectURL(file);
-      setVideoPreviewUrl(url);
+  const triggerDownload = (url: string, originalFileName: string) => {
+    const baseName = originalFileName.replace(/\.[^/.]+$/, '') || 'animation';
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}.gif`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  const handleFilesSelected = (incomingFiles: FileList | File[]) => {
+    const fileArray = Array.from(incomingFiles).filter(
+      (f) => f.type.startsWith('video/') || /\.(mp4|mov|webm|mkv|avi)$/i.test(f.name)
+    );
+    if (fileArray.length === 0) return;
+
+    if (resultGif?.url) {
+      URL.revokeObjectURL(resultGif.url);
       setResultGif(null);
+    }
+    resetTask();
+
+    // PRO Gatekeeper for Batch Processing
+    if ((fileArray.length > 1 || (queue.length > 0 && fileArray.length >= 1)) && !isPro) {
+      openProModal(PRO_BATCH_MESSAGE);
+      const firstFile = queue.length > 0 ? queue[0].file : fileArray[0];
+      if (!videoPreviewUrl) {
+        setVideoPreviewUrl(URL.createObjectURL(firstFile));
+      }
+      setQueue([
+        {
+          id: `${firstFile.name}_${Date.now()}_0`,
+          file: firstFile,
+          status: 'pending',
+        },
+      ]);
+      return;
+    }
+
+    if (queue.length === 0 && fileArray[0]) {
+      if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
+      setVideoPreviewUrl(URL.createObjectURL(fileArray[0]));
       setStartTime(0);
       setDuration(5);
-      resetTask();
     }
+
+    const newItems: BatchGifQueueItem[] = fileArray.map((file, idx) => ({
+      id: `${file.name}_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+      file,
+      status: 'pending',
+    }));
+
+    setQueue((prev) => [...prev, ...newItems]);
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      handleFilesSelected(e.target.files);
+      e.target.value = '';
+    }
+  };
+
+  const handleRemoveItem = (id: string) => {
+    if (isBatchProcessing) return;
+    setQueue((prev) => {
+      const next = prev.filter((item) => item.id !== id);
+      if (next.length === 0 && videoPreviewUrl) {
+        URL.revokeObjectURL(videoPreviewUrl);
+        setVideoPreviewUrl(null);
+      }
+      return next;
+    });
   };
 
   const handleSyncCurrentTime = () => {
@@ -60,8 +138,8 @@ export const GifCreatorTab: React.FC = () => {
     setDuration(newVal);
   };
 
-  const handleCreateGif = async () => {
-    if (!selectedFile) return;
+  const handleCreateGifQueue = async () => {
+    if (queue.length === 0 || isBatchProcessing) return;
 
     if (duration > 10 && !isPro) {
       openProModal(
@@ -70,25 +148,67 @@ export const GifCreatorTab: React.FC = () => {
       return;
     }
 
-    try {
-      const res = await generateGif(selectedFile, {
-        startTime,
-        duration,
-        fps,
-        width: 480,
-      });
-      setResultGif(res);
-    } catch (err) {
-      console.error('GIF generation error', err);
+    setIsBatchProcessing(true);
+    if (resultGif?.url) {
+      URL.revokeObjectURL(resultGif.url);
+      setResultGif(null);
     }
+
+    const isSingleItem = queue.length === 1;
+
+    // MEMORY-SAFE SEQUENTIAL PROCESSING (STRICT for...of LOOP)
+    for (let i = 0; i < queue.length; i++) {
+      const item = queue[i];
+      if (item.status === 'done') continue;
+
+      setActiveFileIndex(i);
+      setQueue((prev) =>
+        prev.map((q, idx) => (idx === i ? { ...q, status: 'processing', errorMsg: undefined } : q))
+      );
+
+      try {
+        const res = await generateGif(item.file, {
+          startTime,
+          duration,
+          fps,
+          width: 480,
+        });
+
+        // Immediately trigger download as each file finishes
+        triggerDownload(res.url, item.file.name);
+
+        if (isSingleItem) {
+          setResultGif({ blob: res.blob, url: res.url, fileName: item.file.name });
+        } else {
+          // Explicitly clean up Object URL memory before processing the next video in the queue
+          setTimeout(() => {
+            URL.revokeObjectURL(res.url);
+          }, 1500);
+        }
+
+        setQueue((prev) =>
+          prev.map((q, idx) => (idx === i ? { ...q, status: 'done' } : q))
+        );
+      } catch (err) {
+        console.error('GIF generation error on file:', item.file.name, err);
+        const msg = err instanceof Error ? err.message : 'Lỗi tạo GIF';
+        setQueue((prev) =>
+          prev.map((q, idx) => (idx === i ? { ...q, status: 'error', errorMsg: msg } : q))
+        );
+      }
+    }
+
+    setIsBatchProcessing(false);
   };
 
   const handleReset = () => {
+    if (isBatchProcessing) return;
     if (videoPreviewUrl) URL.revokeObjectURL(videoPreviewUrl);
     if (resultGif?.url) URL.revokeObjectURL(resultGif.url);
-    setSelectedFile(null);
+    setQueue([]);
     setVideoPreviewUrl(null);
     setResultGif(null);
+    setActiveFileIndex(0);
     resetTask();
   };
 
@@ -99,49 +219,199 @@ export const GifCreatorTab: React.FC = () => {
     return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
   };
 
+  const completedCount = queue.filter((item) => item.status === 'done').length;
+
   return (
     <div className="space-y-6">
+      {/* Hidden Multiple File Input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept="video/mp4,video/quicktime,video/webm"
+        className="hidden"
+        onChange={handleFileChange}
+      />
+
       {/* Upload Zone */}
-      {!selectedFile && (
+      {queue.length === 0 && (
         <div
+          onDragOver={(e) => {
+            e.preventDefault();
+            setIsDragging(true);
+          }}
+          onDragLeave={(e) => {
+            e.preventDefault();
+            setIsDragging(false);
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            setIsDragging(false);
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+              handleFilesSelected(e.dataTransfer.files);
+            }
+          }}
           onClick={() => fileInputRef.current?.click()}
-          className="border-2 border-dashed border-slate-300 dark:border-slate-800 hover:border-pink-500/60 bg-white dark:bg-slate-900/40 hover:bg-slate-50 dark:hover:bg-slate-900/70 rounded-xl p-10 text-center cursor-pointer transition-all flex flex-col items-center justify-center gap-4"
+          className={`border-2 border-dashed rounded-xl p-10 text-center cursor-pointer transition-all flex flex-col items-center justify-center gap-4 ${
+            isDragging
+              ? 'border-pink-500 bg-pink-500/5'
+              : 'border-slate-300 dark:border-slate-800 hover:border-pink-500/60 bg-white dark:bg-slate-900/40 hover:bg-slate-50 dark:hover:bg-slate-900/70'
+          }`}
         >
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="video/mp4,video/quicktime,video/webm"
-            className="hidden"
-            onChange={handleFileChange}
-          />
           <div className="w-16 h-16 rounded-xl bg-pink-500/10 border border-pink-500/20 flex items-center justify-center text-pink-500">
             <Video className="w-8 h-8" />
           </div>
           <div className="space-y-1">
             <p className="text-base font-bold text-slate-900 dark:text-slate-100">
-              Chọn video để biến thành ảnh động GIF
+              Chọn hoặc kéo thả video để biến thành ảnh động GIF (Hỗ trợ nhiều file)
             </p>
             <p className="text-sm text-slate-600 dark:text-slate-400 max-w-xl mx-auto leading-relaxed">
               Hỗ trợ MP4, MOV, WebM • Tối ưu 2-pass palettegen mượt mà chống nhòe hạt
             </p>
           </div>
+          <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-600 dark:text-amber-400 text-xs font-semibold">
+            <Crown className="w-3.5 h-3.5" />
+            <span>PRO: Hỗ trợ tạo GIF hàng loạt (Batch Queue) & mở khóa thời lượng 30s</span>
+          </div>
+        </div>
+      )}
+
+      {/* Batch Queue List */}
+      {queue.length > 1 && (
+        <div className="p-5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100 dark:border-slate-800">
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                Hàng đợi tạo GIF ({queue.length} video)
+              </h3>
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+                <Crown className="w-3 h-3" />
+                PRO Batch ({completedCount}/{queue.length})
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isBatchProcessing}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5 text-pink-500" />
+                <span>Thêm video</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleReset}
+                disabled={isBatchProcessing}
+                className="text-xs text-slate-500 hover:text-red-600 dark:hover:text-red-400 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:opacity-50 transition-colors cursor-pointer"
+              >
+                Xóa tất cả
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-2 max-h-52 overflow-y-auto pr-1">
+            {queue.map((item, idx) => (
+              <div
+                key={item.id}
+                className={`p-3 rounded-xl border flex items-center justify-between gap-3 transition-colors ${
+                  item.status === 'processing'
+                    ? 'bg-pink-500/5 border-pink-500/40'
+                    : item.status === 'done'
+                    ? 'bg-emerald-500/5 border-emerald-500/20'
+                    : item.status === 'error'
+                    ? 'bg-red-500/5 border-red-500/20'
+                    : 'bg-slate-50 dark:bg-slate-950/60 border-slate-200 dark:border-slate-800'
+                }`}
+              >
+                <div className="flex items-center gap-3 overflow-hidden min-w-0">
+                  <div className="w-8 h-8 rounded-lg bg-pink-500/10 border border-pink-500/20 flex items-center justify-center text-pink-500 shrink-0">
+                    <FileVideo className="w-4 h-4" />
+                  </div>
+                  <div className="overflow-hidden min-w-0">
+                    <p className="text-xs font-semibold text-slate-900 dark:text-slate-200 truncate">
+                      {idx + 1}. {item.file.name}
+                    </p>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      {formatSize(item.file.size)}
+                      {item.errorMsg ? ` • ${item.errorMsg}` : ''}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  {item.status === 'pending' && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-200/70 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
+                      <Clock className="w-3 h-3" />
+                      Chờ xử lý
+                    </span>
+                  )}
+                  {item.status === 'processing' && (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-pink-500/10 text-pink-600 dark:text-pink-400 border border-pink-500/20">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      Đang tạo ({progressPercent}%)
+                    </span>
+                  )}
+                  {item.status === 'done' && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
+                      <CheckCircle2 className="w-3 h-3" />
+                      Đã tải về
+                    </span>
+                  )}
+                  {item.status === 'error' && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-red-500/10 text-red-600 dark:text-red-400 border border-red-500/20">
+                      <AlertCircle className="w-3 h-3" />
+                      Lỗi
+                    </span>
+                  )}
+
+                  {!isBatchProcessing && (
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveItem(item.id)}
+                      className="p-1.5 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors cursor-pointer"
+                      title="Xóa khỏi hàng đợi"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
       {/* Video Loaded Workspace */}
-      {selectedFile && videoPreviewUrl && (
+      {queue.length > 0 && videoPreviewUrl && (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           {/* Left Column: Video Preview & Timeline Scrubber */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">Xem trước & chọn mốc thời gian:</span>
-              <button
-                onClick={handleReset}
-                disabled={taskStatus === 'processing'}
-                className="text-xs text-slate-500 hover:text-slate-900 dark:hover:text-white px-2 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
-              >
-                Đổi video
-              </button>
+              <span className="text-xs font-semibold text-slate-700 dark:text-slate-300">
+                Xem trước & chọn mốc thời gian:
+              </span>
+              <div className="flex items-center gap-2">
+                {queue.length === 1 && (
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isBatchProcessing}
+                    className="inline-flex items-center gap-1 text-xs text-pink-600 dark:text-pink-400 hover:underline px-2 py-1 rounded cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>Thêm video (PRO)</span>
+                  </button>
+                )}
+                <button
+                  onClick={handleReset}
+                  disabled={isBatchProcessing}
+                  className="text-xs text-slate-500 hover:text-slate-900 dark:hover:text-white px-2 py-1 rounded hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  Đổi video
+                </button>
+              </div>
             </div>
 
             <div className="rounded-xl overflow-hidden bg-black border border-slate-200 dark:border-slate-800 aspect-video flex items-center justify-center">
@@ -257,12 +527,12 @@ export const GifCreatorTab: React.FC = () => {
 
             {/* Execute Button */}
             <div>
-              {taskStatus === 'processing' ? (
+              {isBatchProcessing ? (
                 <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 space-y-2">
                   <div className="flex items-center justify-between text-xs">
                     <span className="flex items-center gap-2 text-pink-600 dark:text-pink-400 font-semibold">
                       <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      Đang xử lý 2-pass Lanczos palette...
+                      Đang xử lý 2-pass Lanczos ({activeFileIndex + 1}/{queue.length})...
                     </span>
                     <span className="font-mono font-bold text-pink-500">{progressPercent}%</span>
                   </div>
@@ -276,11 +546,15 @@ export const GifCreatorTab: React.FC = () => {
               ) : (
                 <button
                   type="button"
-                  onClick={handleCreateGif}
+                  onClick={handleCreateGifQueue}
                   className="w-full py-3 px-5 rounded-xl bg-pink-500 hover:bg-pink-600 text-white font-bold text-xs active:scale-95 transition-all flex items-center justify-center gap-2 cursor-pointer"
                 >
                   <Sparkles className="w-4 h-4" />
-                  <span>Bắt đầu tạo ảnh động GIF</span>
+                  <span>
+                    {queue.length > 1
+                      ? `Bắt đầu tạo GIF hàng loạt (${queue.length} video)`
+                      : 'Bắt đầu tạo ảnh động GIF'}
+                  </span>
                 </button>
               )}
             </div>
@@ -289,7 +563,7 @@ export const GifCreatorTab: React.FC = () => {
       )}
 
       {/* SKELETON RESULT PLACEHOLDER DURING GIF GENERATION */}
-      {taskStatus === 'processing' && (
+      {isBatchProcessing && queue.length === 1 && (
         <div className="p-6 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-4">
           <div className="flex items-center justify-between">
             <Skeleton className="h-5 w-44 rounded" />
@@ -307,13 +581,13 @@ export const GifCreatorTab: React.FC = () => {
         </div>
       )}
 
-      {/* Generated Result GIF */}
-      {resultGif && (
+      {/* Generated Result GIF (Single File Preview) */}
+      {resultGif && queue.length === 1 && (
         <div className="p-6 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-emerald-600 dark:text-emerald-400 text-sm font-semibold">
               <CheckCircle2 className="w-5 h-5 text-emerald-500" />
-              <span>Tạo ảnh động GIF thành công!</span>
+              <span>Tạo ảnh động GIF thành công! File đã tự động tải về máy.</span>
             </div>
             <span className="text-xs font-mono text-slate-500 dark:text-slate-400">
               Dung lượng: {formatSize(resultGif.blob.size)}
@@ -336,21 +610,44 @@ export const GifCreatorTab: React.FC = () => {
             <div className="flex items-center gap-3">
               <a
                 href={resultGif.url}
-                download={`${selectedFile?.name.replace(/\.[^/.]+$/, '') || 'animation'}.gif`}
+                download={`${resultGif.fileName.replace(/\.[^/.]+$/, '') || 'animation'}.gif`}
                 className="px-5 py-2.5 rounded-xl bg-pink-500 hover:bg-pink-600 text-white font-bold text-xs active:scale-95 transition-all flex items-center gap-2"
               >
                 <Download className="w-4 h-4" />
-                <span>Tải ảnh GIF về máy</span>
+                <span>Tải lại ảnh GIF</span>
               </a>
 
               <button
-                onClick={() => setResultGif(null)}
+                onClick={() => {
+                  URL.revokeObjectURL(resultGif.url);
+                  setResultGif(null);
+                  setQueue((prev) => prev.map((q) => ({ ...q, status: 'pending' })));
+                }}
                 className="px-4 py-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-medium transition-colors cursor-pointer"
               >
                 Tạo đoạn khác
               </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Batch Completion Banner */}
+      {!isBatchProcessing && queue.length > 1 && completedCount === queue.length && (
+        <div className="p-5 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5 text-emerald-600 dark:text-emerald-400 text-sm font-bold">
+            <CheckCircle2 className="w-5 h-5 text-emerald-500 shrink-0" />
+            <span>
+              Đã tạo GIF và tự động tải về thành công {completedCount}/{queue.length} file!
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={handleReset}
+            className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold transition-colors cursor-pointer"
+          >
+            Tạo đợt mới
+          </button>
         </div>
       )}
     </div>

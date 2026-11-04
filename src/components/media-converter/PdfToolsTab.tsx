@@ -15,11 +15,14 @@ import {
   AlertCircle,
   X,
   Archive,
+  Crown,
+  Clock,
 } from 'lucide-react';
 import { Skeleton } from '../ui/Skeleton';
 import { PDFDocument } from 'pdf-lib';
 import * as pdfjsLib from 'pdfjs-dist';
 import JSZip from 'jszip';
+import { usePro } from '../../context/ProContext';
 
 // Configure pdfjs worker to standard CDN
 if (typeof window !== 'undefined' && 'GlobalWorkerOptions' in pdfjsLib) {
@@ -40,7 +43,18 @@ interface ExtractedImagePage {
   url: string;
 }
 
+interface PdfBatchQueueItem {
+  id: string;
+  file: File;
+  status: 'pending' | 'processing' | 'done' | 'error';
+  errorMsg?: string;
+}
+
+const PRO_BATCH_MESSAGE =
+  'Tính năng chuyển đổi hàng loạt (Batch Processing) chỉ dành riêng cho tài khoản PRO. Hãy nâng cấp để tiết kiệm thời gian!';
+
 export const PdfToolsTab: React.FC = () => {
+  const { isPro, openProModal } = usePro();
   const [activeSubTool, setActiveSubTool] = useState<PdfSubTool>('merge');
 
   // Tool A: Merge PDF states
@@ -58,6 +72,7 @@ export const PdfToolsTab: React.FC = () => {
 
   // Tool C: PDF to Images (JPG/ZIP) states
   const [pdfToImgFile, setPdfToImgFile] = useState<File | null>(null);
+  const [pdfBatchQueue, setPdfBatchQueue] = useState<PdfBatchQueueItem[]>([]);
   const [pdfNumPages, setPdfNumPages] = useState<number>(0);
   const [isConvertingPdfToImg, setIsConvertingPdfToImg] = useState(false);
   const [pdfToImgProgress, setPdfToImgProgress] = useState<number>(0);
@@ -310,7 +325,7 @@ export const PdfToolsTab: React.FC = () => {
     }
   };
 
-  // Handle PDF File for PDF to Images
+  // Handle PDF File(s) for PDF to Images
   const handleSelectPdfToImg = async (file: File) => {
     setErrorMessage(null);
     extractedImages.forEach((img) => URL.revokeObjectURL(img.url));
@@ -333,6 +348,149 @@ export const PdfToolsTab: React.FC = () => {
       console.error('Error reading PDF metadata:', err);
       setErrorMessage('Không thể đọc cấu trúc tệp PDF này. Tệp có thể bị hỏng hoặc đã khóa mật khẩu.');
     }
+  };
+
+  const handleSelectMultiplePdfToImg = async (incomingFiles: FileList | File[]) => {
+    const validPdfs = Array.from(incomingFiles).filter(
+      (f) => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')
+    );
+
+    if (validPdfs.length === 0) {
+      setErrorMessage('Vui lòng chọn tệp tin định dạng PDF hợp lệ.');
+      return;
+    }
+
+    const existingCount = pdfBatchQueue.length > 0 ? pdfBatchQueue.length : pdfToImgFile ? 1 : 0;
+
+    // PRO Gatekeeper for Batch Processing
+    if ((validPdfs.length > 1 || (existingCount > 0 && validPdfs.length >= 1)) && !isPro) {
+      openProModal(PRO_BATCH_MESSAGE);
+      const firstPdf = pdfToImgFile || validPdfs[0];
+      setPdfBatchQueue([]);
+      if (!pdfToImgFile) {
+        await handleSelectPdfToImg(firstPdf);
+      }
+      return;
+    }
+
+    if (validPdfs.length === 1 && existingCount === 0) {
+      setPdfBatchQueue([]);
+      await handleSelectPdfToImg(validPdfs[0]);
+      return;
+    }
+
+    const initialItems: PdfBatchQueueItem[] = [];
+    if (pdfBatchQueue.length === 0 && pdfToImgFile) {
+      initialItems.push({
+        id: `${pdfToImgFile.name}_${Date.now()}_init`,
+        file: pdfToImgFile,
+        status: 'pending',
+      });
+    }
+
+    const appendedItems: PdfBatchQueueItem[] = validPdfs.map((f, idx) => ({
+      id: `${f.name}_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+      file: f,
+      status: 'pending',
+    }));
+
+    setPdfBatchQueue((prev) => [...prev, ...initialItems, ...appendedItems]);
+    if (!pdfToImgFile && validPdfs[0]) {
+      await handleSelectPdfToImg(validPdfs[0]);
+    }
+  };
+
+  const executeBatchPdfToImages = async () => {
+    if (pdfBatchQueue.length === 0 || isConvertingPdfToImg) return;
+
+    setIsConvertingPdfToImg(true);
+    setErrorMessage(null);
+
+    // MEMORY-SAFE SEQUENTIAL PROCESSING (STRICT for...of LOOP)
+    for (let i = 0; i < pdfBatchQueue.length; i++) {
+      const item = pdfBatchQueue[i];
+      if (item.status === 'done') continue;
+
+      setPdfBatchQueue((prev) =>
+        prev.map((q, idx) => (idx === i ? { ...q, status: 'processing', errorMsg: undefined } : q))
+      );
+
+      try {
+        const arrayBuffer = await item.file.arrayBuffer();
+        const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) });
+        const pdfDoc = await loadingTask.promise;
+        const numPages = pdfDoc.numPages;
+
+        const pageBlobs: { pageNum: number; blob: Blob }[] = [];
+
+        for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+          const page = await pdfDoc.getPage(pageNum);
+          const viewport = page.getViewport({ scale: 2.0 });
+          const canvas = document.createElement('canvas');
+          canvas.width = viewport.width;
+          canvas.height = viewport.height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) continue;
+
+          ctx.fillStyle = '#ffffff';
+          ctx.fillRect(0, 0, viewport.width, viewport.height);
+          await page.render({ canvasContext: ctx, viewport }).promise;
+
+          const blob = await new Promise<Blob>((resolve, reject) => {
+            canvas.toBlob(
+              (b) => (b ? resolve(b) : reject(new Error('Canvas render failed'))),
+              'image/jpeg',
+              0.92
+            );
+          });
+
+          // Free canvas memory immediately
+          canvas.width = 0;
+          canvas.height = 0;
+
+          pageBlobs.push({ pageNum, blob });
+          setPdfToImgProgress(Math.round((pageNum / numPages) * 100));
+        }
+
+        if (pageBlobs.length === 1) {
+          const tempUrl = URL.createObjectURL(pageBlobs[0].blob);
+          const a = document.createElement('a');
+          a.href = tempUrl;
+          a.download = `${item.file.name.replace(/\.[^/.]+$/, '')}_page1.jpg`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(tempUrl), 1500);
+        } else if (pageBlobs.length > 1) {
+          const zip = new JSZip();
+          pageBlobs.forEach((p) => {
+            zip.file(`trang_${p.pageNum}.jpg`, p.blob);
+          });
+          const generatedZipBlob = await zip.generateAsync({ type: 'blob' });
+          const tempUrl = URL.createObjectURL(generatedZipBlob);
+          const a = document.createElement('a');
+          a.href = tempUrl;
+          a.download = `${item.file.name.replace(/\.[^/.]+$/, '')}_images.zip`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          setTimeout(() => URL.revokeObjectURL(tempUrl), 1500);
+        }
+
+        setPdfBatchQueue((prev) =>
+          prev.map((q, idx) => (idx === i ? { ...q, status: 'done' } : q))
+        );
+      } catch (err) {
+        console.error('Batch PDF to image error on:', item.file.name, err);
+        setPdfBatchQueue((prev) =>
+          prev.map((q, idx) =>
+            idx === i ? { ...q, status: 'error', errorMsg: 'Lỗi kết xuất PDF' } : q
+          )
+        );
+      }
+    }
+
+    setIsConvertingPdfToImg(false);
   };
 
   const executePdfToImages = async () => {
@@ -900,8 +1058,22 @@ export const PdfToolsTab: React.FC = () => {
       {/* ============================================================ */}
       {activeSubTool === 'pdf-to-images' && (
         <div className="space-y-6">
+          <input
+            ref={pdfToImgInputRef}
+            type="file"
+            multiple
+            accept=".pdf,application/pdf"
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files && e.target.files.length > 0) {
+                handleSelectMultiplePdfToImg(e.target.files);
+                e.target.value = '';
+              }
+            }}
+          />
+
           {/* Dropzone */}
-          {!pdfToImgFile && (
+          {!pdfToImgFile && pdfBatchQueue.length === 0 && (
             <div
               onDragOver={(e) => {
                 e.preventDefault();
@@ -914,8 +1086,8 @@ export const PdfToolsTab: React.FC = () => {
               onDrop={(e) => {
                 e.preventDefault();
                 setIsDraggingOver(false);
-                if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-                  handleSelectPdfToImg(e.dataTransfer.files[0]);
+                if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                  handleSelectMultiplePdfToImg(e.dataTransfer.files);
                 }
               }}
               onClick={() => pdfToImgInputRef.current?.click()}
@@ -925,19 +1097,12 @@ export const PdfToolsTab: React.FC = () => {
                   : 'border-slate-300 dark:border-slate-800 hover:border-pink-500/40 bg-white dark:bg-slate-900/40 hover:bg-slate-50 dark:hover:bg-slate-900/70'
               }`}
             >
-              <input
-                ref={pdfToImgInputRef}
-                type="file"
-                accept=".pdf,application/pdf"
-                className="hidden"
-                onChange={(e) => e.target.files?.[0] && handleSelectPdfToImg(e.target.files[0])}
-              />
               <div className="w-14 h-14 rounded-xl bg-pink-500/10 border border-pink-500/20 flex items-center justify-center text-pink-500">
                 <FileText className="w-7 h-7" />
               </div>
               <div className="space-y-1">
                 <p className="text-base font-bold text-slate-900 dark:text-slate-100">
-                  Chọn hoặc kéo thả file PDF cần chuyển sang ảnh JPG
+                  Chọn hoặc kéo thả file PDF cần chuyển sang ảnh JPG (Hỗ trợ nhiều file)
                 </p>
                 <p className="text-sm text-slate-600 dark:text-slate-400 max-w-xl mx-auto leading-relaxed">
                   Trích xuất từng trang thành ảnh JPG độ nét cao • Tự động đóng gói ZIP nếu có nhiều trang • Xử lý 100% Client-side bằng PDF.js
@@ -950,15 +1115,149 @@ export const PdfToolsTab: React.FC = () => {
                 <span className="text-xs font-semibold px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
                   📦 Nhiều trang: Đóng gói trọn bộ file .ZIP
                 </span>
-                <span className="text-xs font-semibold px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
-                  🔒 Bảo mật tuyệt đối in-browser
+                <span className="text-xs font-semibold px-2.5 py-1 rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 inline-flex items-center gap-1">
+                  <Crown className="w-3 h-3" />
+                  PRO: Chuyển đổi hàng loạt (Batch Queue)
                 </span>
               </div>
             </div>
           )}
 
-          {/* Selected PDF Card */}
-          {pdfToImgFile && (
+          {/* PRO Batch Queue Panel */}
+          {pdfBatchQueue.length > 1 && (
+            <div className="p-5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100 dark:border-slate-800">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                    Hàng đợi PDF sang JPG/ZIP ({pdfBatchQueue.length} file)
+                  </h3>
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+                    <Crown className="w-3 h-3" />
+                    PRO Batch ({pdfBatchQueue.filter((q) => q.status === 'done').length}/{pdfBatchQueue.length})
+                  </span>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => pdfToImgInputRef.current?.click()}
+                    disabled={isConvertingPdfToImg}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors cursor-pointer"
+                  >
+                    <FilePlus className="w-3.5 h-3.5 text-pink-500" />
+                    <span>Thêm PDF</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPdfBatchQueue([]);
+                      setPdfToImgFile(null);
+                      setPdfNumPages(0);
+                      setExtractedImages([]);
+                      setZipBlob(null);
+                    }}
+                    disabled={isConvertingPdfToImg}
+                    className="text-xs text-slate-400 hover:text-red-600 dark:hover:text-red-400 disabled:opacity-50 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors cursor-pointer"
+                  >
+                    Xóa tất cả
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+                {pdfBatchQueue.map((item, idx) => (
+                  <div
+                    key={item.id}
+                    className={`p-3 rounded-xl border flex items-center justify-between gap-3 transition-colors ${
+                      item.status === 'processing'
+                        ? 'bg-pink-500/5 border-pink-500/40'
+                        : item.status === 'done'
+                        ? 'bg-emerald-500/5 border-emerald-500/20'
+                        : item.status === 'error'
+                        ? 'bg-red-500/5 border-red-500/20'
+                        : 'bg-slate-50 dark:bg-slate-950/60 border-slate-200 dark:border-slate-800'
+                    }`}
+                  >
+                    <div className="flex items-center gap-3 overflow-hidden min-w-0">
+                      <div className="w-8 h-8 rounded-lg bg-pink-500/10 border border-pink-500/20 flex items-center justify-center text-pink-500 shrink-0">
+                        <FileText className="w-4 h-4" />
+                      </div>
+                      <div className="overflow-hidden min-w-0">
+                        <p className="text-xs font-semibold text-slate-900 dark:text-slate-200 truncate">
+                          {idx + 1}. {item.file.name}
+                        </p>
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          {formatBytes(item.file.size)}
+                          {item.errorMsg ? ` • ${item.errorMsg}` : ''}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0">
+                      {item.status === 'pending' && (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-200/70 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
+                          <Clock className="w-3 h-3" />
+                          Chờ xử lý
+                        </span>
+                      )}
+                      {item.status === 'processing' && (
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-pink-500/10 text-pink-600 dark:text-pink-400 border border-pink-500/20">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          Đang kết xuất ({pdfToImgProgress}%)
+                        </span>
+                      )}
+                      {item.status === 'done' && (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
+                          <CheckCircle2 className="w-3 h-3" />
+                          Đã tải về
+                        </span>
+                      )}
+                      {item.status === 'error' && (
+                        <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-red-500/10 text-red-600 dark:text-red-400 border border-red-500/20">
+                          <AlertCircle className="w-3 h-3" />
+                          Lỗi
+                        </span>
+                      )}
+
+                      {!isConvertingPdfToImg && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setPdfBatchQueue((prev) => prev.filter((q) => q.id !== item.id))
+                          }
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <button
+                type="button"
+                onClick={executeBatchPdfToImages}
+                disabled={isConvertingPdfToImg}
+                className="w-full py-3.5 px-6 rounded-xl bg-pink-500 hover:bg-pink-600 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer"
+              >
+                {isConvertingPdfToImg ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>Đang chuyển đổi tuần tự & tải về...</span>
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-4 h-4" />
+                    <span>Bắt đầu chuyển đổi hàng loạt ({pdfBatchQueue.length} file PDF)</span>
+                  </>
+                )}
+              </button>
+            </div>
+          )}
+
+          {/* Selected PDF Card (Single File Mode) */}
+          {pdfToImgFile && pdfBatchQueue.length <= 1 && (
             <div className="p-6 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-6">
               <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800/80">
                 <div className="flex items-center gap-3 min-w-0">
@@ -975,19 +1274,31 @@ export const PdfToolsTab: React.FC = () => {
                   </div>
                 </div>
 
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPdfToImgFile(null);
-                    setPdfNumPages(0);
-                    setExtractedImages([]);
-                    setZipBlob(null);
-                  }}
-                  disabled={isConvertingPdfToImg}
-                  className="text-xs text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 disabled:opacity-50 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
-                >
-                  Đổi file
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => pdfToImgInputRef.current?.click()}
+                    disabled={isConvertingPdfToImg}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors cursor-pointer"
+                  >
+                    <FilePlus className="w-3.5 h-3.5 text-pink-500" />
+                    <span>Thêm PDF (PRO)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPdfToImgFile(null);
+                      setPdfBatchQueue([]);
+                      setPdfNumPages(0);
+                      setExtractedImages([]);
+                      setZipBlob(null);
+                    }}
+                    disabled={isConvertingPdfToImg}
+                    className="text-xs text-slate-400 hover:text-slate-600 dark:hover:text-slate-200 disabled:opacity-50 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+                  >
+                    Đổi file
+                  </button>
+                </div>
               </div>
 
               {/* Progress indicator */}

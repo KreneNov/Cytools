@@ -74,15 +74,17 @@ export const useFFmpeg = (): UseFFmpegReturn => {
       setProgressPercent(0);
       setTaskStatus('processing');
 
+      const inputExt = videoFile.name.substring(videoFile.name.lastIndexOf('.')) || '.mp4';
+      const uniqueSuffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const inputName = `input_${uniqueSuffix}${inputExt}`;
+      const outputName = `output_${uniqueSuffix}.mp3`;
+
       try {
         if (!ffmpegRef.current || !ffmpegRef.current.loaded) {
           await loadEngine();
         }
 
         const ffmpeg = ffmpegRef.current!;
-        const inputExt = videoFile.name.substring(videoFile.name.lastIndexOf('.')) || '.mp4';
-        const inputName = `input_${Date.now()}${inputExt}`;
-        const outputName = `output_${Date.now()}.mp3`;
 
         // Write input file to in-memory FFmpeg virtual FS
         const fileData = await fetchFile(videoFile);
@@ -100,14 +102,6 @@ export const useFFmpeg = (): UseFFmpegReturn => {
         const blob = new Blob([uint8.buffer as ArrayBuffer], { type: 'audio/mp3' });
         const url = URL.createObjectURL(blob);
 
-        // Cleanup virtual FS
-        try {
-          await ffmpeg.deleteFile(inputName);
-          await ffmpeg.deleteFile(outputName);
-        } catch {
-          // ignore cleanup errors
-        }
-
         setProgressPercent(100);
         setTaskStatus('done');
         return { blob, url };
@@ -117,6 +111,20 @@ export const useFFmpeg = (): UseFFmpegReturn => {
         setError(msg);
         setTaskStatus('failed');
         throw err;
+      } finally {
+        const ffmpeg = ffmpegRef.current;
+        if (ffmpeg && ffmpeg.loaded) {
+          try {
+            await ffmpeg.deleteFile(inputName);
+          } catch {
+            // ignore cleanup errors if file was not written
+          }
+          try {
+            await ffmpeg.deleteFile(outputName);
+          } catch {
+            // ignore cleanup errors if output was not created
+          }
+        }
       }
     },
     [loadEngine]
@@ -128,15 +136,17 @@ export const useFFmpeg = (): UseFFmpegReturn => {
       setProgressPercent(0);
       setTaskStatus('processing');
 
+      const inputExt = videoFile.name.substring(videoFile.name.lastIndexOf('.')) || '.mp4';
+      const uniqueSuffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const inputName = `input_${uniqueSuffix}${inputExt}`;
+      const outputName = `output_${uniqueSuffix}.gif`;
+
       try {
         if (!ffmpegRef.current || !ffmpegRef.current.loaded) {
           await loadEngine();
         }
 
         const ffmpeg = ffmpegRef.current!;
-        const inputExt = videoFile.name.substring(videoFile.name.lastIndexOf('.')) || '.mp4';
-        const inputName = `input_${Date.now()}${inputExt}`;
-        const outputName = `output_${Date.now()}.gif`;
 
         // Write input file to virtual memory FS
         const fileData = await fetchFile(videoFile);
@@ -162,14 +172,6 @@ export const useFFmpeg = (): UseFFmpegReturn => {
         const blob = new Blob([uint8.buffer as ArrayBuffer], { type: 'image/gif' });
         const url = URL.createObjectURL(blob);
 
-        // Cleanup virtual FS
-        try {
-          await ffmpeg.deleteFile(inputName);
-          await ffmpeg.deleteFile(outputName);
-        } catch {
-          // ignore
-        }
-
         setProgressPercent(100);
         setTaskStatus('done');
         return { blob, url };
@@ -179,6 +181,20 @@ export const useFFmpeg = (): UseFFmpegReturn => {
         setError(msg);
         setTaskStatus('failed');
         throw err;
+      } finally {
+        const ffmpeg = ffmpegRef.current;
+        if (ffmpeg && ffmpeg.loaded) {
+          try {
+            await ffmpeg.deleteFile(inputName);
+          } catch {
+            // ignore
+          }
+          try {
+            await ffmpeg.deleteFile(outputName);
+          } catch {
+            // ignore
+          }
+        }
       }
     },
     [loadEngine]
@@ -190,15 +206,17 @@ export const useFFmpeg = (): UseFFmpegReturn => {
       setProgressPercent(0);
       setTaskStatus('processing');
 
+      const inputExt = videoFile.name.substring(videoFile.name.lastIndexOf('.')) || '.mov';
+      const uniqueSuffix = `${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const inputName = `input_${uniqueSuffix}${inputExt}`;
+      const outputName = `output_${uniqueSuffix}.mp4`;
+
       try {
         if (!ffmpegRef.current || !ffmpegRef.current.loaded) {
           await loadEngine();
         }
 
         const ffmpeg = ffmpegRef.current!;
-        const inputExt = videoFile.name.substring(videoFile.name.lastIndexOf('.')) || '.mov';
-        const inputName = `input_${Date.now()}${inputExt}`;
-        const outputName = `output_${Date.now()}.mp4`;
 
         // Write input file to virtual memory FS
         const fileData = await fetchFile(videoFile);
@@ -228,14 +246,6 @@ export const useFFmpeg = (): UseFFmpegReturn => {
         const blob = new Blob([uint8.buffer as ArrayBuffer], { type: 'video/mp4' });
         const url = URL.createObjectURL(blob);
 
-        // Cleanup virtual FS
-        try {
-          await ffmpeg.deleteFile(inputName);
-          await ffmpeg.deleteFile(outputName);
-        } catch {
-          // ignore
-        }
-
         setProgressPercent(100);
         setTaskStatus('done');
         return { blob, url };
@@ -245,6 +255,20 @@ export const useFFmpeg = (): UseFFmpegReturn => {
         setError(msg);
         setTaskStatus('failed');
         throw err;
+      } finally {
+        const ffmpeg = ffmpegRef.current;
+        if (ffmpeg && ffmpeg.loaded) {
+          try {
+            await ffmpeg.deleteFile(inputName);
+          } catch {
+            // ignore
+          }
+          try {
+            await ffmpeg.deleteFile(outputName);
+          } catch {
+            // ignore
+          }
+        }
       }
     },
     [loadEngine]

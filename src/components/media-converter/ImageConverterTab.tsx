@@ -13,8 +13,14 @@ import {
   X,
   Loader2,
   Smartphone,
+  Crown,
+  Plus,
+  Trash2,
+  Clock,
+  CheckCircle2,
 } from 'lucide-react';
 import { Skeleton } from '../ui/Skeleton';
+import { usePro } from '../../context/ProContext';
 
 type TargetFormat = 'image/webp' | 'image/jpeg' | 'image/png' | 'image/bmp' | 'image/x-icon';
 
@@ -26,6 +32,17 @@ interface FormatOption {
   desc: string;
   badgeStyle: string;
 }
+
+interface BatchImageQueueItem {
+  id: string;
+  file: File;
+  status: 'pending' | 'processing' | 'done' | 'error';
+  outputSize?: number;
+  errorMsg?: string;
+}
+
+const PRO_BATCH_MESSAGE =
+  'Tính năng chuyển đổi hàng loạt (Batch Processing) chỉ dành riêng cho tài khoản PRO. Hãy nâng cấp để tiết kiệm thời gian!';
 
 const FORMAT_OPTIONS: FormatOption[] = [
   {
@@ -175,8 +192,100 @@ async function canvasToIcoBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   return new Blob([icoHeader, pngBytes], { type: 'image/x-icon' });
 }
 
+/**
+ * Memory-safe helper to convert a single File to the target format Blob
+ */
+async function convertSingleImageFile(
+  rawFile: File,
+  targetFormat: TargetFormat,
+  quality: number,
+  scale: number
+): Promise<Blob> {
+  let workingFile = rawFile;
+  const isHeic =
+    rawFile.name.toLowerCase().endsWith('.heic') ||
+    rawFile.name.toLowerCase().endsWith('.heif') ||
+    rawFile.type.includes('heic') ||
+    rawFile.type.includes('heif');
+
+  if (isHeic) {
+    const heic2anyModule = await import('heic2any');
+    const heic2any = heic2anyModule.default || heic2anyModule;
+    const res = await heic2any({
+      blob: rawFile,
+      toType: 'image/jpeg',
+      quality: 0.95,
+    });
+    const standardBlob = Array.isArray(res) ? res[0] : res;
+    workingFile = new File(
+      [standardBlob],
+      rawFile.name.replace(/\.(heic|heif)$/i, '.jpg'),
+      { type: 'image/jpeg' }
+    );
+  }
+
+  const objectUrl = URL.createObjectURL(workingFile);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error('Không thể đọc hình ảnh'));
+      image.src = objectUrl;
+    });
+
+    const targetWidth = Math.max(1, Math.round(img.naturalWidth * scale));
+    const targetHeight = Math.max(1, Math.round(img.naturalHeight * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Không thể khởi tạo Canvas 2D');
+
+    if (targetFormat === 'image/jpeg' || targetFormat === 'image/bmp') {
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, targetWidth, targetHeight);
+    }
+
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, targetWidth, targetHeight);
+
+    let finalBlob: Blob;
+    if (targetFormat === 'image/bmp') {
+      finalBlob = canvasToBmpBlob(canvas);
+    } else if (targetFormat === 'image/x-icon') {
+      finalBlob = await canvasToIcoBlob(canvas);
+    } else {
+      const mimeQuality = targetFormat === 'image/png' ? undefined : quality / 100;
+      finalBlob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (b) => {
+            if (b) resolve(b);
+            else reject(new Error('Canvas export failed'));
+          },
+          targetFormat,
+          mimeQuality
+        );
+      });
+    }
+
+    // Free canvas memory immediately
+    canvas.width = 0;
+    canvas.height = 0;
+
+    return finalBlob;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
 export const ImageConverterTab: React.FC = () => {
+  const { isPro, openProModal } = usePro();
+
   const [file, setFile] = useState<File | null>(null);
+  const [batchQueue, setBatchQueue] = useState<BatchImageQueueItem[]>([]);
+  const [isBatchProcessing, setIsBatchProcessing] = useState<boolean>(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [targetFormat, setTargetFormat] = useState<TargetFormat>('image/webp');
   const [quality, setQuality] = useState<number>(85);
@@ -284,8 +393,78 @@ export const ImageConverterTab: React.FC = () => {
     processSelectedFile(selectedFile);
   };
 
+  const handleSelectMultipleFiles = async (incomingFiles: FileList | File[]) => {
+    const validFiles = Array.from(incomingFiles).filter(
+      (f) =>
+        f.type.startsWith('image/') ||
+        /\.(jpg|jpeg|png|webp|bmp|ico|heic|heif|gif|svg)$/i.test(f.name)
+    );
+
+    if (validFiles.length === 0) {
+      setErrorMessage('Vui lòng chọn tệp tin hình ảnh hợp lệ (JPG, PNG, WebP, HEIC, BMP, v.v.).');
+      return;
+    }
+
+    const existingCount = batchQueue.length > 0 ? batchQueue.length : file ? 1 : 0;
+
+    // PRO Gatekeeper for Batch Processing
+    if ((validFiles.length > 1 || (existingCount > 0 && validFiles.length >= 1)) && !isPro) {
+      openProModal(PRO_BATCH_MESSAGE);
+      const firstFile = file || validFiles[0];
+      setBatchQueue([]);
+      if (!file) {
+        await handleSelectFile(firstFile);
+      }
+      return;
+    }
+
+    // Single file selection when no queue exists
+    if (validFiles.length === 1 && existingCount === 0) {
+      setBatchQueue([]);
+      await handleSelectFile(validFiles[0]);
+      return;
+    }
+
+    // PRO Batch Mode (multiple files)
+    const initialItems: BatchImageQueueItem[] = [];
+    if (batchQueue.length === 0 && file) {
+      initialItems.push({
+        id: `${file.name}_${Date.now()}_init`,
+        file,
+        status: 'pending',
+      });
+    }
+
+    const appendedItems: BatchImageQueueItem[] = validFiles.map((f, idx) => ({
+      id: `${f.name}_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+      file: f,
+      status: 'pending',
+    }));
+
+    setBatchQueue((prev) => [...prev, ...initialItems, ...appendedItems]);
+
+    if (!file && validFiles[0]) {
+      await handleSelectFile(validFiles[0]);
+    }
+  };
+
+  const handleRemoveQueueItem = (id: string) => {
+    if (isBatchProcessing) return;
+    setBatchQueue((prev) => {
+      const next = prev.filter((item) => item.id !== id);
+      if (next.length === 1) {
+        handleSelectFile(next[0].file);
+        return [];
+      }
+      if (next.length === 0) {
+        handleReset();
+      }
+      return next;
+    });
+  };
+
   /**
-   * Render to canvas and convert 100% Client-side
+   * Render to canvas and convert 100% Client-side (Live Preview for primary file)
    */
   const executeConversion = useCallback(async () => {
     if (!file) return;
@@ -390,18 +569,77 @@ export const ImageConverterTab: React.FC = () => {
     const baseName = file.name.substring(0, file.name.lastIndexOf('.')) || file.name;
     const downloadFileName = `${baseName}_converted.${ext}`;
 
+    const tempUrl = URL.createObjectURL(convertedBlob);
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(convertedBlob);
+    a.href = tempUrl;
     a.download = downloadFileName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(tempUrl), 1500);
+  };
+
+  /**
+   * MEMORY-SAFE SEQUENTIAL PROCESSING (STRICT for...of LOOP) for PRO Batch Queue
+   */
+  const handleBatchConvertAndDownload = async () => {
+    if (batchQueue.length === 0 || isBatchProcessing) return;
+
+    setIsBatchProcessing(true);
+    setErrorMessage(null);
+
+    const opt = FORMAT_OPTIONS.find((f) => f.id === targetFormat);
+    const ext = opt ? opt.ext : 'webp';
+
+    for (let i = 0; i < batchQueue.length; i++) {
+      const item = batchQueue[i];
+
+      setBatchQueue((prev) =>
+        prev.map((q, idx) => (idx === i ? { ...q, status: 'processing', errorMsg: undefined } : q))
+      );
+
+      try {
+        const outputBlob = await convertSingleImageFile(item.file, targetFormat, quality, scale);
+        const baseName = item.file.name.substring(0, item.file.name.lastIndexOf('.')) || item.file.name;
+        const downloadFileName = `${baseName}_converted.${ext}`;
+
+        // Trigger download immediately as each file finishes
+        const tempUrl = URL.createObjectURL(outputBlob);
+        const a = document.createElement('a');
+        a.href = tempUrl;
+        a.download = downloadFileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+
+        // Explicitly clean up Object URL memory before moving on
+        setTimeout(() => {
+          URL.revokeObjectURL(tempUrl);
+        }, 1500);
+
+        setBatchQueue((prev) =>
+          prev.map((q, idx) =>
+            idx === i ? { ...q, status: 'done', outputSize: outputBlob.size } : q
+          )
+        );
+      } catch (err) {
+        console.error('Batch image conversion error on:', item.file.name, err);
+        const msg = err instanceof Error ? err.message : 'Lỗi chuyển đổi';
+        setBatchQueue((prev) =>
+          prev.map((q, idx) => (idx === i ? { ...q, status: 'error', errorMsg: msg } : q))
+        );
+      }
+    }
+
+    setIsBatchProcessing(false);
   };
 
   const handleReset = () => {
+    if (isBatchProcessing) return;
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     if (convertedUrl) URL.revokeObjectURL(convertedUrl);
     setFile(null);
+    setBatchQueue([]);
     setPreviewUrl(null);
     setConvertedBlob(null);
     setConvertedUrl(null);
@@ -466,9 +704,24 @@ export const ImageConverterTab: React.FC = () => {
 
   const savings = calculateSavings();
   const selectedOption = FORMAT_OPTIONS.find((f) => f.id === targetFormat) || FORMAT_OPTIONS[0];
+  const completedBatchCount = batchQueue.filter((q) => q.status === 'done').length;
 
   return (
     <div className="space-y-6">
+      {/* Hidden Multiple File Input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept="image/*,.heic,.heif"
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files && e.target.files.length > 0) {
+            handleSelectMultipleFiles(e.target.files);
+            e.target.value = '';
+          }
+        }}
+      />
 
       {/* HEIC Decoding Loading Indicator */}
       {isDecodingHeic && (
@@ -499,7 +752,7 @@ export const ImageConverterTab: React.FC = () => {
       )}
 
       {/* Upload Dropzone */}
-      {!file && (
+      {!file && batchQueue.length === 0 && (
         <div
           onDragOver={(e) => {
             e.preventDefault();
@@ -512,8 +765,8 @@ export const ImageConverterTab: React.FC = () => {
           onDrop={(e) => {
             e.preventDefault();
             setIsDraggingOver(false);
-            if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-              handleSelectFile(e.dataTransfer.files[0]);
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+              handleSelectMultipleFiles(e.dataTransfer.files);
             }
           }}
           onClick={() => fileInputRef.current?.click()}
@@ -523,19 +776,12 @@ export const ImageConverterTab: React.FC = () => {
               : 'border-slate-300 dark:border-slate-800 hover:border-pink-500/40 bg-white dark:bg-slate-900/40 hover:bg-slate-50 dark:hover:bg-slate-900/70'
           }`}
         >
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*,.heic,.heif"
-            className="hidden"
-            onChange={(e) => e.target.files?.[0] && handleSelectFile(e.target.files[0])}
-          />
           <div className="w-16 h-16 rounded-xl bg-pink-500/10 border border-pink-500/20 flex items-center justify-center text-pink-500">
             <UploadCloud className="w-8 h-8" />
           </div>
           <div className="space-y-1">
             <p className="text-base font-bold text-slate-900 dark:text-slate-100">
-              Kéo thả hình ảnh vào đây hoặc click để chọn file
+              Kéo thả hình ảnh vào đây hoặc click để chọn file (Hỗ trợ chọn nhiều ảnh)
             </p>
             <p className="text-sm text-slate-600 dark:text-slate-400 max-w-xl mx-auto leading-relaxed">
               Hỗ trợ JPG, PNG, WebP, Apple HEIC/HEIF, BMP, ICO • Xử lý 100% trong trình duyệt (HTML5 Canvas)
@@ -548,10 +794,143 @@ export const ImageConverterTab: React.FC = () => {
             <span className="text-xs font-semibold px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
               Tạo Favicon ICO & Windows BMP
             </span>
-            <span className="text-xs font-semibold px-2.5 py-1 rounded-md bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border border-slate-200 dark:border-slate-700">
-              Bảo mật 100% In-Browser
+            <span className="text-xs font-semibold px-2.5 py-1 rounded-md bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20 inline-flex items-center gap-1">
+              <Crown className="w-3 h-3" />
+              PRO: Chuyển đổi hàng loạt (Batch Queue)
             </span>
           </div>
+        </div>
+      )}
+
+      {/* PRO Batch Queue Panel (when multiple images are queued) */}
+      {batchQueue.length > 1 && (
+        <div className="p-5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3 pb-3 border-b border-slate-100 dark:border-slate-800">
+            <div className="flex items-center gap-2">
+              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                Hàng đợi chuyển đổi ảnh ({batchQueue.length} ảnh)
+              </h3>
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-500/20">
+                <Crown className="w-3 h-3" />
+                PRO Batch ({completedBatchCount}/{batchQueue.length})
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isBatchProcessing}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors cursor-pointer"
+              >
+                <Plus className="w-3.5 h-3.5 text-pink-500" />
+                <span>Thêm ảnh</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleReset}
+                disabled={isBatchProcessing}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30 disabled:opacity-50 transition-colors cursor-pointer"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Xóa tất cả</span>
+              </button>
+            </div>
+          </div>
+
+          <div className="space-y-2 max-h-60 overflow-y-auto pr-1">
+            {batchQueue.map((item, idx) => (
+              <div
+                key={item.id}
+                className={`p-3 rounded-xl border flex items-center justify-between gap-3 transition-colors ${
+                  item.status === 'processing'
+                    ? 'bg-pink-500/5 border-pink-500/40'
+                    : item.status === 'done'
+                    ? 'bg-emerald-500/5 border-emerald-500/20'
+                    : item.status === 'error'
+                    ? 'bg-red-500/5 border-red-500/20'
+                    : 'bg-slate-50 dark:bg-slate-950/60 border-slate-200 dark:border-slate-800'
+                }`}
+              >
+                <div className="flex items-center gap-3 overflow-hidden min-w-0">
+                  <div className="w-8 h-8 rounded-lg bg-pink-500/10 border border-pink-500/20 flex items-center justify-center text-pink-500 shrink-0">
+                    <ImageIcon className="w-4 h-4" />
+                  </div>
+                  <div className="overflow-hidden min-w-0">
+                    <p className="text-xs font-semibold text-slate-900 dark:text-slate-200 truncate">
+                      {idx + 1}. {item.file.name}
+                    </p>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      Gốc: {formatBytes(item.file.size)}
+                      {item.outputSize ? ` → Mới: ${formatBytes(item.outputSize)}` : ''}
+                      {item.errorMsg ? ` • ${item.errorMsg}` : ''}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 shrink-0">
+                  {item.status === 'pending' && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-200/70 dark:bg-slate-800 text-slate-600 dark:text-slate-400">
+                      <Clock className="w-3 h-3" />
+                      Chờ xử lý
+                    </span>
+                  )}
+                  {item.status === 'processing' && (
+                    <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold bg-pink-500/10 text-pink-600 dark:text-pink-400 border border-pink-500/20">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      Đang xử lý...
+                    </span>
+                  )}
+                  {item.status === 'done' && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
+                      <CheckCircle2 className="w-3 h-3" />
+                      Đã tải về
+                    </span>
+                  )}
+                  {item.status === 'error' && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-bold bg-red-500/10 text-red-600 dark:text-red-400 border border-red-500/20">
+                      <AlertCircle className="w-3 h-3" />
+                      Lỗi
+                    </span>
+                  )}
+
+                  {!isBatchProcessing && (
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveQueueItem(item.id)}
+                      className="p-1.5 rounded-lg text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors cursor-pointer"
+                      title="Xóa khỏi hàng đợi"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <button
+            type="button"
+            onClick={handleBatchConvertAndDownload}
+            disabled={isBatchProcessing}
+            className="w-full py-3.5 px-6 rounded-xl bg-pink-500 hover:bg-pink-600 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer"
+          >
+            {isBatchProcessing ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>
+                  Đang chuyển đổi tuần tự & tải về ({completedBatchCount}/{batchQueue.length})...
+                </span>
+              </>
+            ) : (
+              <>
+                <Download className="w-4 h-4" />
+                <span>
+                  Chuyển Đổi Hàng Loạt & Tải Về ({batchQueue.length} ảnh sang {selectedOption.ext.toUpperCase()})
+                </span>
+              </>
+            )}
+          </button>
         </div>
       )}
 
@@ -576,14 +955,27 @@ export const ImageConverterTab: React.FC = () => {
                 </div>
               </div>
 
-              <button
-                type="button"
-                onClick={handleReset}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors self-start sm:self-auto cursor-pointer"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                <span>Chọn ảnh khác</span>
-              </button>
+              <div className="flex items-center gap-2 self-start sm:self-auto">
+                {batchQueue.length === 0 && (
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-pink-500" />
+                    <span>Thêm ảnh (PRO Batch)</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  onClick={handleReset}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Chọn ảnh khác</span>
+                </button>
+              </div>
             </div>
 
             {/* Custom Dropdown for Target Format */}
@@ -815,18 +1207,44 @@ export const ImageConverterTab: React.FC = () => {
 
             {/* Instant Action Download */}
             <div className="pt-2">
-              <button
-                type="button"
-                onClick={handleDownload}
-                disabled={!convertedBlob || isConverting}
-                className="w-full py-3.5 px-6 rounded-xl bg-pink-500 hover:bg-pink-600 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer"
-              >
-                <Download className="w-4 h-4" />
-                <span>
-                  Tải Về File {selectedOption.ext.toUpperCase()} (
-                  {convertedBlob ? formatBytes(convertedBlob.size) : '...'})
-                </span>
-              </button>
+              {batchQueue.length > 1 ? (
+                <button
+                  type="button"
+                  onClick={handleBatchConvertAndDownload}
+                  disabled={isBatchProcessing}
+                  className="w-full py-3.5 px-6 rounded-xl bg-pink-500 hover:bg-pink-600 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer"
+                >
+                  {isBatchProcessing ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>
+                        Đang chuyển đổi tuần tự & tải về ({completedBatchCount}/{batchQueue.length})...
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <Download className="w-4 h-4" />
+                      <span>
+                        Chuyển Đổi Hàng Loạt & Tải Về ({batchQueue.length} ảnh sang{' '}
+                        {selectedOption.ext.toUpperCase()})
+                      </span>
+                    </>
+                  )}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleDownload}
+                  disabled={!convertedBlob || isConverting}
+                  className="w-full py-3.5 px-6 rounded-xl bg-pink-500 hover:bg-pink-600 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 transition-all cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>
+                    Tải Về File {selectedOption.ext.toUpperCase()} (
+                    {convertedBlob ? formatBytes(convertedBlob.size) : '...'})
+                  </span>
+                </button>
+              )}
             </div>
           </div>
         </div>
