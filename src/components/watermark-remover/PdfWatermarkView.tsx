@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   FileText,
   CheckCircle2,
@@ -8,56 +8,98 @@ import {
   Download,
   AlertCircle,
   FileCheck,
-  ShieldAlert,
-  X,
+  Sparkles,
+  ScanEye,
+  Sliders,
+  Wand2,
 } from 'lucide-react';
 import { cleanPdfWatermarks } from '../../utils/pdfWatermarkCleaner';
-import type { PdfStripSuccess, PdfStripFailure } from '../../types/watermarkRemover';
+import {
+  renderPdfPagesForRasterClean,
+  applySmartWatermarkLumaFilter,
+  buildWatermarkMaskFromPage,
+  imageDataToDataUrl,
+  packRasterPagesToPdf,
+} from '../../utils/pdfRasterCleaner';
+import { useWatermarkRemover } from '../../hooks/useWatermarkRemover';
+import type {
+  PdfStripSuccess,
+  PdfRasterPageItem,
+} from '../../types/watermarkRemover';
 
 interface PdfWatermarkViewProps {
   isCompact?: boolean;
 }
 
-export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = false }) => {
+export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({
+  isCompact = false,
+}) => {
   const [pdfFile, setPdfFile] = useState<File | null>(null);
+  const [pdfBuffer, setPdfBuffer] = useState<ArrayBuffer | null>(null);
   const [customKeywords, setCustomKeywords] = useState<string[]>([
     'CamScanner',
     'Scanned with CamScanner',
     'CONFIDENTIAL',
     'SAMPLE',
     'DRAFT',
+    'DO NOT COPY',
   ]);
   const [newKeyword, setNewKeyword] = useState<string>('');
   const [stripAnnots, setStripAnnots] = useState<boolean>(true);
   const [stripPieceInfo, setStripPieceInfo] = useState<boolean>(true);
   const [stripOverlayForms, setStripOverlayForms] = useState<boolean>(true);
+  const [autoDetectDiagonal, setAutoDetectDiagonal] = useState<boolean>(true);
 
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [result, setResult] = useState<PdfStripSuccess | null>(null);
-  const [unsupportedModal, setUnsupportedModal] = useState<PdfStripFailure | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Close modal on Escape key
-  useEffect(() => {
-    if (!unsupportedModal) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setUnsupportedModal(null);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [unsupportedModal]);
+  // Tier 3: Visual Raster & AI Clean states
+  const [rasterPages, setRasterPages] = useState<PdfRasterPageItem[]>([]);
+  const [isRasterizing, setIsRasterizing] = useState<boolean>(false);
+  const [isPackingPdf, setIsPackingPdf] = useState<boolean>(false);
+  const [rasterProgress, setRasterProgress] = useState<number>(0);
+  const [lumaThreshold, setLumaThreshold] = useState<number>(195);
+  const [inpaintingPageNumber, setInpaintingPageNumber] = useState<number | null>(
+    null
+  );
+
+  const { runInpaint, aiModelProgress } = useWatermarkRemover();
+
+  const resetAllStates = () => {
+    setPdfFile(null);
+    setPdfBuffer(null);
+    setResult(null);
+    setErrorMsg(null);
+    setRasterPages([]);
+    setIsRasterizing(false);
+    setIsPackingPdf(false);
+    setRasterProgress(0);
+    setInpaintingPageNumber(null);
+  };
+
+  const loadSelectedPdfFile = async (file: File) => {
+    setPdfFile(file);
+    setResult(null);
+    setErrorMsg(null);
+    setRasterPages([]);
+    try {
+      const buf = await file.arrayBuffer();
+      setPdfBuffer(buf);
+    } catch {
+      setErrorMsg('Không thể đọc dữ liệu từ file PDF đã chọn.');
+    }
+  };
 
   const handleFileDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
       const file = e.dataTransfer.files[0];
-      if (file.name.toLowerCase().endsWith('.pdf') || file.type === 'application/pdf') {
-        setPdfFile(file);
-        setResult(null);
-        setUnsupportedModal(null);
-        setErrorMsg(null);
+      if (
+        file.name.toLowerCase().endsWith('.pdf') ||
+        file.type === 'application/pdf'
+      ) {
+        void loadSelectedPdfFile(file);
       }
     }
   };
@@ -79,21 +121,24 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
     setIsProcessing(true);
     setErrorMsg(null);
     setResult(null);
-    setUnsupportedModal(null);
+    setRasterPages([]);
 
     try {
-      const arrayBuffer = await pdfFile.arrayBuffer();
-      const res = await cleanPdfWatermarks(arrayBuffer, {
+      const arrayBuffer = pdfBuffer ?? (await pdfFile.arrayBuffer());
+      if (!pdfBuffer) {
+        setPdfBuffer(arrayBuffer);
+      }
+
+      const res = await cleanPdfWatermarks(arrayBuffer.slice(0), {
         customKeywords,
         stripAnnotations: stripAnnots,
         stripPieceInfo,
         stripOverlayForms,
+        autoDetectDiagonal,
       });
 
       if (res.success) {
         setResult(res);
-      } else if (res.reason === 'SUBSET_FONT_UNSUPPORTED') {
-        setUnsupportedModal(res);
       } else {
         setErrorMsg(res.message);
       }
@@ -106,6 +151,124 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
       );
     } finally {
       setIsProcessing(false);
+    }
+  };
+
+  const handleStartRasterClean = async () => {
+    if (!pdfFile) return;
+    setIsRasterizing(true);
+    setErrorMsg(null);
+    setRasterProgress(0);
+
+    try {
+      const sourceBuffer = pdfBuffer ?? (await pdfFile.arrayBuffer());
+      if (!pdfBuffer) {
+        setPdfBuffer(sourceBuffer);
+      }
+
+      const pages = await renderPdfPagesForRasterClean(
+        sourceBuffer,
+        2.0,
+        lumaThreshold,
+        (pct) => setRasterProgress(pct)
+      );
+      setRasterPages(pages);
+    } catch (err) {
+      console.error('[PDF Raster Clean Error]:', err);
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : 'Không thể kết xuất trang PDF sang chế độ Quét Sâu Thị Giác.'
+      );
+    } finally {
+      setIsRasterizing(false);
+    }
+  };
+
+  const handleThresholdChange = (newThreshold: number) => {
+    setLumaThreshold(newThreshold);
+    if (rasterPages.length === 0) return;
+
+    const updated = rasterPages.map((p) => {
+      const refiltered = applySmartWatermarkLumaFilter(
+        p.originalImageData,
+        newThreshold
+      );
+      return {
+        ...p,
+        cleanedImageData: refiltered,
+        previewUrl: imageDataToDataUrl(refiltered, 'image/jpeg', 0.92),
+        aiInpainted: false,
+      };
+    });
+    setRasterPages(updated);
+  };
+
+  const handleAiInpaintPage = async (pageItem: PdfRasterPageItem) => {
+    setInpaintingPageNumber(pageItem.pageNumber);
+    setErrorMsg(null);
+    try {
+      const autoMask = buildWatermarkMaskFromPage(
+        pageItem.originalImageData,
+        lumaThreshold
+      );
+      const inpainted = await runInpaint(pageItem.cleanedImageData, autoMask);
+      const previewUrl = imageDataToDataUrl(inpainted, 'image/jpeg', 0.92);
+
+      setRasterPages((prev) =>
+        prev.map((p) =>
+          p.pageNumber === pageItem.pageNumber
+            ? {
+                ...p,
+                cleanedImageData: inpainted,
+                previewUrl,
+                aiInpainted: true,
+              }
+            : p
+        )
+      );
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : `Không thể chạy AI Inpaint trên trang ${pageItem.pageNumber}.`
+      );
+    } finally {
+      setInpaintingPageNumber(null);
+    }
+  };
+
+  const handleDownloadRasterPdf = async () => {
+    if (rasterPages.length === 0 || !pdfFile) return;
+    setIsPackingPdf(true);
+    setRasterProgress(0);
+
+    try {
+      const pdfBytes = await packRasterPagesToPdf(rasterPages, (pct) =>
+        setRasterProgress(pct)
+      );
+      const blob = new Blob([pdfBytes as unknown as BlobPart], {
+        type: 'application/pdf',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const nameWithoutExt = pdfFile.name.replace(/\.[^/.]+$/, '');
+      a.href = url;
+      a.download = `${nameWithoutExt}_visual_cleaned.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      resetAllStates();
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : 'Không thể đóng gói các trang đã làm sạch thành file PDF.'
+      );
+    } finally {
+      setIsPackingPdf(false);
     }
   };
 
@@ -124,10 +287,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
 
-    // Reset state after download so dropzone is ready for the next PDF
-    setPdfFile(null);
-    setResult(null);
-    setErrorMsg(null);
+    resetAllStates();
   };
 
   const formatFileSize = (bytes: number): string => {
@@ -138,86 +298,6 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
 
   return (
     <div className={`space-y-6 ${isCompact ? 'p-1' : ''}`}>
-      {/* Defensive Guardrail Modal for SUBSET_FONT_UNSUPPORTED */}
-      {unsupportedModal && (
-        <div
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="subset-font-modal-title"
-          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-xs"
-        >
-          <div className="w-full max-w-lg rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl p-6 space-y-4">
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-500 shrink-0">
-                  <ShieldAlert className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3
-                    id="subset-font-modal-title"
-                    className="text-sm sm:text-base font-bold text-slate-900 dark:text-white"
-                  >
-                    Không thể gỡ Watermark Vector trên Font Subset
-                  </h3>
-                  <p className="text-xs text-amber-600 dark:text-amber-400 font-mono">
-                    Mã bảo vệ: SUBSET_FONT_UNSUPPORTED
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setUnsupportedModal(null)}
-                aria-label="Đóng hộp thoại"
-                className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
-              {unsupportedModal.message}
-            </p>
-
-            {unsupportedModal.details.length > 0 && (
-              <div className="rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 p-3 max-h-40 overflow-y-auto space-y-1.5">
-                <p className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 uppercase tracking-wider">
-                  Font Subset / CID phát hiện trong tài liệu:
-                </p>
-                {unsupportedModal.details.slice(0, 8).map((item, idx) => (
-                  <div
-                    key={`${item.pageIndex}-${item.fontName}-${idx}`}
-                    className="flex items-center justify-between text-xs font-mono text-slate-700 dark:text-slate-300"
-                  >
-                    <span className="truncate">
-                      Trang {item.pageIndex}: {item.fontName}
-                    </span>
-                    <span className="text-[11px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 shrink-0 ml-2">
-                      {item.fontKind}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            <div className="p-3 rounded-xl bg-pink-500/10 border border-pink-500/20 text-xs text-slate-700 dark:text-slate-300">
-              <strong className="text-pink-600 dark:text-pink-400">Giải pháp an toàn:</strong> Để giữ
-              nguyên vẹn 100% bố cục mà không làm lỗi font chữ, hãy xuất trang PDF sang định dạng ảnh
-              (PNG/JPG) rồi sử dụng tab <strong>Xóa Watermark Ảnh (ONNX AI)</strong>.
-            </div>
-
-            <div className="flex justify-end pt-1">
-              <button
-                type="button"
-                onClick={() => setUnsupportedModal(null)}
-                className="px-5 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 dark:bg-white dark:hover:bg-slate-200 text-white dark:text-slate-900 text-xs font-bold transition-colors cursor-pointer"
-              >
-                Đã hiểu
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* File Upload Dropzone */}
       {!pdfFile ? (
         <div
@@ -231,10 +311,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
             input.onchange = (e) => {
               const file = (e.target as HTMLInputElement).files?.[0];
               if (file) {
-                setPdfFile(file);
-                setResult(null);
-                setUnsupportedModal(null);
-                setErrorMsg(null);
+                void loadSelectedPdfFile(file);
               }
             };
             input.click();
@@ -247,8 +324,8 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
             Kéo thả tài liệu PDF vào đây
           </h3>
           <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mb-4 max-w-md mx-auto">
-            Hỗ trợ gỡ bỏ Annotations (/Watermark, /Stamp), khối Marked-Content Artifact của MS Word và
-            lọc an toàn toán tử văn bản kèm cơ chế bảo vệ cấu trúc Font Subset.
+            Hệ thống 3 Tầng Universal: Giải mã bảng mã Font Subset (ToUnicode CMap), gỡ khối chữ
+            chìm xoay chéo (BT...ET) và Quét Sâu Thị Giác kết hợp AI ONNX ngay trong trình duyệt.
           </p>
           <button
             type="button"
@@ -278,12 +355,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
 
             <button
               type="button"
-              onClick={() => {
-                setPdfFile(null);
-                setResult(null);
-                setUnsupportedModal(null);
-                setErrorMsg(null);
-              }}
+              onClick={resetAllStates}
               className="px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-800 hover:bg-slate-100 dark:hover:bg-slate-800 text-slate-500 text-xs font-medium transition-colors cursor-pointer"
             >
               Đổi file khác
@@ -292,12 +364,29 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
 
           {/* Options & Keywords Configuration */}
           <div className="p-6 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm space-y-5">
-            <h4 className="text-sm font-bold text-slate-900 dark:text-white">
-              Cấu hình bộ lọc Watermark PDF An Toàn
-            </h4>
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <h4 className="text-sm font-bold text-slate-900 dark:text-white">
+                Tầng 1 & 2: Giải Mã CMap Font Subset & Gỡ Khối Stream (BT...ET)
+              </h4>
+              <span className="text-[11px] px-2.5 py-1 rounded-full bg-pink-500/10 text-pink-600 dark:text-pink-400 font-semibold">
+                Giữ nguyên 100% Vector & Font gốc
+              </span>
+            </div>
 
             {/* Checkbox Options */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <label className="flex items-center gap-2.5 p-3 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={autoDetectDiagonal}
+                  onChange={(e) => setAutoDetectDiagonal(e.target.checked)}
+                  className="rounded text-pink-500 focus:ring-pink-500"
+                />
+                <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
+                  Tự động nhận diện chữ chìm xoay chéo (Ma trận Tm/cm + Độ mờ)
+                </span>
+              </label>
+
               <label className="flex items-center gap-2.5 p-3 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 cursor-pointer">
                 <input
                   type="checkbox"
@@ -306,7 +395,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
                   className="rounded text-pink-500 focus:ring-pink-500"
                 />
                 <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
-                  Xóa Annotations (/Watermark, /Stamp)
+                  Xóa Annotations (/Watermark, /Stamp, /FreeText)
                 </span>
               </label>
 
@@ -318,7 +407,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
                   className="rounded text-pink-500 focus:ring-pink-500"
                 />
                 <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
-                  Xóa PieceInfo Metadata
+                  Xóa PieceInfo & Metadata ẩn
                 </span>
               </label>
 
@@ -330,7 +419,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
                   className="rounded text-pink-500 focus:ring-pink-500"
                 />
                 <span className="text-xs font-medium text-slate-700 dark:text-slate-300">
-                  Xóa Form XObject Overlay
+                  Quét đệ quy trong Form XObject Overlay
                 </span>
               </label>
             </div>
@@ -338,7 +427,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
             {/* Watermark Keywords Tag Input */}
             <div className="space-y-2">
               <label className="text-xs font-semibold text-slate-700 dark:text-slate-300">
-                Từ khóa cần bóc tách khỏi luồng văn bản (Content Stream):
+                Từ khóa cần giải mã ToUnicode CMap & bóc tách khỏi luồng văn bản:
               </label>
               <div className="flex gap-2">
                 <input
@@ -351,7 +440,7 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
                       handleAddKeyword();
                     }
                   }}
-                  placeholder="Nhập từ khóa (vd: CamScanner, CONFIDENTIAL, DRAFT...)"
+                  placeholder="Nhập từ khóa trên tài liệu (vd: CONFIDENTIAL, BẢN NHÁP, TÀI LIỆU MẬT...)"
                   className="flex-1 px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 text-xs text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:border-pink-500"
                 />
                 <button
@@ -384,23 +473,42 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
               </div>
             </div>
 
-            {/* Execute Button */}
-            <div className="pt-2">
+            {/* Action Buttons: Tier 1/2 Stream Clean & Tier 3 Deep Visual Scan */}
+            <div className="pt-2 flex flex-wrap items-center gap-3">
               <button
                 type="button"
                 onClick={handleExecuteClean}
-                disabled={isProcessing}
+                disabled={isProcessing || isRasterizing}
                 className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-pink-500 hover:bg-pink-600 text-white text-xs sm:text-sm font-bold shadow-md shadow-pink-500/20 transition-all active:scale-95 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
               >
                 {isProcessing ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Đang kiểm tra Font & làm sạch PDF...</span>
+                    <span>Đang giải mã CMap & bóc tách khối BT...ET...</span>
                   </>
                 ) : (
                   <>
                     <FileCheck className="w-4 h-4" />
-                    <span>Bắt đầu làm sạch PDF</span>
+                    <span>Bắt đầu làm sạch PDF (Chuẩn Vector)</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleStartRasterClean}
+                disabled={isProcessing || isRasterizing}
+                className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 text-xs sm:text-sm font-semibold transition-all active:scale-95 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              >
+                {isRasterizing ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin text-pink-500" />
+                    <span>Đang quét thị giác ({rasterProgress}%)...</span>
+                  </>
+                ) : (
+                  <>
+                    <ScanEye className="w-4 h-4 text-pink-500" />
+                    <span>Chế độ Quét Sâu Thị Giác (Auto Raster & AI)</span>
                   </>
                 )}
               </button>
@@ -415,13 +523,17 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
             </div>
           )}
 
-          {/* Success Result Card */}
+          {/* Tier 1 & 2 Result Card */}
           {result && (
             <div className="p-6 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 space-y-4">
               <div className="flex items-center justify-between flex-wrap gap-3">
                 <div className="flex items-center gap-2 text-emerald-700 dark:text-emerald-400 font-bold text-sm">
                   <CheckCircle2 className="w-5 h-5" />
-                  <span>Đã làm sạch file PDF an toàn!</span>
+                  <span>
+                    {result.totalRemovedCount > 0
+                      ? `Đã bóc tách thành công ${result.totalRemovedCount} khối Watermark Vector!`
+                      : 'Hoàn tất quét luồng Vector — Không phát hiện khối chữ trùng khớp'}
+                  </span>
                 </div>
                 <button
                   type="button"
@@ -441,23 +553,160 @@ export const PdfWatermarkView: React.FC<PdfWatermarkViewProps> = ({ isCompact = 
                   </span>
                 </div>
                 <div className="p-3 rounded-xl bg-white/60 dark:bg-slate-900/60 border border-emerald-500/20">
-                  <span className="text-slate-500 block">Annotations đã gỡ:</span>
-                  <span className="font-semibold text-slate-800 dark:text-slate-200">
-                    {result.strippedAnnotsCount} mục
-                  </span>
-                </div>
-                <div className="p-3 rounded-xl bg-white/60 dark:bg-slate-900/60 border border-emerald-500/20">
-                  <span className="text-slate-500 block">Artifact / Text Ops gỡ:</span>
+                  <span className="text-slate-500 block">Khối từ khóa & Artifact:</span>
                   <span className="font-semibold text-slate-800 dark:text-slate-200">
                     {result.strippedArtifactBlocks + result.strippedTextOps} khối
                   </span>
                 </div>
                 <div className="p-3 rounded-xl bg-white/60 dark:bg-slate-900/60 border border-emerald-500/20">
-                  <span className="text-slate-500 block">Form XObjects gỡ bỏ:</span>
+                  <span className="text-slate-500 block">Khối chữ xoay chéo (Tm/cm):</span>
                   <span className="font-semibold text-slate-800 dark:text-slate-200">
-                    {result.strippedXObjectsCount} đối tượng
+                    {result.strippedDiagonalBlocks} khối
                   </span>
                 </div>
+                <div className="p-3 rounded-xl bg-white/60 dark:bg-slate-900/60 border border-emerald-500/20">
+                  <span className="text-slate-500 block">Annotations & XObjects:</span>
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                    {result.strippedAnnotsCount + result.strippedXObjectsCount} mục
+                  </span>
+                </div>
+              </div>
+
+              {/* Automatic Tier 3 Prompt when 0 vector blocks were matched */}
+              {result.totalRemovedCount === 0 && rasterPages.length === 0 && (
+                <div className="p-4 rounded-xl bg-amber-500/15 border border-amber-500/30 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                  <div className="space-y-1 text-xs text-slate-700 dark:text-slate-200">
+                    <p className="font-bold text-amber-700 dark:text-amber-300 flex items-center gap-1.5">
+                      <Sparkles className="w-4 h-4" />
+                      Watermark dạng Đường Cong Vector (Outlines) hoặc Ảnh Scan?
+                    </p>
+                    <p className="text-slate-600 dark:text-slate-300">
+                      Một số PDF chuyển chữ chìm thành hình vẽ (curves) hoặc ảnh nền. Hãy bật{' '}
+                      <strong>Quét Sâu Thị Giác (Tier 3)</strong> để tự động lọc sạch màu chữ chìm và
+                      đóng gói lại thành PDF ngay tại đây.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleStartRasterClean}
+                    disabled={isRasterizing}
+                    className="px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-600 text-white text-xs font-bold shrink-0 shadow-sm cursor-pointer transition-colors"
+                  >
+                    Chạy Quét Sâu Thị Giác ngay
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Tier 3: Visual Raster & AI Clean Workspace */}
+          {rasterPages.length > 0 && (
+            <div className="p-6 rounded-2xl bg-white dark:bg-slate-900 border border-pink-500/30 shadow-sm space-y-5">
+              <div className="flex items-center justify-between flex-wrap gap-3">
+                <div>
+                  <h4 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                    <ScanEye className="w-4 h-4 text-pink-500" />
+                    <span>
+                      Tầng 3: Kết quả Quét Sâu Thị Giác ({rasterPages.length} trang PDF)
+                    </span>
+                  </h4>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Đã tự động lọc chữ chìm xám/mờ trên từng trang. Bạn có thể tinh chỉnh độ nhạy
+                    hoặc bấm AI Inpaint cho từng trang trước khi tải PDF.
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleDownloadRasterPdf}
+                  disabled={isPackingPdf}
+                  className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-pink-500 hover:bg-pink-600 text-white text-xs sm:text-sm font-bold shadow-md shadow-pink-500/20 transition-all active:scale-95 cursor-pointer disabled:opacity-50"
+                >
+                  {isPackingPdf ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Đang đóng gói PDF ({rasterProgress}%)...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Download className="w-4 h-4" />
+                      <span>Tải PDF Đã Quét Sâu ({rasterPages.length} trang)</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {/* Smart Luma Threshold Slider */}
+              <div className="p-4 rounded-xl bg-slate-50 dark:bg-slate-950 border border-slate-200 dark:border-slate-800 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-2 text-xs font-semibold text-slate-700 dark:text-slate-300">
+                  <Sliders className="w-4 h-4 text-pink-500" />
+                  <span>Ngưỡng lọc độ sáng chữ chìm (Smart Luma Filter): {lumaThreshold}</span>
+                </div>
+                <div className="flex items-center gap-3 w-full sm:w-72">
+                  <span className="text-[11px] text-slate-400">Mạnh (160)</span>
+                  <input
+                    type="range"
+                    min={160}
+                    max={235}
+                    value={lumaThreshold}
+                    onChange={(e) => handleThresholdChange(Number(e.target.value))}
+                    className="flex-1 accent-pink-500 cursor-pointer"
+                  />
+                  <span className="text-[11px] text-slate-400">Nhẹ (235)</span>
+                </div>
+              </div>
+
+              {/* Page Grid Previews */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 max-h-[540px] overflow-y-auto pr-1">
+                {rasterPages.map((pageItem) => {
+                  const isPageInpainting = inpaintingPageNumber === pageItem.pageNumber;
+                  return (
+                    <div
+                      key={pageItem.pageNumber}
+                      className="rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3 space-y-2.5 flex flex-col"
+                    >
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-bold text-slate-700 dark:text-slate-200">
+                          Trang {pageItem.pageNumber}
+                        </span>
+                        {pageItem.aiInpainted && (
+                          <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 text-[10px] font-semibold">
+                            Đã xử lý ONNX AI
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="relative rounded-lg overflow-hidden border border-slate-200 dark:border-slate-800 bg-white aspect-[1/1.35] flex items-center justify-center">
+                        <img
+                          src={pageItem.previewUrl}
+                          alt={`Trang PDF ${pageItem.pageNumber}`}
+                          className="max-w-full max-h-full object-contain"
+                        />
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() => void handleAiInpaintPage(pageItem)}
+                        disabled={isPageInpainting || inpaintingPageNumber !== null}
+                        className="w-full py-1.5 px-3 rounded-lg bg-slate-200/80 hover:bg-pink-500 hover:text-white dark:bg-slate-800 dark:hover:bg-pink-500 text-slate-700 dark:text-slate-200 text-xs font-semibold transition-colors flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                      >
+                        {isPageInpainting ? (
+                          <>
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            <span>
+                              AI ONNX ({aiModelProgress > 0 ? `${aiModelProgress}%` : '...'})
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <Wand2 className="w-3.5 h-3.5" />
+                            <span>Khử sâu bằng AI ONNX</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

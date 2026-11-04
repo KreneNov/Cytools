@@ -90,7 +90,7 @@ export type InpaintWorkerResponse =
     };
 
 /* ------------------------------------------------------------------ */
-/* PDF                                                                 */
+/* PDF (3-Tier Universal Pipeline)                                     */
 /* ------------------------------------------------------------------ */
 
 export interface PdfCleanOptions {
@@ -98,12 +98,7 @@ export interface PdfCleanOptions {
   stripAnnotations?: boolean;
   stripPieceInfo?: boolean;
   stripOverlayForms?: boolean;
-}
-
-export interface PdfUnsupportedDetail {
-  pageIndex: number;
-  fontName: string;
-  fontKind: string;
+  autoDetectDiagonal?: boolean;
 }
 
 export interface PdfStripSuccess {
@@ -114,17 +109,30 @@ export interface PdfStripSuccess {
   strippedAnnotsCount: number;
   strippedArtifactBlocks: number;
   strippedTextOps: number;
+  strippedDiagonalBlocks: number;
   strippedXObjectsCount: number;
+  totalRemovedCount: number;
 }
 
 export interface PdfStripFailure {
   success: false;
-  reason: 'SUBSET_FONT_UNSUPPORTED' | 'ENCRYPTED' | 'PARSE_FAILED';
+  reason: 'ENCRYPTED' | 'PARSE_FAILED';
   message: string;
-  details: PdfUnsupportedDetail[];
 }
 
 export type PdfStripResult = PdfStripSuccess | PdfStripFailure;
+
+export interface PdfRasterPageItem {
+  pageNumber: number;
+  width: number;
+  height: number;
+  pdfWidthPts: number;
+  pdfHeightPts: number;
+  originalImageData: ImageData;
+  cleanedImageData: ImageData;
+  previewUrl: string;
+  aiInpainted: boolean;
+}
 
 /* ------------------------------------------------------------------ */
 /* PPTX                                                                */
