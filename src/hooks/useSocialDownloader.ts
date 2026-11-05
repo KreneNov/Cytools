@@ -107,8 +107,8 @@ interface YouTubeResolveResponse {
   error?: string;
 }
 
-const YT_PROGRESS_MAX_POLLS = 20;
-const YT_PROGRESS_INTERVAL_MS = 1500;
+const YT_PROGRESS_MAX_POLLS = 30;
+const YT_PROGRESS_INTERVAL_MS = 1200;
 
 function isHttpUrl(value: unknown): value is string {
   return typeof value === 'string' && value.startsWith('http');

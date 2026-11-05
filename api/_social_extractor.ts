@@ -1157,34 +1157,44 @@ export async function resolveInnertubeStreams(videoId: string): Promise<{
   }
 
   // Strategy 2: Try @distube/ytdl-core (visionos, tv, web_embedded, mweb clients)
-  try {
-    const { Ytdl } = await import('@distube/ytdl-core');
-    const ytdl = new Ytdl();
-    const info = await ytdl.getInfo(videoId);
-    if (info && Array.isArray(info.formats) && info.formats.length > 0) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const preMuxed = info.formats.find((f: any) => f.url && f.hasVideo && f.hasAudio) ||
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        info.formats.find((f: any) => f.url && f.hasVideo && (f.qualityLabel?.includes('720') || f.itag === 22 || f.itag === 18)) ||
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        info.formats.find((f: any) => f.url && f.hasVideo);
+  // Disable on Vercel/Datacenter unless explicit YouTube cookies or PoToken are provided
+  const hasYtAuth = Boolean(process.env.YOUTUBE_COOKIE || process.env.YT_POTOKEN);
+  const isServerlessDatacenter = Boolean(
+    process.env.VERCEL ||
+    process.env.AWS_LAMBDA_FUNCTION_NAME ||
+    process.env.NODE_ENV === 'production'
+  );
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const audio = info.formats.find((f: any) => f.url && f.hasAudio && (f.itag === 140 || f.mimeType?.includes('audio/mp4'))) ||
+  if (hasYtAuth || !isServerlessDatacenter) {
+    try {
+      const { Ytdl } = await import('@distube/ytdl-core');
+      const ytdl = new Ytdl();
+      const info = await ytdl.getInfo(videoId);
+      if (info && Array.isArray(info.formats) && info.formats.length > 0) {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        info.formats.find((f: any) => f.url && f.hasAudio);
+        const preMuxed = info.formats.find((f: any) => f.url && f.hasVideo && f.hasAudio) ||
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          info.formats.find((f: any) => f.url && f.hasVideo && (f.qualityLabel?.includes('720') || f.itag === 22 || f.itag === 18)) ||
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          info.formats.find((f: any) => f.url && f.hasVideo);
 
-      if (preMuxed?.url || audio?.url) {
-        return {
-          preMuxedUrl: preMuxed?.url || null,
-          audioUrl: audio?.url || null,
-          resolvedBy: 'ytdl_multi_client',
-          debugReason: 'OK',
-        };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const audio = info.formats.find((f: any) => f.url && f.hasAudio && (f.itag === 140 || f.mimeType?.includes('audio/mp4'))) ||
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          info.formats.find((f: any) => f.url && f.hasAudio);
+
+        if (preMuxed?.url || audio?.url) {
+          return {
+            preMuxedUrl: preMuxed?.url || null,
+            audioUrl: audio?.url || null,
+            resolvedBy: 'ytdl_multi_client',
+            debugReason: 'OK',
+          };
+        }
       }
+    } catch (ytdlErr) {
+      console.warn('[Ytdl Stream Resolution Warning]:', ytdlErr instanceof Error ? ytdlErr.message : ytdlErr);
     }
-  } catch (ytdlErr) {
-    console.warn('[Ytdl Stream Resolution Warning]:', ytdlErr instanceof Error ? ytdlErr.message : ytdlErr);
   }
 
   // Strategy 3: SaveTube VIP CDN v2 Fallback (Works on Datacenter IPs where YouTube blocks Innertube)
@@ -1312,16 +1322,19 @@ export async function extractYouTube(url: string): Promise<ExtractionResult> {
     // Metadata defaults are already safely set
   }
 
-  // Phase 2: Instant Probed Stream Resolution (Innertube)
+  // Phase 2: Instant Probed Stream Resolution (Innertube) - skip on Vercel/datacenter to ensure <300ms metadata response
   let preMuxedUrl: string = '';
   let audioStreamUrl: string = '';
 
-  try {
-    const streams = await resolveInnertubeStreams(videoId);
-    if (streams.preMuxedUrl) preMuxedUrl = streams.preMuxedUrl;
-    if (streams.audioUrl) audioStreamUrl = streams.audioUrl;
-  } catch {
-    // Continue
+  const isServerlessEnv = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+  if (!isServerlessEnv) {
+    try {
+      const streams = await resolveInnertubeStreams(videoId);
+      if (streams.preMuxedUrl) preMuxedUrl = streams.preMuxedUrl;
+      if (streams.audioUrl) audioStreamUrl = streams.audioUrl;
+    } catch {
+      // Continue
+    }
   }
 
   const primaryVideoUrl = preMuxedUrl;

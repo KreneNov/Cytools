@@ -38,20 +38,47 @@ export interface YouTubeProgressResult {
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
-const SAVETUBE_HEADERS: Record<string, string> = {
-  'Content-Type': 'application/json',
-  Accept: 'application/json, text/plain, */*',
-  Origin: 'https://ytshorts.savetube.me',
-  Referer: 'https://ytshorts.savetube.me/',
-  'User-Agent': BROWSER_UA,
-};
+export function getRandomResidentialIp(): string {
+  const subnets = [
+    // VN Viettel/VNPT/FPT/CMC residential
+    () => `14.${160 + Math.floor(Math.random() * 80)}.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}`,
+    () => `113.${160 + Math.floor(Math.random() * 32)}.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}`,
+    () => `171.${224 + Math.floor(Math.random() * 32)}.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}`,
+    () => `42.${112 + Math.floor(Math.random() * 8)}.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}`,
+    // US Comcast/Charter/AT&T residential
+    () => `73.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}`,
+    () => `24.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}.${Math.floor(Math.random() * 254) + 1}`,
+  ];
+  const picker = subnets[Math.floor(Math.random() * subnets.length)];
+  return picker();
+}
 
-const SAVENOW_HEADERS: Record<string, string> = {
-  Accept: 'application/json, text/plain, */*',
-  Origin: 'https://en.loader.to',
-  Referer: 'https://en.loader.to/',
-  'User-Agent': BROWSER_UA,
-};
+export function getSavetubeHeaders(): Record<string, string> {
+  const ip = getRandomResidentialIp();
+  return {
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/plain, */*',
+    Origin: 'https://ytshorts.savetube.me',
+    Referer: 'https://ytshorts.savetube.me/',
+    'User-Agent': BROWSER_UA,
+    'X-Forwarded-For': ip,
+    'X-Real-IP': ip,
+    'X-Client-IP': ip,
+  };
+}
+
+export function getSavenowHeaders(): Record<string, string> {
+  const ip = getRandomResidentialIp();
+  return {
+    Accept: 'application/json, text/plain, */*',
+    Origin: 'https://en.loader.to',
+    Referer: 'https://en.loader.to/',
+    'User-Agent': BROWSER_UA,
+    'X-Forwarded-For': ip,
+    'X-Real-IP': ip,
+    'X-Client-IP': ip,
+  };
+}
 
 const SAVETUBE_AES_KEY_HEX = 'C5D58EF67A7584E4A29F6C35BBC4EB12';
 const SAVETUBE_CDN_POOL = [
@@ -64,7 +91,6 @@ const SAVETUBE_CDN_POOL = [
 const SAVETUBE_MAX_CDN_ATTEMPTS = 2;
 
 const SAVENOW_API_KEY = 'dfcb6d76f2f6a9894gjkege8a4ab232222';
-const SAVENOW_INITIAL_POLL_DELAY_MS = 800;
 
 const YT_ID_REGEX = /^[A-Za-z0-9_-]{11}$/;
 
@@ -221,7 +247,7 @@ async function getSavetubeCdnCandidates(): Promise<string[]> {
   const candidates: string[] = [];
   try {
     const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', {
-      headers: SAVETUBE_HEADERS,
+      headers: getSavetubeHeaders(),
       signal: AbortSignal.timeout(2000),
     });
     if (cdnRes.ok) {
@@ -247,11 +273,12 @@ async function trySavetubeOnCdn(
   youtubeUrl: string,
   format: YouTubeResolveFormat
 ): Promise<{ url: string; quality: string; title?: string }> {
+  const headers = getSavetubeHeaders();
   const infoRes = await fetch(`https://${cdn}/v2/info`, {
     method: 'POST',
-    headers: SAVETUBE_HEADERS,
+    headers,
     body: JSON.stringify({ url: youtubeUrl }),
-    signal: AbortSignal.timeout(3500),
+    signal: AbortSignal.timeout(2500),
   });
   if (infoRes.status === 429) throw new RateLimitError(`${cdn}/v2/info 429`);
   if (!infoRes.ok) throw new Error(`${cdn}/v2/info HTTP ${infoRes.status}`);
@@ -295,9 +322,9 @@ async function trySavetubeOnCdn(
 
   const dlRes = await fetch(`https://${cdn}/download`, {
     method: 'POST',
-    headers: SAVETUBE_HEADERS,
+    headers: getSavetubeHeaders(),
     body: JSON.stringify({ downloadType, quality: requestedQuality, key }),
-    signal: AbortSignal.timeout(3500),
+    signal: AbortSignal.timeout(2500),
   });
 
   if (dlRes.status === 429) {
@@ -314,8 +341,8 @@ async function trySavetubeOnCdn(
     return { url: downloadUrl, quality: requestedQuality, title };
   }
 
-  // If Savetube responded with 200 OK but has no valid URL, Savetube is unable to serve this video.
-  // Throw NoDownloadUrlError so caller can IMMEDIATELY break out and switch to Savenow!
+  // If Savetube responded with 200 OK but has no valid URL (shadow-ban/empty payload),
+  // immediately fail this CDN so the resolver can try the next iteration or Savenow.
   throw new NoDownloadUrlError(`${cdn}/download returned 200 without downloadUrl`);
 }
 
@@ -341,14 +368,9 @@ async function resolveViaSavetube(
     } catch (err) {
       attempts.push(`savetube:${errMsg(err)}`);
 
-      // INSTANT BREAKOUT: If Savetube responded cleanly but has no downloadUrl,
-      // all other Savetube CDNs will fail the same way. Break out immediately to Savenow!
-      if (err instanceof NoDownloadUrlError) {
-        break;
-      }
-
+      // If NoDownloadUrlError or RateLimitError, fail this CDN and move to the next iteration with a fresh IP
       if (err instanceof RateLimitError) {
-        await sleep(200);
+        await sleep(150);
       }
     }
   }
@@ -389,7 +411,7 @@ export async function pollYouTubeSaveNowProgress(taskId: string): Promise<YouTub
 
   try {
     const progRes = await fetch(`https://p.savenow.to/ajax/progress.php?id=${encodeURIComponent(id)}`, {
-      headers: SAVENOW_HEADERS,
+      headers: getSavenowHeaders(),
       signal: AbortSignal.timeout(3500),
     });
     if (progRes.status === 429) {
@@ -417,8 +439,8 @@ async function resolveViaSaveNow(
 
   try {
     const initRes = await fetch(initUrl, {
-      headers: SAVENOW_HEADERS,
-      signal: AbortSignal.timeout(4000),
+      headers: getSavenowHeaders(),
+      signal: AbortSignal.timeout(3500),
     });
     if (!initRes.ok) {
       attempts.push(`savenow:init HTTP ${initRes.status}`);
@@ -440,18 +462,7 @@ async function resolveViaSaveNow(
           ? initData.info.title
           : undefined;
 
-    // Fast initial check after 800ms
-    await sleep(SAVENOW_INITIAL_POLL_DELAY_MS);
-    const prog = await pollYouTubeSaveNowProgress(taskId);
-    if (prog.url) {
-      return { success: true, url: prog.url, provider: 'savenow', quality: format, title, attempts };
-    }
-    if (prog.status === 'failed') {
-      attempts.push(`savenow:progress ${prog.error || 'failed'}`);
-      return null;
-    }
-
-    // Still converting: return pendingId for client to poll, preventing serverless function timeout
+    // Decoupled: Immediately return pendingId to client without server-side waiting/polling!
     return { success: true, pendingId: taskId, provider: 'savenow', quality: format, title, attempts };
   } catch (err) {
     attempts.push(`savenow:${errMsg(err)}`);
