@@ -1670,12 +1670,16 @@ export function socialDownloadProxyPlugin(): Plugin {
                   (typeof ytBody.videoId === 'string' ? ytBody.videoId : '') ||
                   (typeof ytBody.url === 'string' ? ytBody.url : '');
                 const format = urlObj.searchParams.get('format') || ytBody.format;
+                const skipSavetube =
+                  urlObj.searchParams.get('skipSavetube') === 'true' ||
+                  ytBody.skipSavetube === true ||
+                  ytBody.skipSavetube === 'true';
                 if (!source) {
                   res.statusCode = 400;
                   res.end(JSON.stringify({ success: false, error: 'Thiếu tham số videoId hoặc url YouTube.' }));
                   return;
                 }
-                const resolved = await resolveYouTubeServerSide(source, format);
+                const resolved = await resolveYouTubeServerSide(source, format, { skipSavetube });
                 res.statusCode = 200;
                 res.end(JSON.stringify(resolved));
                 return;

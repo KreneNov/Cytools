@@ -80,6 +80,7 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
     let videoId: string | null = null;
     let format: string | null = null;
     let taskId: string | null = null;
+    let skipSavetube = false;
     let pathname = '';
 
     // 1. Try URL Query parameters
@@ -92,6 +93,7 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
         videoId = parsed.searchParams.get('videoId');
         format = parsed.searchParams.get('format');
         taskId = parsed.searchParams.get('id');
+        skipSavetube = parsed.searchParams.get('skipSavetube') === 'true';
       } catch {
         // Continue
       }
@@ -101,7 +103,7 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
       action = 'youtube-resolve';
     }
 
-    // Server-Side YouTube Resolver Proxy (Savetube Multi-CDN -> Savenow), zero browser CORS.
+    // Server-Side YouTube Resolver Proxy (Savetube Multi-CDN -> Piped/Invidious -> Savenow), zero browser CORS.
     // Parse the POST body once up-front and cache it on req.body so the later parseBody() call reuses it.
     if (req.method === 'POST') {
       const earlyBody = await parseBody(req);
@@ -112,6 +114,9 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
         if (earlyBody.videoId && !videoId) videoId = String(earlyBody.videoId);
         if (earlyBody.format && !format) format = String(earlyBody.format);
         if (earlyBody.id && !taskId) taskId = String(earlyBody.id);
+        if (earlyBody.skipSavetube === true || earlyBody.skipSavetube === 'true') {
+          skipSavetube = true;
+        }
       }
     }
 
@@ -121,7 +126,7 @@ export default async function handler(req: ExtendedRequest, res: ExtendedRespons
         if (!source) {
           return sendJson(res, 400, { success: false, error: 'Thiếu tham số videoId hoặc url YouTube.' }, req);
         }
-        const resolved = await resolveYouTubeServerSide(source, format);
+        const resolved = await resolveYouTubeServerSide(source, format, { skipSavetube });
         return sendJson(res, 200, resolved, req);
       } catch (err) {
         const msg = err instanceof Error ? err.message : 'Lỗi phân giải liên kết YouTube.';

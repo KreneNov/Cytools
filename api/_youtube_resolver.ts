@@ -4,23 +4,30 @@ import { createDecipheriv } from 'node:crypto';
  * Server-Side YouTube Resolver Proxy (shared by Vercel Serverless `api/social/extract.ts`
  * and Vite dev middleware `src/server/socialExtractor.ts`).
  *
- * Runs entirely on the server so that `Origin`, `Referer` and `User-Agent` are controlled by us:
- * - Provider A: Savetube Multi-CDN (spoofed as `ytshorts.savetube.me`), AES-128-CBC decryption,
- *   deep response URL extraction across multiple keys/encrypted payloads, and instant breakout
- *   if no downloadUrl is returned.
- * - Provider B: Savenow / Loader.to (`p.savenow.to`, spoofed as `en.loader.to`) fallback,
- *   returning `pendingId` if not ready in <2s so serverless function never times out.
+ * Supports `options.skipSavetube`: when the browser client has already attempted Savetube
+ * directly using its residential IP, the server skips Savetube completely so it never
+ * re-triggers Savetube's per-video mutex lock ("This video is busy right now").
+ *
+ * Server-Side Fallback Providers:
+ * - Provider A (when skipSavetube is false): Savetube Multi-CDN with 5-minute in-memory
+ *   `/v2/info` key caching, 15s muxing timeout, and same-key quality step-down (1080 -> 720 -> 360).
+ * - Provider B: Piped / Invidious public API instances for direct muxed video & audio streams.
+ * - Provider C: Savenow / Loader.to (`p.savenow.to`) decoupled task initialization.
  *
  * Guaranteed to never throw unhandled exceptions or return HTTP 502.
  */
 
 export type YouTubeResolveFormat = '1080' | '720' | '360' | 'mp3';
 
+export interface YouTubeResolveOptions {
+  skipSavetube?: boolean;
+}
+
 export interface YouTubeResolveResult {
   success: boolean;
   url?: string;
   pendingId?: string;
-  provider?: 'savetube' | 'savenow';
+  provider?: 'savetube' | 'piped' | 'invidious' | 'savenow';
   quality?: string;
   title?: string;
   error?: string;
@@ -34,6 +41,17 @@ export interface YouTubeProgressResult {
   status?: 'ready' | 'processing' | 'failed';
   error?: string;
 }
+
+interface ServerCachedSavetubeInfo {
+  cdn: string;
+  key: string;
+  title?: string;
+  videoFormats: Array<Record<string, unknown>>;
+  expiresAt: number;
+}
+
+const serverSavetubeInfoCache = new Map<string, ServerCachedSavetubeInfo>();
+const SAVETUBE_INFO_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
@@ -82,31 +100,29 @@ export function getSavenowHeaders(): Record<string, string> {
 
 const SAVETUBE_AES_KEY_HEX = 'C5D58EF67A7584E4A29F6C35BBC4EB12';
 const SAVETUBE_CDN_POOL = [
+  'cdn400.savetube.vip',
   'cdn401.savetube.vip',
   'cdn403.savetube.vip',
-  'cdn404.savetube.vip',
   'cdn405.savetube.vip',
   'cdn406.savetube.vip',
 ];
+const DEAD_SAVETUBE_CDNS = new Set(['cdn402.savetube.vip', 'cdn404.savetube.vip']);
 const SAVETUBE_MAX_CDN_ATTEMPTS = 2;
+
+const PIPED_API_INSTANCES = [
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi.tokhmi.xyz',
+  'https://pipedapi.adminforge.de',
+];
+
+const INVIDIOUS_API_INSTANCES = [
+  'https://inv.tux.pizza',
+  'https://invidious.nerdvpn.de',
+];
 
 const SAVENOW_API_KEY = 'dfcb6d76f2f6a9894gjkege8a4ab232222';
 
 const YT_ID_REGEX = /^[A-Za-z0-9_-]{11}$/;
-
-class RateLimitError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'RateLimitError';
-  }
-}
-
-class NoDownloadUrlError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'NoDownloadUrlError';
-  }
-}
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -166,12 +182,7 @@ function decryptSavetubePayload(b64: string): Record<string, unknown> {
 }
 
 /**
- * Resilient recursive URL extractor across all known Savetube response formats:
- * - Direct fields: `downloadUrl`, `download_url`, `url`, `streamUrl`, `stream_url`, `file`, `link`, `href`
- * - Nested objects: `data`, `result`, `info`
- * - Direct string URLs (`http://`, `https://`)
- * - Encrypted base64 payload strings (AES-128-CBC)
- * - Array collections
+ * Resilient recursive URL extractor across all known Savetube response formats.
  */
 export function extractUrlFromAny(target: unknown): string | null {
   if (!target) return null;
@@ -181,7 +192,6 @@ export function extractUrlFromAny(target: unknown): string | null {
     if (s.startsWith('http://') || s.startsWith('https://')) {
       return s;
     }
-    // Check if it might be an encrypted base64 payload
     if (s.length > 32 && /^[A-Za-z0-9+/=\s]+$/.test(s)) {
       try {
         const decrypted = decryptSavetubePayload(s);
@@ -204,7 +214,6 @@ export function extractUrlFromAny(target: unknown): string | null {
   if (typeof target === 'object') {
     const obj = target as Record<string, unknown>;
 
-    // Direct key scan
     const candidateKeys = [
       'downloadUrl',
       'download_url',
@@ -225,7 +234,6 @@ export function extractUrlFromAny(target: unknown): string | null {
       }
     }
 
-    // Inspect nested structures
     if (obj.data) {
       const nested = extractUrlFromAny(obj.data);
       if (nested) return nested;
@@ -248,12 +256,12 @@ async function getSavetubeCdnCandidates(): Promise<string[]> {
   try {
     const cdnRes = await fetch('https://media.savetube.vip/api/random-cdn', {
       headers: getSavetubeHeaders(),
-      signal: AbortSignal.timeout(2000),
+      signal: AbortSignal.timeout(2500),
     });
     if (cdnRes.ok) {
       const cdnData = (await cdnRes.json().catch(() => null)) as { cdn?: unknown } | null;
-      const cdn = typeof cdnData?.cdn === 'string' ? cdnData.cdn.replace(/^https?:\/\//, '').replace(/\/+$/, '') : '';
-      if (cdn && /^[a-z0-9.-]+\.savetube\.vip$/i.test(cdn)) {
+      const cdn = typeof cdnData?.cdn === 'string' ? cdnData.cdn.replace(/^https?:\/\//, '').replace(/\/+$/, '').toLowerCase() : '';
+      if (cdn && /^[a-z0-9.-]+\.savetube\.vip$/i.test(cdn) && !DEAD_SAVETUBE_CDNS.has(cdn)) {
         candidates.push(cdn);
       }
     }
@@ -268,82 +276,64 @@ async function getSavetubeCdnCandidates(): Promise<string[]> {
   return candidates.slice(0, SAVETUBE_MAX_CDN_ATTEMPTS);
 }
 
-async function trySavetubeOnCdn(
-  cdn: string,
+async function getOrFetchServerSavetubeInfo(
+  videoId: string,
   youtubeUrl: string,
-  format: YouTubeResolveFormat
-): Promise<{ url: string; quality: string; title?: string }> {
-  const headers = getSavetubeHeaders();
-  const infoRes = await fetch(`https://${cdn}/v2/info`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ url: youtubeUrl }),
-    signal: AbortSignal.timeout(2500),
-  });
-  if (infoRes.status === 429) throw new RateLimitError(`${cdn}/v2/info 429`);
-  if (!infoRes.ok) throw new Error(`${cdn}/v2/info HTTP ${infoRes.status}`);
-
-  const infoJson = (await infoRes.json().catch(() => null)) as { status?: unknown; data?: unknown } | null;
-  if (!infoJson?.status || typeof infoJson.data !== 'string') {
-    throw new Error(`${cdn}/v2/info returned no encrypted payload`);
+  attempts: string[]
+): Promise<ServerCachedSavetubeInfo | null> {
+  const now = Date.now();
+  const cached = serverSavetubeInfoCache.get(videoId);
+  if (cached && cached.expiresAt > now && cached.key && cached.cdn) {
+    return cached;
   }
 
-  const decrypted = decryptSavetubePayload(infoJson.data);
-  const key = typeof decrypted.key === 'string' ? decrypted.key : '';
-  if (!key) throw new Error(`${cdn}/v2/info decrypted payload has no key`);
-  const title = typeof decrypted.title === 'string' ? decrypted.title : undefined;
+  const cdns = await getSavetubeCdnCandidates();
+  for (const cdn of cdns) {
+    try {
+      const infoRes = await fetch(`https://${cdn}/v2/info`, {
+        method: 'POST',
+        headers: getSavetubeHeaders(),
+        body: JSON.stringify({ url: youtubeUrl }),
+        signal: AbortSignal.timeout(8000),
+      });
+      if (!infoRes.ok) {
+        attempts.push(`savetube:${cdn}/v2/info HTTP ${infoRes.status}`);
+        continue;
+      }
 
-  // 1. Instant Direct Stream Shortcut:
-  // Sometimes Savetube's decrypted info payload already contains direct googlevideo playback URLs
-  if (Array.isArray(decrypted.video_formats) && format !== 'mp3') {
-    const targetQNum = Number(format);
-    const directMatch = (decrypted.video_formats as Array<Record<string, unknown>>).find(
-      (f) => Number(f.quality) === targetQNum && typeof f.url === 'string' && f.url.startsWith('http')
-    );
-    if (directMatch && typeof directMatch.url === 'string') {
-      return { url: directMatch.url, quality: format, title };
+      const infoJson = (await infoRes.json().catch(() => null)) as { status?: unknown; data?: unknown } | null;
+      if (!infoJson?.status || typeof infoJson.data !== 'string') {
+        attempts.push(`savetube:${cdn}/v2/info no encrypted payload`);
+        continue;
+      }
+
+      const decrypted = decryptSavetubePayload(infoJson.data);
+      const key = typeof decrypted.key === 'string' ? decrypted.key : '';
+      if (!key) {
+        attempts.push(`savetube:${cdn}/v2/info no key`);
+        continue;
+      }
+
+      const title = typeof decrypted.title === 'string' ? decrypted.title : undefined;
+      const videoFormats = Array.isArray(decrypted.video_formats)
+        ? (decrypted.video_formats as Array<Record<string, unknown>>)
+        : [];
+
+      const entry: ServerCachedSavetubeInfo = {
+        cdn,
+        key,
+        title,
+        videoFormats,
+        expiresAt: Date.now() + SAVETUBE_INFO_CACHE_TTL_MS,
+      };
+      serverSavetubeInfoCache.set(videoId, entry);
+      return entry;
+    } catch (err) {
+      attempts.push(`savetube:${cdn}/v2/info ${errMsg(err)}`);
     }
   }
 
-  // 2. Determine best quality to request
-  let requestedQuality = format === 'mp3' ? '128' : format;
-  if (format !== 'mp3' && Array.isArray(decrypted.video_formats)) {
-    const availableQualities = (decrypted.video_formats as Array<Record<string, unknown>>)
-      .map((f) => String(f.quality || ''))
-      .filter(Boolean);
-
-    // If 1080 was requested but not available, auto-step down to 720
-    if (format === '1080' && !availableQualities.includes('1080')) {
-      requestedQuality = availableQualities.includes('720') ? '720' : '360';
-    }
-  }
-
-  const downloadType = format === 'mp3' ? 'audio' : 'video';
-
-  const dlRes = await fetch(`https://${cdn}/download`, {
-    method: 'POST',
-    headers: getSavetubeHeaders(),
-    body: JSON.stringify({ downloadType, quality: requestedQuality, key }),
-    signal: AbortSignal.timeout(2500),
-  });
-
-  if (dlRes.status === 429) {
-    throw new RateLimitError(`${cdn}/download ${requestedQuality} 429`);
-  }
-  if (!dlRes.ok) {
-    throw new Error(`${cdn}/download ${requestedQuality} HTTP ${dlRes.status}`);
-  }
-
-  const dlJson = await dlRes.json().catch(() => null);
-  const downloadUrl = extractUrlFromAny(dlJson);
-
-  if (downloadUrl) {
-    return { url: downloadUrl, quality: requestedQuality, title };
-  }
-
-  // If Savetube responded with 200 OK but has no valid URL (shadow-ban/empty payload),
-  // immediately fail this CDN so the resolver can try the next iteration or Savenow.
-  throw new NoDownloadUrlError(`${cdn}/download returned 200 without downloadUrl`);
+  return null;
 }
 
 async function resolveViaSavetube(
@@ -352,28 +342,255 @@ async function resolveViaSavetube(
   attempts: string[]
 ): Promise<YouTubeResolveResult | null> {
   const youtubeUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  const cdns = await getSavetubeCdnCandidates();
+  const info = await getOrFetchServerSavetubeInfo(videoId, youtubeUrl, attempts);
+  if (!info) return null;
 
-  for (const cdn of cdns) {
-    try {
-      const resolved = await trySavetubeOnCdn(cdn, youtubeUrl, format);
+  const { cdn, key, title, videoFormats } = info;
+
+  // 1. Direct playback stream shortcut if present in videoFormats
+  if (format !== 'mp3' && videoFormats.length > 0) {
+    const targetQNum = Number(format);
+    const directMatch = videoFormats.find(
+      (f) => Number(f.quality) === targetQNum && typeof f.url === 'string' && f.url.startsWith('http')
+    );
+    if (directMatch && typeof directMatch.url === 'string') {
       return {
         success: true,
-        url: resolved.url,
+        url: directMatch.url,
         provider: 'savetube',
-        quality: resolved.quality,
-        title: resolved.title,
+        quality: format,
+        title,
         attempts,
       };
-    } catch (err) {
-      attempts.push(`savetube:${errMsg(err)}`);
-
-      // If NoDownloadUrlError or RateLimitError, fail this CDN and move to the next iteration with a fresh IP
-      if (err instanceof RateLimitError) {
-        await sleep(150);
-      }
     }
   }
+
+  // 2. Determine requested quality
+  let requestedQuality = format === 'mp3' ? '128' : format;
+  if (format !== 'mp3' && videoFormats.length > 0) {
+    const availableQualities = videoFormats
+      .map((f) => String(f.quality || ''))
+      .filter(Boolean);
+    if (format === '1080' && availableQualities.length > 0 && !availableQualities.includes('1080')) {
+      requestedQuality = availableQualities.includes('720') ? '720' : '360';
+    }
+  }
+
+  const downloadType = format === 'mp3' ? 'audio' : 'video';
+
+  const requestDownload = async (q: string): Promise<{ url: string | null; isBusy: boolean; status: number }> => {
+    const dlRes = await fetch(`https://${cdn}/download`, {
+      method: 'POST',
+      headers: getSavetubeHeaders(),
+      body: JSON.stringify({ downloadType, quality: q, key }),
+      signal: AbortSignal.timeout(12000),
+    });
+    const dlJson = (await dlRes.json().catch(() => null)) as Record<string, unknown> | null;
+    const url = extractUrlFromAny(dlJson);
+    const msg = typeof dlJson?.message === 'string' ? dlJson.message.toLowerCase() : '';
+    const isBusy = msg.includes('busy') || (dlJson !== null && dlJson.status === false && !url);
+    return { url, isBusy, status: dlRes.status };
+  };
+
+  try {
+    let outcome = await requestDownload(requestedQuality);
+    if (outcome.url) {
+      return {
+        success: true,
+        url: outcome.url,
+        provider: 'savetube',
+        quality: requestedQuality,
+        title,
+        attempts,
+      };
+    }
+
+    if (outcome.isBusy) {
+      attempts.push(`savetube:${cdn}/download ${requestedQuality} busy`);
+      await sleep(2000);
+      outcome = await requestDownload(requestedQuality);
+      if (outcome.url) {
+        return {
+          success: true,
+          url: outcome.url,
+          provider: 'savetube',
+          quality: requestedQuality,
+          title,
+          attempts,
+        };
+      }
+    }
+
+    if (format !== 'mp3') {
+      const stepDown = requestedQuality === '1080' ? ['720', '360'] : requestedQuality === '720' ? ['360'] : [];
+      for (const fallbackQ of stepDown) {
+        const fallbackOutcome = await requestDownload(fallbackQ);
+        if (fallbackOutcome.url) {
+          return {
+            success: true,
+            url: fallbackOutcome.url,
+            provider: 'savetube',
+            quality: fallbackQ,
+            title,
+            attempts,
+          };
+        }
+      }
+    }
+
+    attempts.push(`savetube:${cdn}/download ${requestedQuality} HTTP ${outcome.status} no downloadUrl`);
+  } catch (err) {
+    attempts.push(`savetube:${cdn}/download ${errMsg(err)}`);
+  }
+
+  return null;
+}
+
+/**
+ * Resolves direct muxed video or audio streams via public Piped & Invidious API instances.
+ * Completely independent from Savetube's per-video mutex lock.
+ */
+async function resolveViaPipedOrInvidious(
+  videoId: string,
+  format: YouTubeResolveFormat,
+  attempts: string[]
+): Promise<YouTubeResolveResult | null> {
+  // 1. Try Piped API instances
+  for (const instance of PIPED_API_INSTANCES) {
+    try {
+      const res = await fetch(`${instance}/streams/${encodeURIComponent(videoId)}`, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': BROWSER_UA,
+        },
+        signal: AbortSignal.timeout(3500),
+      });
+      if (!res.ok) {
+        attempts.push(`piped:${new URL(instance).hostname} HTTP ${res.status}`);
+        continue;
+      }
+
+      const data = (await res.json().catch(() => null)) as {
+        title?: unknown;
+        audioStreams?: Array<Record<string, unknown>>;
+        videoStreams?: Array<Record<string, unknown>>;
+      } | null;
+
+      if (!data) continue;
+      const title = typeof data.title === 'string' ? data.title : undefined;
+
+      if (format === 'mp3' && Array.isArray(data.audioStreams)) {
+        const validAudio = data.audioStreams
+          .filter((s) => typeof s.url === 'string' && s.url.startsWith('http'))
+          .sort((a, b) => Number(b.bitrate || 0) - Number(a.bitrate || 0));
+        if (validAudio.length > 0 && typeof validAudio[0].url === 'string') {
+          return {
+            success: true,
+            url: validAudio[0].url,
+            provider: 'piped',
+            quality: 'mp3',
+            title,
+            attempts,
+          };
+        }
+      }
+
+      if (format !== 'mp3' && Array.isArray(data.videoStreams)) {
+        const muxedVideos = data.videoStreams.filter(
+          (s) => s.videoOnly === false && typeof s.url === 'string' && s.url.startsWith('http')
+        );
+        if (muxedVideos.length > 0) {
+          const preferred =
+            muxedVideos.find((s) => String(s.quality || '').includes(format)) ||
+            muxedVideos.find((s) => String(s.quality || '').includes('720')) ||
+            muxedVideos[0];
+          if (preferred && typeof preferred.url === 'string') {
+            return {
+              success: true,
+              url: preferred.url,
+              provider: 'piped',
+              quality: typeof preferred.quality === 'string' ? preferred.quality : format,
+              title,
+              attempts,
+            };
+          }
+        }
+      }
+    } catch (err) {
+      attempts.push(`piped:${new URL(instance).hostname} ${errMsg(err)}`);
+    }
+  }
+
+  // 2. Try Invidious API instances
+  for (const instance of INVIDIOUS_API_INSTANCES) {
+    try {
+      const res = await fetch(`${instance}/api/v1/videos/${encodeURIComponent(videoId)}`, {
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': BROWSER_UA,
+        },
+        signal: AbortSignal.timeout(3500),
+      });
+      if (!res.ok) {
+        attempts.push(`invidious:${new URL(instance).hostname} HTTP ${res.status}`);
+        continue;
+      }
+
+      const data = (await res.json().catch(() => null)) as {
+        title?: unknown;
+        formatStreams?: Array<Record<string, unknown>>;
+        adaptiveFormats?: Array<Record<string, unknown>>;
+      } | null;
+
+      if (!data) continue;
+      const title = typeof data.title === 'string' ? data.title : undefined;
+
+      if (format === 'mp3' && Array.isArray(data.adaptiveFormats)) {
+        const audioStreams = data.adaptiveFormats.filter(
+          (s) =>
+            typeof s.type === 'string' &&
+            s.type.startsWith('audio/') &&
+            typeof s.url === 'string' &&
+            s.url.startsWith('http')
+        );
+        if (audioStreams.length > 0 && typeof audioStreams[0].url === 'string') {
+          return {
+            success: true,
+            url: audioStreams[0].url,
+            provider: 'invidious',
+            quality: 'mp3',
+            title,
+            attempts,
+          };
+        }
+      }
+
+      if (format !== 'mp3' && Array.isArray(data.formatStreams)) {
+        const muxedStreams = data.formatStreams.filter(
+          (s) => typeof s.url === 'string' && s.url.startsWith('http')
+        );
+        if (muxedStreams.length > 0) {
+          const preferred =
+            muxedStreams.find((s) => String(s.qualityLabel || '').includes(format)) ||
+            muxedStreams.find((s) => String(s.qualityLabel || '').includes('720')) ||
+            muxedStreams[0];
+          if (preferred && typeof preferred.url === 'string') {
+            return {
+              success: true,
+              url: preferred.url,
+              provider: 'invidious',
+              quality: typeof preferred.qualityLabel === 'string' ? preferred.qualityLabel : format,
+              title,
+              attempts,
+            };
+          }
+        }
+      }
+    } catch (err) {
+      attempts.push(`invidious:${new URL(instance).hostname} ${errMsg(err)}`);
+    }
+  }
+
   return null;
 }
 
@@ -471,12 +688,14 @@ async function resolveViaSaveNow(
 }
 
 /**
- * Resolves a direct YouTube download URL on the server via the 2-provider fallback chain.
- * Wrapped in a top-level try/catch to guarantee returning clean JSON and never crashing the server.
+ * Resolves a direct YouTube download URL on the server.
+ * When `options.skipSavetube` is true (because the browser client already tried Savetube),
+ * skips Savetube completely so the server does not re-trigger Savetube's per-video mutex lock.
  */
 export async function resolveYouTubeServerSide(
   urlOrVideoId: string,
-  formatInput: unknown
+  formatInput: unknown,
+  options?: YouTubeResolveOptions
 ): Promise<YouTubeResolveResult> {
   try {
     const videoId = normalizeYouTubeVideoId(urlOrVideoId);
@@ -486,13 +705,21 @@ export async function resolveYouTubeServerSide(
     const format = normalizeYouTubeFormat(formatInput);
     const attempts: string[] = [];
 
-    // Provider A: Savetube Multi-CDN
-    const savetube = await resolveViaSavetube(videoId, format, attempts);
-    if (savetube) return savetube;
+    // Provider A: Savetube Multi-CDN (only when client did not already attempt it)
+    if (!options?.skipSavetube) {
+      const savetube = await resolveViaSavetube(videoId, format, attempts);
+      if (savetube) return savetube;
+    } else {
+      attempts.push('savetube:skipped(client_already_tried)');
+    }
 
-    // Provider B: Savenow / Loader.to Fallback
+    // Provider B: Savenow / Loader.to Decoupled Task Initialization
     const savenow = await resolveViaSaveNow(videoId, format, attempts);
     if (savenow) return savenow;
+
+    // Provider C: Piped / Invidious Public Stream Extraction (immune to Savetube mutex lock & Savenow Cloudflare block)
+    const pipedOrInvidious = await resolveViaPipedOrInvidious(videoId, format, attempts);
+    if (pipedOrInvidious) return pipedOrInvidious;
 
     console.warn('[YouTube Resolver] All providers failed:', attempts.join(' | '));
     return {

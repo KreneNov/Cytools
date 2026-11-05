@@ -6,8 +6,14 @@
  * residential/mobile IP rather than Vercel's datacenter AWS IPs, completely bypassing Cloudflare
  * 429/403 blocks.
  *
- * All fetch calls strictly use `referrerPolicy: "no-referrer"`, `credentials: "omit"`, and `mode: "cors"`
- * so no website origin/referer headers are leaked to the upstream CDN.
+ * Key Anti-Mutex Architecture:
+ * 1. Single `/v2/info` lookup cached in memory per `videoId` for 5 minutes (`300_000ms`),
+ *    eliminating redundant `/v2/info` calls across multiple clicks or CDNs.
+ * 2. Extended timeouts (`10000ms` for `/v2/info` and `15000ms` for `/download`) so 1080p FFmpeg
+ *    muxing is never aborted mid-flight.
+ * 3. Graceful handling of `"This video is busy right now"`: waits 2500ms and retries once on the
+ *    SAME CDN with the SAME `key`, then automatically steps down `1080` -> `720` -> `360` using
+ *    the SAME `key` on the SAME CDN to bypass Savetube's 1080p FFmpeg mutex.
  */
 
 export type YouTubeResolveFormat = '1080' | '720' | '360' | 'mp3';
@@ -19,16 +25,29 @@ export interface ClientYouTubeResolveResult {
   provider: 'savetube_client';
 }
 
+interface CachedSavetubeInfo {
+  cdn: string;
+  key: string;
+  title?: string;
+  videoFormats: Array<Record<string, unknown>>;
+  expiresAt: number;
+}
+
 const SAVETUBE_AES_KEY_HEX = 'C5D58EF67A7584E4A29F6C35BBC4EB12';
 const SAVETUBE_CDN_POOL = [
+  'cdn400.savetube.vip',
   'cdn401.savetube.vip',
-  'cdn402.savetube.vip',
   'cdn403.savetube.vip',
-  'cdn404.savetube.vip',
   'cdn405.savetube.vip',
   'cdn406.savetube.vip',
 ];
-const MAX_CLIENT_CDN_ATTEMPTS = 3;
+const DEAD_SAVETUBE_CDNS = new Set(['cdn402.savetube.vip', 'cdn404.savetube.vip']);
+const MAX_INFO_CDN_ATTEMPTS = 2;
+const SAVETUBE_INFO_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const INFO_TIMEOUT_MS = 10000; // 10s for /v2/info
+const DOWNLOAD_TIMEOUT_MS = 15000; // 15s for /download (1080p muxing takes 3-10s)
+
+const savetubeInfoCache = new Map<string, CachedSavetubeInfo>();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -147,7 +166,7 @@ export function extractUrlFromAny(target: unknown): string | null {
 }
 
 /**
- * Retrieves a list of active CDN hosts, starting with the server's random CDN recommendation.
+ * Retrieves active CDN candidates, starting with Savetube's random-cdn endpoint.
  */
 async function getClientCdnCandidates(): Promise<string[]> {
   const candidates: string[] = [];
@@ -158,143 +177,167 @@ async function getClientCdnCandidates(): Promise<string[]> {
       referrerPolicy: 'no-referrer',
       credentials: 'omit',
       mode: 'cors',
-      signal: AbortSignal.timeout(2500),
+      signal: AbortSignal.timeout(3000),
     });
 
     if (cdnRes.ok) {
       const cdnData = (await cdnRes.json().catch(() => null)) as { cdn?: unknown } | null;
-      const cdn = typeof cdnData?.cdn === 'string' ? cdnData.cdn.replace(/^https?:\/\//, '').replace(/\/+$/, '') : '';
-      if (cdn && /^[a-z0-9.-]+\.savetube\.vip$/i.test(cdn)) {
+      const cdn = typeof cdnData?.cdn === 'string' ? cdnData.cdn.replace(/^https?:\/\//, '').replace(/\/+$/, '').toLowerCase() : '';
+      if (cdn && /^[a-z0-9.-]+\.savetube\.vip$/i.test(cdn) && !DEAD_SAVETUBE_CDNS.has(cdn)) {
         candidates.push(cdn);
       }
     }
   } catch {
-    // Fall back to pool
+    // Fall back to static pool
   }
 
   const shuffledPool = [...SAVETUBE_CDN_POOL].sort(() => Math.random() - 0.5);
   for (const host of shuffledPool) {
     if (!candidates.includes(host)) candidates.push(host);
   }
-  return candidates.slice(0, MAX_CLIENT_CDN_ATTEMPTS);
+  return candidates.slice(0, MAX_INFO_CDN_ATTEMPTS);
 }
 
-async function trySavetubeClientOnCdn(
+/**
+ * Looks up and decrypts `/v2/info` ONCE per `videoId` and caches `{ cdn, key, title, videoFormats }`
+ * in memory for 5 minutes so subsequent clicks or quality step-downs never re-trigger `/v2/info`.
+ */
+async function getOrFetchSavetubeInfo(videoId: string, targetUrl: string): Promise<CachedSavetubeInfo> {
+  const now = Date.now();
+  const cached = savetubeInfoCache.get(videoId);
+  if (cached && cached.expiresAt > now && cached.key && cached.cdn) {
+    return cached;
+  }
+
+  const cdns = await getClientCdnCandidates();
+  let lastError: Error | null = null;
+
+  for (let i = 0; i < cdns.length; i++) {
+    const cdn = cdns[i];
+    try {
+      const infoRes = await fetch(`https://${cdn}/v2/info`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/plain, */*',
+        },
+        body: JSON.stringify({ url: targetUrl }),
+        referrerPolicy: 'no-referrer',
+        credentials: 'omit',
+        mode: 'cors',
+        signal: AbortSignal.timeout(INFO_TIMEOUT_MS),
+      });
+
+      if (!infoRes.ok) {
+        throw new Error(`${cdn}/v2/info HTTP ${infoRes.status}`);
+      }
+
+      const infoJson = (await infoRes.json().catch(() => null)) as {
+        status?: unknown;
+        data?: unknown;
+        message?: unknown;
+      } | null;
+
+      if (!infoJson?.status || typeof infoJson.data !== 'string') {
+        throw new Error(
+          `${cdn}/v2/info returned no encrypted payload (${typeof infoJson?.message === 'string' ? infoJson.message : 'status false'})`
+        );
+      }
+
+      const decrypted = await decryptSavetubePayloadWebCrypto(infoJson.data);
+      const key = typeof decrypted.key === 'string' ? decrypted.key : '';
+      if (!key) {
+        throw new Error(`${cdn}/v2/info decrypted payload has no key`);
+      }
+
+      const title = typeof decrypted.title === 'string' ? decrypted.title : undefined;
+      const videoFormats = Array.isArray(decrypted.video_formats)
+        ? (decrypted.video_formats as Array<Record<string, unknown>>)
+        : [];
+
+      const entry: CachedSavetubeInfo = {
+        cdn,
+        key,
+        title,
+        videoFormats,
+        expiresAt: Date.now() + SAVETUBE_INFO_CACHE_TTL_MS,
+      };
+      savetubeInfoCache.set(videoId, entry);
+      return entry;
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.warn(`[Client Savetube] /v2/info on ${cdn} failed:`, lastError.message);
+      if (i < cdns.length - 1) {
+        await sleep(500);
+      }
+    }
+  }
+
+  throw lastError || new Error('Failed to fetch Savetube /v2/info');
+}
+
+interface DownloadAttemptOutcome {
+  downloadUrl: string | null;
+  isBusy: boolean;
+  httpStatus: number;
+  message?: string;
+}
+
+/**
+ * Calls `https://${cdn}/download` on the exact CDN that issued `key` with a 15-second timeout.
+ */
+async function requestSavetubeDownloadOnSameCdn(
   cdn: string,
-  targetUrl: string,
-  format: YouTubeResolveFormat
-): Promise<{ url: string; quality: string; title?: string }> {
-  // 1. Fetch info payload with clean no-referrer policy
-  const infoRes = await fetch(`https://${cdn}/v2/info`, {
+  downloadType: 'audio' | 'video',
+  quality: string,
+  key: string
+): Promise<DownloadAttemptOutcome> {
+  const dlRes = await fetch(`https://${cdn}/download`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Accept: 'application/json, text/plain, */*',
     },
-    body: JSON.stringify({ url: targetUrl }),
+    body: JSON.stringify({ downloadType, quality, key }),
     referrerPolicy: 'no-referrer',
     credentials: 'omit',
     mode: 'cors',
-    signal: AbortSignal.timeout(5000),
+    signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
   });
 
-  if (!infoRes.ok) {
-    throw new Error(`${cdn}/v2/info HTTP ${infoRes.status}`);
-  }
-
-  const infoJson = (await infoRes.json().catch(() => null)) as { status?: unknown; data?: unknown } | null;
-  if (!infoJson?.status || typeof infoJson.data !== 'string') {
-    throw new Error(`${cdn}/v2/info returned no encrypted payload`);
-  }
-
-  const decrypted = await decryptSavetubePayloadWebCrypto(infoJson.data);
-  const key = typeof decrypted.key === 'string' ? decrypted.key : '';
-  if (!key) throw new Error(`${cdn}/v2/info decrypted payload has no key`);
-  const title = typeof decrypted.title === 'string' ? decrypted.title : undefined;
-
-  // 2. Direct playback stream shortcut (if already provided in video_formats)
-  if (Array.isArray(decrypted.video_formats) && format !== 'mp3') {
-    const targetQNum = Number(format);
-    const directMatch = (decrypted.video_formats as Array<Record<string, unknown>>).find(
-      (f) => Number(f.quality) === targetQNum && typeof f.url === 'string' && f.url.startsWith('http')
-    );
-    if (directMatch && typeof directMatch.url === 'string') {
-      return { url: directMatch.url, quality: format, title };
-    }
-  }
-
-  // 3. Determine best quality to request
-  let requestedQuality = format === 'mp3' ? '128' : format;
-  if (format !== 'mp3' && Array.isArray(decrypted.video_formats)) {
-    const availableQualities = (decrypted.video_formats as Array<Record<string, unknown>>)
-      .map((f) => String(f.quality || ''))
-      .filter(Boolean);
-
-    if (format === '1080' && !availableQualities.includes('1080')) {
-      requestedQuality = availableQualities.includes('720') ? '720' : '360';
-    }
-  }
-
-  const downloadType = format === 'mp3' ? 'audio' : 'video';
-
-  // 4. Request direct download URL
-  const dlRes = await fetch(`https://${cdn}/download`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-    },
-    body: JSON.stringify({ downloadType, quality: requestedQuality, key }),
-    referrerPolicy: 'no-referrer',
-    credentials: 'omit',
-    mode: 'cors',
-    signal: AbortSignal.timeout(7000),
-  });
-
-  if (!dlRes.ok) {
-    throw new Error(`${cdn}/download ${requestedQuality} HTTP ${dlRes.status}`);
-  }
-
-  const dlJson = await dlRes.json().catch(() => null);
+  const dlJson = (await dlRes.json().catch(() => null)) as Record<string, unknown> | null;
   const downloadUrl = extractUrlFromAny(dlJson);
+  const rawMessage = typeof dlJson?.message === 'string' ? dlJson.message : undefined;
+  const lowerMsg = (rawMessage || '').toLowerCase();
+  const isBusy = lowerMsg.includes('busy');
 
-  if (downloadUrl) {
-    return { url: downloadUrl, quality: requestedQuality, title };
-  }
+  return {
+    downloadUrl,
+    isBusy,
+    httpStatus: dlRes.status,
+    message: rawMessage,
+  };
+}
 
-  // If 1080 failed without downloadUrl, attempt 720 as immediate quality step-down on same CDN
-  if (requestedQuality === '1080') {
-    try {
-      const fallbackRes = await fetch(`https://${cdn}/download`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({ downloadType, quality: '720', key }),
-        referrerPolicy: 'no-referrer',
-        credentials: 'omit',
-        mode: 'cors',
-        signal: AbortSignal.timeout(5000),
-      });
-      if (fallbackRes.ok) {
-        const fallbackJson = await fallbackRes.json().catch(() => null);
-        const fallbackUrl = extractUrlFromAny(fallbackJson);
-        if (fallbackUrl) {
-          return { url: fallbackUrl, quality: '720', title };
-        }
-      }
-    } catch {
-      // Continue to next CDN
-    }
-  }
-
-  throw new Error(`${cdn}/download returned no downloadUrl`);
+function findDirectFormatUrl(
+  videoFormats: Array<Record<string, unknown>>,
+  quality: string
+): string | null {
+  const targetQNum = Number(quality);
+  if (!Number.isFinite(targetQNum)) return null;
+  const match = videoFormats.find(
+    (f) => Number(f.quality) === targetQNum && typeof f.url === 'string' && f.url.startsWith('http')
+  );
+  return match && typeof match.url === 'string' ? match.url : null;
 }
 
 /**
- * Resolves a YouTube download URL purely in the client's browser using residential IP and Web Crypto.
- * Returns null if all client-side CDN attempts fail so the caller can seamlessly try serverless fallback.
+ * Resolves a YouTube download URL in the browser using residential IP + cached `/v2/info` key:
+ * - Never calls `/v2/info` more than once per `videoId` within 5 minutes.
+ * - Uses 10s `/v2/info` timeout and 15s `/download` timeout.
+ * - If `/download` returns `"This video is busy right now"` or `status: false`:
+ *   1. Waits 2500ms and retries `/download` ONCE on the SAME CDN with the SAME `key`.
+ *   2. If still busy on `1080`, immediately steps down to `720` -> `360` using the SAME `key` on the SAME CDN.
  */
 export async function resolveYouTubeClientSavetube(
   videoId: string,
@@ -303,27 +346,129 @@ export async function resolveYouTubeClientSavetube(
   const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
   try {
-    const cdns = await getClientCdnCandidates();
+    const info = await getOrFetchSavetubeInfo(videoId, targetUrl);
+    const { cdn, key, title, videoFormats } = info;
 
-    for (let i = 0; i < cdns.length; i++) {
-      const cdn = cdns[i];
-      try {
-        const res = await trySavetubeClientOnCdn(cdn, targetUrl, format);
+    // 1. Check if decrypted video_formats already provides a direct stream URL for requested quality
+    if (format !== 'mp3' && videoFormats.length > 0) {
+      const directUrl = findDirectFormatUrl(videoFormats, format);
+      if (directUrl) {
         return {
-          url: res.url,
-          quality: res.quality,
-          title: res.title,
+          url: directUrl,
+          quality: format,
+          title,
           provider: 'savetube_client',
         };
-      } catch (err) {
-        console.warn(`[Client Savetube] CDN ${cdn} failed:`, err instanceof Error ? err.message : err);
-        if (i < cdns.length - 1) {
-          await sleep(400);
+      }
+    }
+
+    // 2. Determine initial quality to request
+    let requestedQuality = format === 'mp3' ? '128' : format;
+    if (format !== 'mp3' && videoFormats.length > 0) {
+      const availableQualities = videoFormats
+        .map((f) => String(f.quality || ''))
+        .filter(Boolean);
+
+      if (
+        format === '1080' &&
+        availableQualities.length > 0 &&
+        !availableQualities.includes('1080')
+      ) {
+        requestedQuality = availableQualities.includes('720') ? '720' : '360';
+      }
+    }
+
+    const downloadType: 'audio' | 'video' = format === 'mp3' ? 'audio' : 'video';
+
+    // 3. Primary /download call on the SAME CDN that issued the key (15s timeout)
+    let outcome = await requestSavetubeDownloadOnSameCdn(
+      cdn,
+      downloadType,
+      requestedQuality,
+      key
+    );
+
+    if (outcome.downloadUrl) {
+      return {
+        url: outcome.downloadUrl,
+        quality: requestedQuality,
+        title,
+        provider: 'savetube_client',
+      };
+    }
+
+    // 4. Handle "This video is busy right now" or status:false on the SAME CDN + SAME key
+    if (outcome.isBusy) {
+      console.warn(
+        `[Client Savetube] ${cdn}/download (${requestedQuality}) reported busy ("${outcome.message || 'status:false'}"). Waiting 2500ms before same-key retry...`
+      );
+      await sleep(2500);
+      outcome = await requestSavetubeDownloadOnSameCdn(
+        cdn,
+        downloadType,
+        requestedQuality,
+        key
+      );
+
+      if (outcome.downloadUrl) {
+        return {
+          url: outcome.downloadUrl,
+          quality: requestedQuality,
+          title,
+          provider: 'savetube_client',
+        };
+      }
+    }
+
+    // 5. If still busy/unavailable on video (e.g., 1080p FFmpeg mutex locked), immediately step down
+    //    to 720 -> 360 using the SAME key on the SAME CDN (pre-muxed streams bypass 1080p FFmpeg mutex)
+    if (format !== 'mp3') {
+      const stepDownQualities =
+        requestedQuality === '1080'
+          ? ['720', '360']
+          : requestedQuality === '720'
+            ? ['360']
+            : [];
+
+      for (const fallbackQuality of stepDownQualities) {
+        const directFallback = findDirectFormatUrl(videoFormats, fallbackQuality);
+        if (directFallback) {
+          return {
+            url: directFallback,
+            quality: fallbackQuality,
+            title,
+            provider: 'savetube_client',
+          };
+        }
+
+        try {
+          const stepDownOutcome = await requestSavetubeDownloadOnSameCdn(
+            cdn,
+            'video',
+            fallbackQuality,
+            key
+          );
+          if (stepDownOutcome.downloadUrl) {
+            return {
+              url: stepDownOutcome.downloadUrl,
+              quality: fallbackQuality,
+              title,
+              provider: 'savetube_client',
+            };
+          }
+        } catch (stepErr) {
+          console.warn(
+            `[Client Savetube] Quality step-down ${fallbackQuality} on ${cdn} failed:`,
+            stepErr instanceof Error ? stepErr.message : stepErr
+          );
         }
       }
     }
-  } catch (outerErr) {
-    console.warn('[Client Savetube Resolver Error]:', outerErr);
+  } catch (err) {
+    console.warn(
+      '[Client Savetube Resolver] Resolution attempt failed:',
+      err instanceof Error ? err.message : err
+    );
   }
 
   return null;

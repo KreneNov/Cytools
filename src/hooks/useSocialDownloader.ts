@@ -139,7 +139,7 @@ async function resolveYouTubeClientSide(
     console.warn('[useSocialDownloader] Client-side Savetube resolution error, trying server fallback:', clientErr);
   }
 
-  // 2. Fallback Strategy: Server-Side Resolver Proxy (Savenow / server pool)
+  // 2. Fallback Strategy: Server-Side Resolver Proxy (Piped/Invidious + Savenow; skipSavetube: true prevents re-triggering Savetube's mutex lock)
   const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
   try {
@@ -149,7 +149,13 @@ async function resolveYouTubeClientSide(
         Accept: 'application/json',
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ action: 'youtube-resolve', videoId, url: targetUrl, format }),
+      body: JSON.stringify({
+        action: 'youtube-resolve',
+        videoId,
+        url: targetUrl,
+        format,
+        skipSavetube: true,
+      }),
       signal: AbortSignal.timeout(55000),
     });
 
@@ -248,9 +254,12 @@ export async function triggerDirectDownload(url: string, filename: string): Prom
     return;
   }
 
-  // 2. Web App - Direct download for URLs with guaranteed attachment headers (Savetube CDN, Cobalt tunnel, Xenon)
+  // 2. Web App - Direct download for URLs with guaranteed attachment headers (Savetube CDN, Savenow, Piped, Cobalt tunnel, Xenon)
   const isAttachmentGuaranteed =
     url.includes('savetube.vip') ||
+    url.includes('savenow.to') ||
+    url.includes('oceansaver') ||
+    url.includes('piped') ||
     url.includes('/tunnel') ||
     url.includes('api.cobalt.tools') ||
     url.includes('cobalt.tools') ||
