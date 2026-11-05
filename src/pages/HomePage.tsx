@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import {
   ImageOff,
   Eraser,
+  Droplets,
   Repeat,
   DownloadCloud,
   ImageIcon,
@@ -72,6 +73,14 @@ export const HomePage: React.FC = () => {
             >
               <Eraser className="w-4 h-4 text-indigo-500 dark:text-indigo-400" />
               <span>Xóa Watermark Đa Nền Tảng</span>
+            </button>
+
+            <button
+              onClick={() => navigate('/blur-brush')}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-700 font-medium text-sm transition-all active:scale-95 cursor-pointer"
+            >
+              <Droplets className="w-4 h-4 text-pink-500 dark:text-pink-400" />
+              <span>Cọ Làm Mờ Ảnh (Hypic)</span>
             </button>
 
             <button

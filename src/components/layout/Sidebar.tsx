@@ -6,6 +6,7 @@ import {
   Repeat,
   ImageOff,
   Eraser,
+  Droplets,
   Sparkles,
   CheckCircle2,
   Loader2,
@@ -58,6 +59,13 @@ const NAV_ITEMS: NavItem[] = [
     name: 'Xóa Watermark',
     path: '/watermark-remover',
     icon: Eraser,
+    isAvailable: true,
+  },
+  {
+    id: 'blur-brush',
+    name: 'Cọ Làm Mờ Ảnh',
+    path: '/blur-brush',
+    icon: Droplets,
     isAvailable: true,
   },
   {

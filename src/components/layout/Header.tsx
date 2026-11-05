@@ -33,6 +33,10 @@ const ROUTE_TITLES: Record<string, { title: string; subtitle: string }> = {
     title: 'Trung Tâm Chuyển Đổi',
     subtitle: 'Chuyển đổi Video, Âm thanh MP3, Hình ảnh (JPG, PNG, WebP) và Tài liệu trực tiếp',
   },
+  '/blur-brush': {
+    title: 'Cọ Làm Mờ Ảnh (Hypic Blur)',
+    subtitle: 'Bôi mờ vùng nhạy cảm & tạo hiệu ứng Mờ Chuyển Động (Motion Blur) 60fps trên trình duyệt',
+  },
 };
 
 interface HeaderProps {
