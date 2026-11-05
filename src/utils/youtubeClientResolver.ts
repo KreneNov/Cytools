@@ -48,6 +48,7 @@ const INFO_TIMEOUT_MS = 10000; // 10s for /v2/info
 const DOWNLOAD_TIMEOUT_MS = 15000; // 15s for /download (1080p muxing takes 3-10s)
 
 const savetubeInfoCache = new Map<string, CachedSavetubeInfo>();
+const savetubeInfoInflight = new Map<string, Promise<CachedSavetubeInfo>>();
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -209,6 +210,38 @@ async function getOrFetchSavetubeInfo(videoId: string, targetUrl: string): Promi
     return cached;
   }
 
+  // Deduplicate concurrent lookups (e.g., prefetch still in-flight when the user clicks download)
+  // so Savetube never receives two parallel /v2/info calls for the same videoId.
+  const inflight = savetubeInfoInflight.get(videoId);
+  if (inflight) {
+    return inflight;
+  }
+
+  const pending = fetchSavetubeInfoUncached(videoId, targetUrl).finally(() => {
+    savetubeInfoInflight.delete(videoId);
+  });
+  savetubeInfoInflight.set(videoId, pending);
+  return pending;
+}
+
+/**
+ * Pre-warms the Savetube `/v2/info` key cache for a YouTube video as soon as metadata extraction
+ * completes, so the subsequent download click only needs a single fast `/download` call and the
+ * browser's transient user activation is still active when the file download is triggered.
+ * Never throws; failures are silently ignored and retried on the actual download click.
+ */
+export function prefetchYouTubeClientInfo(videoId: string): void {
+  if (!videoId || typeof window === 'undefined') return;
+  const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
+  getOrFetchSavetubeInfo(videoId, targetUrl).catch((err) => {
+    console.warn(
+      '[Client Savetube] Prefetch /v2/info failed (will retry on click):',
+      err instanceof Error ? err.message : err
+    );
+  });
+}
+
+async function fetchSavetubeInfoUncached(videoId: string, targetUrl: string): Promise<CachedSavetubeInfo> {
   const cdns = await getClientCdnCandidates();
   let lastError: Error | null = null;
 

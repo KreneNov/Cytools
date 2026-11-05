@@ -8,7 +8,10 @@ import type {
 } from '../types/socialDownloader';
 import { apiFetch } from '../utils/apiConfig';
 import { getApiUrl } from '../utils/api';
-import { resolveYouTubeClientSavetube } from '../utils/youtubeClientResolver';
+import {
+  resolveYouTubeClientSavetube,
+  prefetchYouTubeClientInfo,
+} from '../utils/youtubeClientResolver';
 import type { YouTubeResolveFormat } from '../utils/youtubeClientResolver';
 
 export interface UseSocialDownloaderReturn {
@@ -300,6 +303,44 @@ export async function triggerDirectDownload(url: string, filename: string): Prom
   }, 60000);
 }
 
+/**
+ * Programmatically auto-triggers a browser file download for a resolved YouTube direct URL
+ * (Savetube / Savenow CDN responses carry `Content-Disposition: attachment`, so the current page
+ * never navigates away).
+ *
+ * - Chrome Extension: delegates to `triggerDirectDownload` (chrome.downloads API).
+ * - Web App: injects an invisible `<a>` and clicks it immediately. `target="_blank"` is only applied
+ *   while the browser's transient user activation is still active; if muxing took longer than the
+ *   activation window (~5s), `target` is omitted so Chrome's popup blocker cannot silently swallow
+ *   the download.
+ */
+async function autoTriggerYouTubeDownload(downloadUrl: string, filename: string): Promise<void> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const chromeObj = typeof window !== 'undefined' ? (window as any).chrome : undefined;
+  if (chromeObj?.downloads?.download) {
+    await triggerDirectDownload(downloadUrl, filename);
+    return;
+  }
+
+  const cleanName = cleanDownloadFilename(filename);
+  const nav = typeof navigator !== 'undefined'
+    ? (navigator as Navigator & { userActivation?: { isActive: boolean } })
+    : undefined;
+  const hasActiveGesture = !nav || !nav.userActivation || Boolean(nav.userActivation.isActive);
+
+  const link = document.createElement('a');
+  link.href = downloadUrl;
+  if (hasActiveGesture) {
+    link.target = '_blank';
+  }
+  link.rel = 'noreferrer';
+  link.download = cleanName;
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
 export const useSocialDownloader = (): UseSocialDownloaderReturn => {
   const [isExtracting, setIsExtracting] = useState<boolean>(false);
   const [extractError, setExtractError] = useState<string | null>(null);
@@ -423,6 +464,12 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
         throw new Error(data.error || 'Không thể trích xuất phương tiện từ liên kết này.');
       }
 
+      // Pre-warm Savetube /v2/info key for YouTube so the first download click resolves instantly
+      // (within the browser's transient user-activation window) and auto-download is never blocked.
+      if (data.platform === 'youtube' && data.videoId) {
+        prefetchYouTubeClientInfo(data.videoId);
+      }
+
       setResult(data);
       return data;
     } catch (err) {
@@ -509,7 +556,18 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
               mediaUrl.includes('googlevideo.com')));
 
         if (isYouTube && result?.videoId) {
-          const isAudio = optionId === 'youtube_audio' || optionId === 'yt_audio';
+          const normalizedOptionId = (optionId || '').toLowerCase();
+          const isAudio =
+            normalizedOptionId === 'youtube_audio' ||
+            normalizedOptionId === 'yt_audio' ||
+            normalizedOptionId === 'audio' ||
+            normalizedOptionId === '140' ||
+            normalizedOptionId.includes('audio') ||
+            /\.(mp3|m4a)$/i.test(cleanTargetFileName);
+          const is1080 =
+            normalizedOptionId.includes('1080') ||
+            normalizedOptionId.startsWith('137') ||
+            normalizedOptionId.startsWith('399');
 
           setDownloadProgress((prev) => ({
             ...prev,
@@ -517,11 +575,7 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             stage: isAudio ? 'audio' : 'video',
           }));
 
-          const ytFormat: YouTubeResolveFormat = isAudio
-            ? 'mp3'
-            : optionId?.includes('1080')
-              ? '1080'
-              : '720';
+          const ytFormat: YouTubeResolveFormat = isAudio ? 'mp3' : is1080 ? '1080' : '720';
 
           const ytResolution = await resolveYouTubeClientSide(
             result.videoId,
@@ -547,13 +601,8 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
             throw new Error('Hệ thống tải đang quá tải, vui lòng thử lại sau.');
           }
 
-          setDownloadProgress((prev) => ({
-            ...prev,
-            percentage: 85,
-            stage: 'muxing',
-          }));
-
-          await triggerDirectDownload(resolvedYtUrl, cleanTargetFileName);
+          // Auto-trigger the browser download immediately after resolution — no second click needed
+          await autoTriggerYouTubeDownload(resolvedYtUrl, cleanTargetFileName);
 
           stopStageTimer();
           setDownloadProgress((prev) => ({
