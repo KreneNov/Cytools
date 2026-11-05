@@ -8,6 +8,8 @@ import type {
 } from '../types/socialDownloader';
 import { apiFetch } from '../utils/apiConfig';
 import { getApiUrl } from '../utils/api';
+import { resolveYouTubeClientSavetube } from '../utils/youtubeClientResolver';
+import type { YouTubeResolveFormat } from '../utils/youtubeClientResolver';
 
 export interface UseSocialDownloaderReturn {
   isExtracting: boolean;
@@ -88,8 +90,6 @@ export function cleanDownloadFilename(filename: string): string {
   return name + ext;
 }
 
-type YouTubeResolveFormat = '1080' | '720' | 'mp3';
-
 interface YouTubeResolutionResult {
   url: string | null;
   provider?: string;
@@ -115,17 +115,31 @@ function isHttpUrl(value: unknown): value is string {
 }
 
 /**
- * Resolves a direct YouTube download URL through our own Server-Side Resolver Proxy
- * (`/api/social/extract?action=youtube-resolve`). The server spoofs Origin/Referer/User-Agent
- * for Savetube Multi-CDN (Provider A) and Savenow / Loader.to (Provider B), so the browser never
- * makes CORS-blocked (403) or rate-limited (429) requests to third-party converters.
- * If the server returns a `pendingId`, progress is polled via `action=youtube-progress`.
+ * Resolves a direct YouTube download URL:
+ * 1. Primary Strategy: Client-Side Savetube Multi-CDN with Web Crypto AES-128-CBC
+ *    using the end-user's clean residential IP (bypasses Vercel datacenter IP 429/403 blocks).
+ * 2. Fallback Strategy: Serverless proxy `/api/social/extract?action=youtube-resolve`
+ *    if client-side CDN attempts fail.
  */
 async function resolveYouTubeClientSide(
   videoId: string,
   format: YouTubeResolveFormat,
   onProgress?: (percentage: number) => void
 ): Promise<YouTubeResolutionResult> {
+  // 1. Primary Strategy: Client-Side Residential IP Savetube Multi-CDN
+  try {
+    const clientRes = await resolveYouTubeClientSavetube(videoId, format);
+    if (clientRes && isHttpUrl(clientRes.url)) {
+      return {
+        url: clientRes.url,
+        provider: clientRes.provider,
+      };
+    }
+  } catch (clientErr) {
+    console.warn('[useSocialDownloader] Client-side Savetube resolution error, trying server fallback:', clientErr);
+  }
+
+  // 2. Fallback Strategy: Server-Side Resolver Proxy (Savenow / server pool)
   const targetUrl = `https://www.youtube.com/watch?v=${videoId}`;
 
   try {
@@ -234,13 +248,31 @@ export async function triggerDirectDownload(url: string, filename: string): Prom
     return;
   }
 
-  // 2. Web App - Tunnel/API/CDN URLs with guaranteed attachment headers
+  // 2. Web App - Direct download for URLs with guaranteed attachment headers (Savetube CDN, Cobalt tunnel, Xenon)
   const isAttachmentGuaranteed =
+    url.includes('savetube.vip') ||
     url.includes('/tunnel') ||
     url.includes('api.cobalt.tools') ||
     url.includes('cobalt.tools') ||
     url.includes('wuk.sh') ||
     url.includes('xenon.zone');
+
+  if (isAttachmentGuaranteed) {
+    // Direct native browser download without routing through Vercel /api/download proxy
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = cleanName;
+    a.rel = 'noreferrer';
+    a.target = '_blank';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      if (document.body.contains(a)) {
+        document.body.removeChild(a);
+      }
+    }, 2000);
+    return;
+  }
 
   const streamUrl = isAttachmentGuaranteed
     ? url
