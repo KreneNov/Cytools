@@ -37,6 +37,18 @@ const ROUTE_TITLES: Record<string, { title: string; subtitle: string }> = {
     title: 'Cọ Làm Mờ Ảnh (Hypic Blur)',
     subtitle: 'Bôi mờ vùng nhạy cảm & tạo hiệu ứng Mờ Chuyển Động (Motion Blur) 60fps trên trình duyệt',
   },
+  '/tai-video-tiktok-khong-logo': {
+    title: 'Tải Video TikTok Không Logo',
+    subtitle: 'Bóc tách video TikTok HD không watermark & album ảnh Slideshow ZIP miễn phí',
+  },
+  '/tai-video-youtube-1080p': {
+    title: 'Tải Video YouTube 1080p',
+    subtitle: 'Tải video YouTube Full HD 1080p kèm âm thanh gốc & tách file nhạc MP3 320kbps',
+  },
+  '/lam-mo-anh-online': {
+    title: 'Làm Mờ Ảnh & Motion Blur Online',
+    subtitle: 'Cọ làm mờ chi tiết & tạo vệt mờ chuyển động nghệ thuật chuẩn Hypic',
+  },
 };
 
 interface HeaderProps {

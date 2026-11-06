@@ -9,6 +9,9 @@ import { RemoveBgPage } from './pages/RemoveBgPage';
 import { ConverterHubPage } from './pages/ConverterHubPage';
 import { WatermarkRemoverPage } from './pages/WatermarkRemoverPage';
 import { BlurEditorPage } from './pages/BlurEditorPage';
+import { TikTokSeoPage } from './pages/seo/TikTokSeoPage';
+import { YouTubeSeoPage } from './pages/seo/YouTubeSeoPage';
+import { BlurSeoPage } from './pages/seo/BlurSeoPage';
 import { HallOfFamePage } from './pages/HallOfFamePage';
 import { ExtensionPopupView } from './components/extension/ExtensionPopupView';
 
@@ -42,6 +45,8 @@ export const App: React.FC = () => {
               <Route path="/social-downloader" element={<SocialDownloaderPage />} />
               <Route path="/downloader" element={<Navigate to="/social-downloader" replace />} />
               <Route path="/video-downloader" element={<Navigate to="/social-downloader" replace />} />
+              <Route path="/tai-video-tiktok-khong-logo" element={<TikTokSeoPage />} />
+              <Route path="/tai-video-youtube-1080p" element={<YouTubeSeoPage />} />
               <Route path="/remove-bg" element={<RemoveBgPage />} />
               <Route path="/watermark-remover" element={<WatermarkRemoverPage />} />
               <Route path="/xoa-watermark" element={<Navigate to="/watermark-remover" replace />} />
@@ -49,6 +54,7 @@ export const App: React.FC = () => {
               <Route path="/blur-brush" element={<BlurEditorPage />} />
               <Route path="/blur-editor" element={<Navigate to="/blur-brush" replace />} />
               <Route path="/lam-mo-anh" element={<Navigate to="/blur-brush" replace />} />
+              <Route path="/lam-mo-anh-online" element={<BlurSeoPage />} />
               <Route path="/converter" element={<ConverterHubPage />} />
               <Route path="/converter-hub" element={<Navigate to="/converter" replace />} />
               <Route path="/media-converter" element={<Navigate to="/converter" replace />} />

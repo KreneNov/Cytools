@@ -42,7 +42,6 @@ export const BlurEditor: React.FC = () => {
 
   // Component UI State
   const [hasImage, setHasImage] = useState<boolean>(false);
-  const [fileName, setFileName] = useState<string>('cytools-blur.png');
   const [imageDimensions, setImageDimensions] = useState<{ width: number; height: number }>({
     width: 0,
     height: 0,
@@ -256,9 +255,6 @@ export const BlurEditor: React.FC = () => {
   const loadImageFile = useCallback(
     (file: File) => {
       if (!file.type.startsWith('image/')) return;
-
-      const baseName = file.name.replace(/\.[^.]+$/, '') || 'photo';
-      setFileName(`${baseName}-blurred.png`);
 
       const reader = new FileReader();
       reader.onload = (ev) => {
@@ -481,7 +477,7 @@ export const BlurEditor: React.FC = () => {
         const objectUrl = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = objectUrl;
-        link.download = fileName || 'cytools-blur.png';
+        link.download = `[cytools.io.vn]_edited_image_${Date.now()}.png`;
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);

@@ -87,7 +87,13 @@ export function cleanDownloadFilename(filename: string): string {
       ext.toLowerCase().includes('wav') ||
       ext.toLowerCase().includes('aac') ||
       ext.toLowerCase().includes('opus');
-    name = isAudio ? 'cytools-audio' : 'cytools-video';
+    name = isAudio ? 'audio' : 'video';
+  }
+
+  // 8. Passive growth engine: prepend domain promotion tag [cytools.io.vn]_
+  const BRAND_PREFIX = '[cytools.io.vn]_';
+  if (!name.startsWith(BRAND_PREFIX)) {
+    name = `${BRAND_PREFIX}${name}`;
   }
 
   return name + ext;
@@ -810,7 +816,10 @@ export const useSocialDownloader = (): UseSocialDownloaderReturn => {
 
         const a = document.createElement('a');
         a.href = objectUrl;
-        a.download = `${cleanTitle}.zip`;
+        const brandZipTitle = cleanTitle.startsWith('[cytools.io.vn]_')
+          ? cleanTitle
+          : `[cytools.io.vn]_${cleanTitle}`;
+        a.download = `${brandZipTitle}.zip`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);

@@ -349,6 +349,45 @@ export const HomePage: React.FC = () => {
           </button>
         </div>
       )}
+      {/* SEO Landing Quick Links */}
+      <div className="pt-6 border-t border-slate-200 dark:border-slate-800/80 space-y-3">
+        <div className="text-xs font-bold text-slate-700 dark:text-slate-300 uppercase tracking-wider">
+          Liên kết phổ biến & Tìm kiếm nhiều nhất
+        </div>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <button
+            onClick={() => navigate('/tai-video-tiktok-khong-logo')}
+            className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-medium border border-slate-200 dark:border-slate-700 transition-colors cursor-pointer"
+          >
+            Tải Video TikTok Không Logo
+          </button>
+          <button
+            onClick={() => navigate('/tai-video-youtube-1080p')}
+            className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-medium border border-slate-200 dark:border-slate-700 transition-colors cursor-pointer"
+          >
+            Tải Video YouTube 1080p Full HD
+          </button>
+          <button
+            onClick={() => navigate('/lam-mo-anh-online')}
+            className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-medium border border-slate-200 dark:border-slate-700 transition-colors cursor-pointer"
+          >
+            Làm Mờ Ảnh & Motion Blur Online
+          </button>
+          <button
+            onClick={() => navigate('/watermark-remover')}
+            className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-medium border border-slate-200 dark:border-slate-700 transition-colors cursor-pointer"
+          >
+            Xóa Watermark PDF & Ảnh
+          </button>
+          <button
+            onClick={() => navigate('/remove-bg')}
+            className="px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 text-xs font-medium border border-slate-200 dark:border-slate-700 transition-colors cursor-pointer"
+          >
+            Xóa Nền AI Studio
+          </button>
+        </div>
+      </div>
+
       {/* Install Extension Modal */}
       <InstallExtensionModal
         isOpen={isInstallModalOpen}
